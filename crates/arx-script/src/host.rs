@@ -5,7 +5,7 @@
 use crate::interp::{Args, CmdResult, Host, has_flag};
 use crate::player::PlayerState;
 use crate::text::Script;
-use crate::world::{EntityId, EntityKind, Timer};
+use crate::world::{EntityId, EntityKind, ScriptWorld, Timer};
 use std::{collections::HashMap, sync::Arc};
 
 #[derive(Debug, Clone)]
@@ -42,6 +42,8 @@ pub struct EntityState {
     pub price: f32,
     /// Carried by the player (and so not in the world).
     pub in_inventory: bool,
+    /// Turned by `rotate`: degrees added to the angles the level gave it (pitch, yaw, roll).
+    pub rotation: [f32; 3],
     /// Moved by the game (dropped by the player), in Arx coordinates; the renderer places the entity here.
     pub moved_to: Option<[f32; 3]>,
 }
@@ -66,6 +68,7 @@ impl Default for EntityState {
             weight: 0.0,
             price: 0.0,
             in_inventory: false,
+            rotation: [0.0; 3],
             moved_to: None,
         }
     }
@@ -133,6 +136,36 @@ pub enum SpeechEvent {
     PlaySample { entity: EntityId, name: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteKind {
+    /// A scrap of paper.
+    Note,
+    /// A notice board or sign.
+    Notice,
+    Book,
+}
+
+/// Something for the player to read (`note`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteRequest {
+    pub kind: NoteKind,
+    /// Localisation key (or literal text) of what it says.
+    pub text: String,
+}
+
+/// Loads the script of an entity class (a virtual path without extension), for items that scripts create
+/// (`inventory add`).
+pub type ScriptLoader = Box<dyn Fn(&str) -> Option<Arc<Script>> + Send + Sync>;
+
+/// What happened to an item given to the player.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Carry {
+    /// Now in the inventory as its own entry.
+    Added,
+    /// Merged into the stack of the same kind the player already carries (its entity).
+    Stacked(EntityId),
+}
+
 /// Returns the length in milliseconds of the animation file at a virtual path.
 pub type AnimDuration = Box<dyn Fn(&str) -> Option<f64> + Send + Sync>;
 
@@ -145,11 +178,163 @@ pub struct StdHost {
     messages: Vec<String>,
     /// The player's life, mana, hunger and inventory.
     pub player: PlayerState,
+    script_loader: Option<ScriptLoader>,
+    /// What chests, corpses and characters hold (`inventory add`): item entities not in the world.
+    pub containers: HashMap<EntityId, Vec<EntityId>>,
+    /// The container the player is looking into (`inventory open`).
+    pub open_container: Option<EntityId>,
+    notes: Vec<NoteRequest>,
 }
 
 impl StdHost {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Tell the host how to load item scripts, so `inventory add` can create items.
+    pub fn set_script_loader(&mut self, f: ScriptLoader) {
+        self.script_loader = Some(f);
+    }
+
+    /// Put `item` into the player's inventory: it joins a carried stack of the same kind that has room (up to
+    /// its `playerstacksize`), or becomes a new entry. The item leaves the world.
+    pub fn carry(&mut self, world: &ScriptWorld, item: EntityId) -> Carry {
+        let st = self.state(item).cloned().unwrap_or_default();
+        let class = &world.entity(item).class;
+        let target = self.player.inventory.iter().copied().find(|&i| {
+            &world.entity(i).class == class && self.state(i).is_some_and(|t| t.stack_size > 1 && t.count < t.stack_size)
+        });
+        let mut remaining = st.count;
+        if let Some(target) = target {
+            let t = self.state(target).expect("carried items have a state");
+            let moved = remaining.min(t.stack_size - t.count);
+            self.modify(target, |t| t.count += moved);
+            remaining -= moved;
+            if remaining == 0 {
+                self.modify(item, |s| {
+                    s.count = 0;
+                    s.destroyed = true;
+                    s.collision = false;
+                });
+                return Carry::Stacked(target);
+            }
+        }
+        self.modify(item, |s| {
+            s.count = remaining;
+            s.in_inventory = true;
+            s.hidden = true;
+            s.collision = false;
+            s.moved_to = None;
+        });
+        self.player.inventory.push(item);
+        Carry::Added
+    }
+
+    /// Forget what `owner` holds (its items are destroyed) and close it if it was open.
+    fn destroy_container(&mut self, owner: EntityId) {
+        for item in self.containers.remove(&owner).unwrap_or_default() {
+            self.modify(item, |s| s.destroyed = true);
+        }
+        if self.open_container == Some(owner) {
+            self.open_container = None;
+        }
+    }
+
+    /// Create a new item of class `name` (a path below `graph/obj3d/interactive/items`), run its start-up, and
+    /// leave it out of the world. `None` if its script cannot be found.
+    fn spawn_item(&mut self, a: &mut Args, name: &str) -> Option<EntityId> {
+        // Scripts write paths with single or doubled backslashes.
+        let name = name.trim().trim_matches('"').to_ascii_lowercase();
+        let parts: Vec<&str> = name.split(['\\', '/']).filter(|part| !part.is_empty()).collect();
+        let class = format!("graph/obj3d/interactive/items/{}", parts.join("/"));
+        let Some(script) = self.script_loader.as_ref().and_then(|load| load(&class)) else {
+            a.warn(&format!("could not add item {class}"));
+            return None;
+        };
+        let instance = a.world.entities.iter().filter(|e| e.class == class).map(|e| e.instance).max().unwrap_or(0) + 1;
+        let id = a.world.add_entity(EntityKind::Item, &class, instance, Some(script), None);
+        self.modify(id, |s| {
+            s.in_inventory = true;
+            s.hidden = true;
+            s.collision = false;
+        });
+        a.world.send_init(self, id);
+        Some(id)
+    }
+
+    /// The `inventory` command: containers and giving items to the player.
+    fn inventory_command(&mut self, a: &mut Args) -> CmdResult {
+        let me = a.entity();
+        let sub: String = a.get_word().chars().filter(|c| *c != '_').collect();
+        let has_container = |h: &Self, w: &ScriptWorld| h.containers.contains_key(&me) || w.entity(me).kind == EntityKind::Npc;
+        match sub.as_str() {
+            "create" => {
+                self.destroy_container(me);
+                self.containers.insert(me, Vec::new());
+            }
+            "skin" => a.skip_word(),
+            "destroy" => self.destroy_container(me),
+            "open" => {
+                if has_container(self, a.world) {
+                    self.open_container = Some(me);
+                }
+            }
+            "close" => self.open_container = None,
+            "add" | "addmulti" | "playeradd" | "playeraddmulti" => {
+                let multi = sub.ends_with("multi");
+                let to_player = sub.starts_with("player");
+                let w = a.get_word();
+                let name = a.string_var(&w);
+                let count = multi.then(|| a.get_float());
+                if !to_player && !has_container(self, a.world) {
+                    return CmdResult::Failed;
+                }
+                if count == Some(0.0) {
+                    return CmdResult::Success;
+                }
+                let Some(item) = self.spawn_item(a, &name) else { return CmdResult::Failed };
+                if let Some(n) = count {
+                    self.modify(item, |s| {
+                        s.stack_size = 9999;
+                        s.count = (n as u32).max(1);
+                    });
+                }
+                if to_player {
+                    let player = a.world.player;
+                    if self.carry(a.world, item) == Carry::Added {
+                        a.world.send_event(self, player, item, "inventoryin", Vec::new());
+                    }
+                } else {
+                    self.containers.entry(me).or_default().push(item);
+                }
+            }
+            "addfromscene" | "playeraddfromscene" => {
+                let w = a.get_word();
+                let target = a.string_var(&w);
+                let Some(item) = a.world.find(&target, me) else {
+                    a.warn(&format!("unknown target: {target}"));
+                    return CmdResult::Failed;
+                };
+                if sub.starts_with("player") {
+                    let player = a.world.player;
+                    if self.carry(a.world, item) == Carry::Added {
+                        a.world.send_event(self, player, item, "inventoryin", Vec::new());
+                    }
+                } else if has_container(self, a.world) {
+                    self.modify(item, |s| {
+                        s.in_inventory = true;
+                        s.hidden = true;
+                        s.collision = false;
+                    });
+                    self.containers.entry(me).or_default().push(item);
+                }
+            }
+            other => {
+                a.warn(&format!("unknown inventory command: {other}"));
+                return CmdResult::Failed;
+            }
+        }
+        CmdResult::Success
     }
 
     /// Tell the host how to measure animations (needed for `playanim -e`, which runs a command when
@@ -161,6 +346,11 @@ impl StdHost {
     /// Speech requests made since the last call.
     pub fn take_speech(&mut self) -> Vec<SpeechEvent> {
         std::mem::take(&mut self.speech)
+    }
+
+    /// Things scripts asked the player to read since the last call.
+    pub fn take_notes(&mut self) -> Vec<NoteRequest> {
+        std::mem::take(&mut self.notes)
     }
 
     /// Queue a speech event as if a script had asked for it (test aid).
@@ -420,6 +610,30 @@ impl Host for StdHost {
                 self.speech.push(SpeechEvent::Say(SpeechRequest { speaker, script_entity: me, key, flags: f, on_end }));
                 CmdResult::Success
             }
+            "inventory" => self.inventory_command(a),
+            "rotate" => {
+                let delta = [a.get_float(), a.get_float(), a.get_float()];
+                let st = self.state_mut(me);
+                for (r, d) in st.rotation.iter_mut().zip(delta) {
+                    *r += d;
+                }
+                CmdResult::Success
+            }
+            "note" => {
+                let kind = match a.get_word().as_str() {
+                    "notice" => NoteKind::Notice,
+                    "book" => NoteKind::Book,
+                    "note" => NoteKind::Note,
+                    other => {
+                        a.warn(&format!("unexpected note type: {other}"));
+                        NoteKind::Note
+                    }
+                };
+                let w = a.get_word();
+                let text = a.string_var(&w);
+                self.notes.push(NoteRequest { kind, text });
+                CmdResult::Success
+            }
             "playerstacksize" => {
                 let n = a.get_float().max(1.0) as u32;
                 self.state_mut(me).stack_size = n;
@@ -667,6 +881,30 @@ on inventoryuse {
         h.player.inventory.push(id);
         h.prune_inventory();
         assert!(h.player.inventory.is_empty());
+    }
+
+    #[test]
+    fn rotate_accumulates_angles() {
+        let (mut w, mut h, id) = setup("x/fix_inter/puzzle_wheel/puzzle_wheel", EntityKind::Fix, "on action {\n rotate 0 90 0\n rotate 0 -30 5\n accept\n}");
+        w.send_event(&mut h, None, id, "action", vec![]);
+        w.send_event(&mut h, None, id, "action", vec![]);
+        assert_eq!(h.state(id).unwrap().rotation, [0.0, 120.0, 10.0]);
+    }
+
+    #[test]
+    fn note_queues_something_to_read() {
+        let (mut w, mut h, id) = setup(
+            "graph/obj3d/interactive/fix_inter/public_notice/public_notice",
+            EntityKind::Fix,
+            "on action {\n note notice [public_notice_a]\n note book \"some text\"\n note scrap oops\n accept\n}",
+        );
+        w.send_event(&mut h, None, id, "action", vec![]);
+        let n = h.take_notes();
+        assert_eq!(n.len(), 3);
+        assert_eq!((n[0].kind, n[0].text.as_str()), (NoteKind::Notice, "[public_notice_a]"));
+        assert_eq!((n[1].kind, n[1].text.as_str()), (NoteKind::Book, "some text"));
+        assert_eq!(n[2].kind, NoteKind::Note, "unknown types fall back to a note");
+        assert!(h.take_notes().is_empty());
     }
 
     #[test]

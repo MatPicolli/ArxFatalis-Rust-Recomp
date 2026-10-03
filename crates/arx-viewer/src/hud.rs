@@ -14,6 +14,10 @@ pub struct Ui {
     pub selected: usize,
     /// Item chosen to be used on something: another item, or what the player looks at (`E`).
     pub held: Option<EntityId>,
+    /// Entry highlighted in the open container (chest, corpse).
+    pub container_selected: usize,
+    /// Something being read (a note, a sign, a book): what kind and what it says.
+    pub reading: Option<(arx_script::NoteKind, String)>,
 }
 
 #[derive(Component)]
@@ -24,6 +28,10 @@ pub struct ManaFill;
 pub struct StatsText;
 #[derive(Component)]
 pub struct InventoryText;
+#[derive(Component)]
+pub struct ContainerText;
+#[derive(Component)]
+pub struct NoteTextUi;
 
 const BAR_WIDTH: f32 = 220.0;
 const BAR_HEIGHT: f32 = 16.0;
@@ -73,6 +81,39 @@ pub fn spawn(mut commands: Commands) {
             ..default()
         },
     ));
+    commands.spawn((
+        NoteTextUi,
+        Text::new(""),
+        TextFont { font_size: FontSize::Px(20.0), ..default() },
+        TextColor(Color::srgb(0.18, 0.12, 0.06)),
+        TextLayout::justify(Justify::Left),
+        BackgroundColor(Color::srgb(0.82, 0.75, 0.58)),
+        Visibility::Hidden,
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Percent(14.0),
+            left: Val::Percent(28.0),
+            width: Val::Percent(44.0),
+            padding: UiRect::all(Val::Px(26.0)),
+            ..default()
+        },
+    ));
+    commands.spawn((
+        ContainerText,
+        Text::new(""),
+        TextFont { font_size: FontSize::Px(17.0), ..default() },
+        TextColor(Color::srgb(0.85, 0.95, 0.85)),
+        BackgroundColor(Color::srgba(0.03, 0.05, 0.04, 0.8)),
+        Visibility::Hidden,
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(90.0),
+            left: Val::Px(18.0),
+            width: Val::Px(380.0),
+            padding: UiRect::all(Val::Px(12.0)),
+            ..default()
+        },
+    ));
 }
 
 /// The text shown for an entity: its localised name, or its id if the scripts never named it.
@@ -94,6 +135,12 @@ pub fn debug_pickup(mut frames: Local<u32>, args: Res<crate::LevelArgs>, mut s: 
     if let Some(life) = args.life {
         s.host.player.life.current = life.clamp(0.0, s.host.player.life.max);
     }
+    if let Some(name) = &args.open_container {
+        match s.world.find(name, player) {
+            Some(id) => eprintln!("open {name}: {}", inventory::open_container(&mut s.world, &mut s.host, player, id)),
+            None => eprintln!("no such entity: {name}"),
+        }
+    }
     for name in &args.pickup {
         match s.world.find(name, player) {
             Some(id) => eprintln!("pickup {name}: {:?}", inventory::pick_up(&mut s.world, &mut s.host, player, id)),
@@ -113,8 +160,49 @@ pub fn input(
     speech: Res<Speech>,
 ) {
     let s = &mut *s;
+    // Things to read (notes, signs) come first; any of these keys puts them away.
+    for note in s.host.take_notes() {
+        ui.reading = Some((note.kind, speech.text(&note.text)));
+    }
+    if ui.reading.is_some() {
+        if keys.any_just_pressed([KeyCode::Escape, KeyCode::Enter, KeyCode::Space, KeyCode::KeyE, KeyCode::Backspace]) {
+            ui.reading = None;
+        }
+        return;
+    }
     if keys.just_pressed(KeyCode::KeyI) {
         ui.open = !ui.open;
+    }
+    // An open container (chest, corpse) has the keyboard until it is closed or the player walks away.
+    if let Some(container) = s.host.open_container {
+        let (p, q) = (s.world.entity(s.player).pos, s.world.entity(container).pos);
+        let far = (p[0] - q[0]).hypot(p[2] - q[2]) > 450.0;
+        let player = s.player;
+        if far || keys.just_pressed(KeyCode::Backspace) {
+            inventory::close_container(&mut s.world, &mut s.host, player);
+            return;
+        }
+        let list = s.host.containers.get(&container).cloned().unwrap_or_default();
+        ui.container_selected = ui.container_selected.min(list.len().saturating_sub(1));
+        if keys.just_pressed(KeyCode::ArrowDown) && !list.is_empty() {
+            ui.container_selected = (ui.container_selected + 1) % list.len();
+        }
+        if keys.just_pressed(KeyCode::ArrowUp) && !list.is_empty() {
+            ui.container_selected = (ui.container_selected + list.len() - 1) % list.len();
+        }
+        if keys.just_pressed(KeyCode::Enter)
+            && let Some(&item) = list.get(ui.container_selected)
+        {
+            let name = display_name(s, &speech, item);
+            if inventory::take_from_container(&mut s.world, &mut s.host, player, container, item).is_some() {
+                s.host.push_message(format!("Took {name}"));
+            }
+        }
+        if keys.just_pressed(KeyCode::KeyT) && !list.is_empty() {
+            let n = inventory::take_all(&mut s.world, &mut s.host, player, container);
+            s.host.push_message(format!("Took {n} things"));
+        }
+        return;
     }
     if !ui.open {
         return;
@@ -165,9 +253,41 @@ pub fn update(
     speech: Res<Speech>,
     mut life: Single<&mut Node, (With<LifeFill>, Without<ManaFill>)>,
     mut mana: Single<&mut Node, (With<ManaFill>, Without<LifeFill>)>,
-    mut stats: Single<&mut Text, (With<StatsText>, Without<InventoryText>)>,
-    mut inv: Single<(&mut Text, &mut Visibility), (With<InventoryText>, Without<StatsText>)>,
+    mut stats: Single<&mut Text, (With<StatsText>, Without<InventoryText>, Without<ContainerText>, Without<NoteTextUi>)>,
+    mut inv: Single<(&mut Text, &mut Visibility), (With<InventoryText>, Without<StatsText>, Without<ContainerText>, Without<NoteTextUi>)>,
+    mut cont: Single<(&mut Text, &mut Visibility), (With<ContainerText>, Without<StatsText>, Without<InventoryText>, Without<NoteTextUi>)>,
+    mut note: Single<(&mut Text, &mut Visibility), (With<NoteTextUi>, Without<StatsText>, Without<InventoryText>, Without<ContainerText>)>,
 ) {
+    {
+        let (text, vis) = &mut *note;
+        match &ui.reading {
+            Some((_, body)) => {
+                **vis = Visibility::Inherited;
+                text.0 = format!("{body}\n\n(Enter to put away)");
+            }
+            None => **vis = Visibility::Hidden,
+        }
+    }
+    {
+        let (text, vis) = &mut *cont;
+        match s.host.open_container {
+            Some(c) => {
+                **vis = Visibility::Inherited;
+                let items = s.host.containers.get(&c).cloned().unwrap_or_default();
+                let mut out = format!("{}   (Up/Down choose, Enter take, T take all, Backspace close)\n", display_name(&s, &speech, c));
+                if items.is_empty() {
+                    out.push_str("\n  empty");
+                }
+                for (i, &id) in items.iter().enumerate() {
+                    let count = s.host.state(id).map_or(1, |st| st.count);
+                    let n = if count > 1 { format!(" x{count}") } else { String::new() };
+                    out.push_str(&format!("\n{} {}{n}", if i == ui.container_selected { ">" } else { " " }, display_name(&s, &speech, id)));
+                }
+                text.0 = out;
+            }
+            None => **vis = Visibility::Hidden,
+        }
+    }
     let p = &s.host.player;
     life.width = Val::Percent(p.life.fraction() * 100.0);
     mana.width = Val::Percent(p.mana.fraction() * 100.0);

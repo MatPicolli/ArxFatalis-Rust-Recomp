@@ -94,6 +94,9 @@ struct Args {
     /// after start-up, for headless testing
     #[arg(long, value_delimiter = ',')]
     pickup: Vec<String>,
+    /// Level mode: open this chest (an entity id such as `chest_metal_0051`) shortly after start-up
+    #[arg(long)]
+    open_chest: Option<String>,
     /// Level mode: start with the inventory panel open
     #[arg(long)]
     show_inventory: bool,
@@ -401,6 +404,7 @@ struct LevelArgs {
     say: Option<String>,
     pickup: Vec<String>,
     life: Option<f32>,
+    open_container: Option<String>,
 }
 
 #[derive(Resource)]
@@ -414,6 +418,8 @@ struct Fly {
     walk: bool,
     player: arx_physics::Player,
     world: Option<std::sync::Arc<arx_physics::CollisionWorld>>,
+    /// Crouch toggled with `C` (holding `X` crouches too).
+    crouch_toggle: bool,
 }
 
 fn run_level(args: Args, pak: PakSet) {
@@ -448,6 +454,7 @@ fn run_level(args: Args, pak: PakSet) {
         say: args.say.clone(),
         pickup: args.pickup.clone(),
         life: args.life,
+        open_container: args.open_chest.clone(),
     })
     .insert_resource(entities::EntityCache::default())
     .insert_resource(Fly {
@@ -458,6 +465,7 @@ fn run_level(args: Args, pak: PakSet) {
         walk: !args.fly,
         player: arx_physics::Player::new(Vec3::ZERO),
         world: None,
+        crouch_toggle: false,
     })
     .add_systems(Startup, setup_level)
     .insert_resource(scripting::Scripting::default())
@@ -640,8 +648,6 @@ fn setup_level(
     }
 }
 
-const WALK_SPEED: f32 = 300.0;
-const RUN_SPEED: f32 = 600.0;
 
 fn fly_camera(
     time: Res<Time>,
@@ -653,6 +659,7 @@ fn fly_camera(
     mut cursor: Single<&mut CursorOptions, With<Window>>,
     mut cam: Single<&mut Transform, With<Camera3d>>,
     shot: Option<Res<Shot>>,
+    mut script: ResMut<scripting::Scripting>,
 ) {
     // Screenshot runs are scripted: ignore the real keyboard and mouse so they are reproducible.
     let live = shot.is_none();
@@ -687,13 +694,34 @@ fn fly_camera(
     let ahead = |key: KeyCode| keys.pressed(key) as i32 as f32;
 
     if fly.walk && fly.world.is_some() {
-        // Movement is relative to the horizontal facing direction.
-        let forward = Vec2::new(-fly.yaw.sin(), -fly.yaw.cos());
-        let right = Vec2::new(fly.yaw.cos(), -fly.yaw.sin());
-        let wish = forward * (ahead(KeyCode::KeyW) - ahead(KeyCode::KeyS)) + right * (ahead(KeyCode::KeyD) - ahead(KeyCode::KeyA));
-        let speed = if keys.pressed(KeyCode::ShiftLeft) { RUN_SPEED } else { WALK_SPEED };
+        // The movement keys combine like the original's: see `MoveInput::from_keys`.
+        if keys.just_pressed(KeyCode::KeyC) {
+            fly.crouch_toggle = !fly.crouch_toggle;
+        }
+        let dead = script.host.player.is_dead();
+        if dead && keys.just_pressed(KeyCode::KeyR) {
+            // Revive where the player last stood.
+            script.host.player.life.current = script.host.player.life.max;
+            let at = fly.player.last_ground;
+            fly.player = arx_physics::Player::new(at);
+        }
+        let mut input = if dead {
+            arx_physics::MoveInput::default()
+        } else {
+            arx_physics::MoveInput::from_keys(fly.yaw, keys.pressed(KeyCode::KeyW), keys.pressed(KeyCode::KeyS), keys.pressed(KeyCode::KeyA), keys.pressed(KeyCode::KeyD))
+        };
+        input.stealth = keys.pressed(KeyCode::ShiftLeft);
+        input.crouch = !dead && (keys.pressed(KeyCode::KeyX) || fly.crouch_toggle);
+        input.jump = !dead && keys.pressed(KeyCode::Space);
         let world = fly.world.clone().unwrap();
-        fly.player.step(&world, dt, wish.normalize_or_zero() * speed, keys.pressed(KeyCode::Space));
+        fly.player.step(&world, dt, input);
+        // A long fall hurts: (height - 400) / 15 life.
+        if let Some(height) = fly.player.take_landing() {
+            let damage = arx_physics::fall_damage(height);
+            script.host.player.life.add(-damage);
+            let text = if script.host.player.is_dead() { "You are dead - press R".to_owned() } else { format!("Ouch! The fall cost {damage:.0} life") };
+            script.host.push_message(text);
+        }
         fly.pos = fly.player.eye();
     } else {
         if live && scroll.delta.y != 0.0 {
@@ -729,7 +757,7 @@ fn level_hud(
     // Report the position in Arx coordinates so it can be fed back through --cam.
     let mode = if fly.walk { "walking" } else { "flying" };
     let help = if fly.walk {
-        "WASD move  Shift run  Space jump  E use/take  I inventory  click: capture mouse  Esc: release  F: fly"
+        "WASD move  Shift sneak  X crouch (C toggle)  Space jump  E use/take  I inventory  click: capture mouse  Esc: release  F: fly"
     } else {
         "WASD move  Q/E down/up  Shift fast  scroll speed  click: capture mouse  Esc: release  F: walk"
     };

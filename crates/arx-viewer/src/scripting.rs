@@ -19,6 +19,13 @@ const REACH: f32 = 350.0;
 #[derive(Component)]
 pub struct ScriptRef(pub EntityId);
 
+/// The angles the level gave an entity (Arx pitch, yaw, roll in degrees), which `rotate` adds to.
+#[derive(Component)]
+pub struct BaseAngle {
+    pub angle: [f32; 3],
+    pub npc: bool,
+}
+
 /// A clickable bounding sphere for an entity (Bevy coordinates).
 pub struct Pickable {
     pub id: EntityId,
@@ -92,10 +99,10 @@ pub fn sync_obstacles(s: Res<Scripting>, o: Res<Obstacles>) {
 pub fn apply_state(
     mut s: ResMut<Scripting>,
     arx: Res<Arx>,
-    mut q: Query<(&ScriptRef, &mut Visibility, &mut Transform, Option<&mut Animated>)>,
+    mut q: Query<(&ScriptRef, &mut Visibility, &mut Transform, Option<&mut Animated>, Option<&BaseAngle>)>,
 ) {
     let s = &mut *s;
-    for (r, mut vis, mut tf, animated) in &mut q {
+    for (r, mut vis, mut tf, animated, base) in &mut q {
         let Some(st) = s.host.state(r.0) else { continue };
         let key = (st.revision, st.anim_serial);
         if s.applied.get(&r.0) == Some(&key) {
@@ -107,6 +114,10 @@ pub fn apply_state(
         tf.scale = Vec3::splat(st.scale);
         if let Some(p) = st.moved_to {
             tf.translation = Vec3::from(to_bevy(p));
+        }
+        if let (Some(b), true) = (base, st.rotation != [0.0; 3]) {
+            let a = [b.angle[0] + st.rotation[0], b.angle[1] + st.rotation[1], b.angle[2] + st.rotation[2]];
+            tf.rotation = arx_level::entity_rotation(a, b.npc);
         }
         if let (Some(mut a), true) = (animated, prev.is_none_or(|(_, serial)| serial != st.anim_serial)) {
             if let Some(play) = &st.playing {
@@ -155,7 +166,7 @@ pub fn interact(
         }
     }
     s.target = best.map(|(_, id)| id);
-    if !keys.just_pressed(KeyCode::KeyE) {
+    if !keys.just_pressed(KeyCode::KeyE) || ui.reading.is_some() {
         return;
     }
     let Some(target) = s.target else { return };
@@ -177,6 +188,14 @@ pub fn interact(
         }
         EntityKind::Npc => {
             s.world.send_event(&mut s.host, Some(player), target, "chat", Vec::new());
+        }
+        // Chests and the like: look inside (a locked one refuses, and says so).
+        _ if inventory::is_container(&s.world, &s.host, target) => {
+            if s.host.open_container == Some(target) {
+                inventory::close_container(&mut s.world, &mut s.host, player);
+            } else {
+                inventory::open_container(&mut s.world, &mut s.host, player, target);
+            }
         }
         _ => {
             s.world.send_event(&mut s.host, Some(player), target, "action", Vec::new());

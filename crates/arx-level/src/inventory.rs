@@ -2,7 +2,7 @@
 //! The state lives in [`StdHost::player`] and the entity states; items react through their scripts
 //! (`inventoryin`, `inventoryuse`, `combine`, `inventoryout`).
 
-use arx_script::{EntityId, EntityKind, ScriptResult, ScriptWorld, StdHost};
+use arx_script::{Carry, EntityId, EntityKind, ScriptResult, ScriptWorld, StdHost};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickUp {
@@ -31,38 +31,14 @@ pub fn pick_up(world: &mut ScriptWorld, host: &mut StdHost, player: EntityId, it
         return PickUp::Refused("cannot be touched");
     }
 
-    // Items of the same kind share a stack, up to `playerstacksize`.
-    let class = world.entity(item).class.clone();
-    let target = host.player.inventory.iter().copied().find(|&i| {
-        world.entity(i).class == class && host.state(i).is_some_and(|t| t.stack_size > 1 && t.count < t.stack_size)
-    });
-    let mut remaining = st.count;
-    if let Some(target) = target {
-        let t = host.state(target).expect("carried items have a state");
-        let moved = remaining.min(t.stack_size - t.count);
-        host.modify(target, |t| t.count += moved);
-        remaining -= moved;
-        if remaining == 0 {
-            host.modify(item, |s| {
-                s.count = 0;
-                s.destroyed = true;
-                s.collision = false;
-            });
-            return PickUp::Stacked(target);
+    match host.carry(world, item) {
+        Carry::Stacked(target) => PickUp::Stacked(target),
+        Carry::Added => {
+            world.send_event(host, Some(player), item, "inventoryin", Vec::new());
+            host.prune_inventory();
+            PickUp::Added
         }
     }
-
-    host.modify(item, |s| {
-        s.count = remaining;
-        s.in_inventory = true;
-        s.hidden = true;
-        s.collision = false;
-        s.moved_to = None;
-    });
-    host.player.inventory.push(item);
-    world.send_event(host, Some(player), item, "inventoryin", Vec::new());
-    host.prune_inventory();
-    PickUp::Added
 }
 
 /// Use a carried item (eat it, read it, ...): its `inventoryuse` event decides what happens.
@@ -82,6 +58,53 @@ pub fn combine(world: &mut ScriptWorld, host: &mut StdHost, player: EntityId, so
     let result = world.send_event(host, Some(player), target, "combine", vec![name]);
     host.prune_inventory();
     result
+}
+
+/// Does `entity` hold things the player can look into (a chest, a corpse)?
+pub fn is_container(world: &ScriptWorld, host: &StdHost, entity: EntityId) -> bool {
+    host.containers.contains_key(&entity) && world.entity(entity).kind != EntityKind::Npc
+}
+
+/// Open `container`. Its `inventory2_open` script decides: a locked chest refuses (and complains). Returns whether
+/// it is open now. Whatever was open before is closed first.
+pub fn open_container(world: &mut ScriptWorld, host: &mut StdHost, player: EntityId, container: EntityId) -> bool {
+    if !host.containers.contains_key(&container) {
+        return false;
+    }
+    close_container(world, host, player);
+    if world.send_event(host, Some(player), container, "inventory2_open", Vec::new()) == ScriptResult::Refuse {
+        return false;
+    }
+    host.open_container = Some(container);
+    true
+}
+
+/// Close the open container, letting its script know (a chest lid closes).
+pub fn close_container(world: &mut ScriptWorld, host: &mut StdHost, player: EntityId) {
+    if let Some(c) = host.open_container.take() {
+        world.send_event(host, Some(player), c, "inventory2_close", Vec::new());
+    }
+}
+
+/// Take one item out of an open container (a chest, a corpse) into the player's inventory.
+pub fn take_from_container(world: &mut ScriptWorld, host: &mut StdHost, player: EntityId, container: EntityId, item: EntityId) -> Option<PickUp> {
+    let list = host.containers.get_mut(&container)?;
+    let at = list.iter().position(|&i| i == item)?;
+    list.remove(at);
+    Some(match host.carry(world, item) {
+        Carry::Stacked(target) => PickUp::Stacked(target),
+        Carry::Added => {
+            world.send_event(host, Some(player), item, "inventoryin", Vec::new());
+            host.prune_inventory();
+            PickUp::Added
+        }
+    })
+}
+
+/// Take everything out of a container; returns how many entries were taken.
+pub fn take_all(world: &mut ScriptWorld, host: &mut StdHost, player: EntityId, container: EntityId) -> usize {
+    let items = host.containers.get(&container).cloned().unwrap_or_default();
+    items.iter().filter(|&&i| take_from_container(world, host, player, container, i).is_some()).count()
 }
 
 /// Put a carried item back into the world at `pos` (Arx coordinates).
@@ -205,5 +228,60 @@ mod tests {
         assert_eq!(h.take_messages(), ["dropped"]);
         assert!(!drop_item(&mut w, &mut h, player, pie, [0.0; 3]));
         assert_eq!(pick_up(&mut w, &mut h, player, pie), PickUp::Added, "it can be picked up again");
+    }
+
+    #[test]
+    fn chests_hold_items_that_can_be_taken_out() {
+        let (mut w, mut h, player) = scene();
+        let class_scripts: std::collections::HashMap<String, Arc<Script>> = [
+            ("graph/obj3d/interactive/items/provisions/applepie/applepie".to_owned(), script(PIE)),
+            ("graph/obj3d/interactive/items/gold_coin/gold_coin".to_owned(), script("on init {\n playerstacksize 9999\n accept\n}")),
+        ]
+        .into();
+        h.set_script_loader(Box::new(move |class| class_scripts.get(class).cloned()));
+        let chest_src = "on init {\n inventory create\n inventory add \"provisions\\\\applepie\\\\applepie\"\n inventory addmulti gold_coin\\gold_coin 25\n inventory add provisions\\nothing\\nothing\n set \u{a7}locked 1\n accept\n}\non inventory2_open {\n if (\u{a7}locked == 1) {\n  herosay locked\n  refuse\n }\n accept\n}\non inventory2_close {\n herosay lid_closed\n accept\n}\non unlock {\n set \u{a7}locked 0\n accept\n}";
+        let chest = w.add_entity(EntityKind::Fix, "fix_inter/chest/chest", 1, Some(script(chest_src)), None);
+        w.send_init(&mut h, chest);
+        let held = h.containers.get(&chest).expect("inventory create made a container").clone();
+        assert_eq!(held.len(), 2, "the unknown item class could not be added");
+        assert_eq!(h.state(held[1]).map(|s| s.count), Some(25));
+        assert!(h.state(held[0]).unwrap().hidden, "contents are not in the world");
+        assert!(!w.stats.warnings.is_empty());
+        assert!(is_container(&w, &h, chest));
+        assert!(!open_container(&mut w, &mut h, player, chest), "a locked chest refuses");
+        assert_eq!((h.open_container, h.take_messages()), (None, vec!["locked".to_owned()]));
+        w.send_event(&mut h, Some(player), chest, "unlock", vec![]);
+        assert!(open_container(&mut w, &mut h, player, chest));
+        assert_eq!(h.open_container, Some(chest));
+
+        assert_eq!(take_from_container(&mut w, &mut h, player, chest, held[0]), Some(PickUp::Added));
+        assert_eq!(h.player.inventory, [held[0]]);
+        assert_eq!(h.containers[&chest], [held[1]]);
+        assert_eq!(take_from_container(&mut w, &mut h, player, chest, held[0]), None, "already taken");
+        assert_eq!(take_all(&mut w, &mut h, player, chest), 1);
+        assert!(h.containers[&chest].is_empty());
+        assert_eq!(h.state(held[1]).map(|s| s.count), Some(25));
+        h.take_messages();
+        close_container(&mut w, &mut h, player);
+        assert_eq!((h.open_container, h.take_messages()), (None, vec!["lid_closed".to_owned()]));
+    }
+
+    #[test]
+    fn items_created_for_the_player_stack_with_what_is_carried() {
+        let (mut w, mut h, player) = scene();
+        let scripts: std::collections::HashMap<String, Arc<Script>> =
+            [("graph/obj3d/interactive/items/provisions/applepie/applepie".to_owned(), script(PIE))].into();
+        h.set_script_loader(Box::new(move |class| scripts.get(class).cloned()));
+        let giver = w.add_entity(
+            EntityKind::Fix,
+            "fix_inter/giver/giver",
+            1,
+            Some(script("on action {\n inventory playeradd provisions\\applepie\\applepie\n inventory playeraddmulti provisions\\applepie\\applepie 2\n accept\n}")),
+            None,
+        );
+        w.send_event(&mut h, Some(player), giver, "action", vec![]);
+        assert_eq!(h.player.inventory.len(), 1, "both pies share one stack");
+        assert_eq!(h.state(h.player.inventory[0]).unwrap().count, 3);
+        assert_eq!(h.take_messages(), ["got_pie"], "inventoryin ran for the new entry only");
     }
 }

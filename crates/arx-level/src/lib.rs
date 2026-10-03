@@ -4,7 +4,7 @@
 pub mod inventory;
 
 use arx_formats::{PakSet, dlf::Dlf, ftl::Ftl};
-use arx_physics::{CollisionWorld, ObstacleId};
+use arx_physics::{CollisionWorld, CylinderId, ObstacleId};
 use arx_script::{EntityId, EntityKind, Script, ScriptWorld, StdHost};
 use glam::{Quat, Vec3};
 use std::collections::HashMap;
@@ -70,6 +70,11 @@ impl Scripts {
                 Some(frames as f64 * 1000.0 / 24.0)
             }));
         }
+        {
+            // Item scripts, for `inventory add`.
+            let pak = pak.clone();
+            host.set_script_loader(Box::new(move |class| pak.read(&format!("{class}.asl")).ok().map(|b| Arc::new(Script::new(&b)))));
+        }
         let player = world.add_entity(EntityKind::Player, "graph/obj3d/interactive/npc/player/player", 1, None, None);
 
         let load = |path: &str| pak.read(path).ok().map(|b| Arc::new(Script::new(&b)));
@@ -97,10 +102,37 @@ impl Scripts {
     }
 }
 
+/// Radius and height of the cylinder that stands for a character in collisions, from its model's vertices
+/// (Arx coordinates, y down; `origin` is the model's origin vertex, normally at the feet). Ported from the
+/// engine: the radius is 1.2 times the farthest foot-level vertex, shrunk for very short models, capped at 40,
+/// and the collision test clamps the scaled values to 25..60 and 45..165.
+pub fn character_cylinder(vertices: &[[f32; 3]], origin: usize, scale: f32) -> Option<(f32, f32)> {
+    let o = *vertices.get(origin)?;
+    let (mut reach, mut height) = (0.0f32, 0.0f32);
+    for (i, v) in vertices.iter().enumerate() {
+        if i != origin && (o[1] - v[1]).abs() < 20.0 {
+            reach = reach.max(Vec3::from(o).distance(Vec3::from(*v)));
+        }
+        height = height.max(o[1] - v[1]);
+    }
+    if reach == 0.0 || height == 0.0 {
+        return None;
+    }
+    let mut radius = reach * 1.2;
+    if height < 40.0 {
+        radius *= 0.5 + height / 40.0 * 0.5;
+    }
+    let height = height.clamp(40.0, 165.0);
+    let radius = radius.min(40.0);
+    Some(((radius * scale).clamp(25.0, 60.0), (height * scale).clamp(45.0, 165.0)))
+}
+
 /// Which collision obstacle belongs to which entity.
 #[derive(Default)]
 pub struct EntityObstacles {
     pub by_entity: HashMap<EntityId, ObstacleId>,
+    /// Characters (NPCs) block the player with a cylinder.
+    pub characters: HashMap<EntityId, CylinderId>,
 }
 
 impl EntityObstacles {
@@ -120,7 +152,8 @@ impl EntityObstacles {
         let mut models: HashMap<String, Option<Arc<Ftl>>> = HashMap::new();
         for (index, e) in dlf.entities.iter().enumerate() {
             let id = ids[index];
-            if world.entity(id).kind != EntityKind::Fix {
+            let kind = world.entity(id).kind;
+            if kind != EntityKind::Fix && kind != EntityKind::Npc {
                 continue;
             }
             let st = host.state(id).cloned().unwrap_or_default();
@@ -132,6 +165,13 @@ impl EntityObstacles {
                 .clone();
             let Some(ftl) = model else { continue };
             let origin = to_yup([e.pos[0] + scene_pos.x, e.pos[1] + scene_pos.y, e.pos[2] + scene_pos.z]);
+            if kind == EntityKind::Npc {
+                let points: Vec<[f32; 3]> = ftl.vertices.iter().map(|v| v.pos).collect();
+                if let Some((radius, height)) = character_cylinder(&points, ftl.origin as usize, st.scale) {
+                    out.characters.insert(id, collision.add_cylinder(origin, radius, height));
+                }
+                continue;
+            }
             let rot = entity_rotation(e.angle, false);
             let world_pos = |i: u16| origin + rot * (to_yup(ftl.vertices[i as usize].pos) * st.scale);
             let tris = ftl.faces.iter().map(|f| [world_pos(f.vid[0]), world_pos(f.vid[1]), world_pos(f.vid[2])]);
@@ -152,12 +192,35 @@ impl EntityObstacles {
                 collision.set_obstacle_enabled(obstacle, solid);
             }
         }
+        for (&entity, &cylinder) in &self.characters {
+            let solid = host.state(entity).is_none_or(|s| s.collision && !s.hidden && !s.destroyed);
+            if let Some(c) = collision.cylinder(cylinder)
+                && c.enabled != solid
+            {
+                collision.set_cylinder(cylinder, c.base, solid);
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn character_cylinders_follow_the_engines_rules() {
+        // A human-ish figure: origin at the feet, a wide stance (feet 40 from the origin) and 170 tall.
+        let pts = [[0.0, 0.0, 0.0], [40.0, 0.0, 0.0], [-30.0, 5.0, 10.0], [0.0, -170.0, 0.0], [20.0, -90.0, 0.0]];
+        let (radius, height) = character_cylinder(&pts, 0, 1.0).unwrap();
+        assert!((radius - 40.0).abs() < 1e-4, "1.2 x 40 = 48, capped at 40: {radius}");
+        assert!((height - 165.0).abs() < 1e-4, "170 is clamped to 165: {height}");
+        // Scaled down, the radius clamps to at least 25.
+        let (small_r, small_h) = character_cylinder(&pts, 0, 0.5).unwrap();
+        assert_eq!((small_r, small_h), (25.0, 82.5));
+        // A flat model has no cylinder.
+        assert!(character_cylinder(&[[0.0; 3], [10.0, 0.0, 0.0]], 0, 1.0).is_none());
+        assert!(character_cylinder(&[], 0, 1.0).is_none());
+    }
 
     #[test]
     fn engine_yaw_remapping() {

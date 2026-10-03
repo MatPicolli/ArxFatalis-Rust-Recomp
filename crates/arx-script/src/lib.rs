@@ -13,7 +13,7 @@ mod text;
 mod vars;
 mod world;
 
-pub use host::{AnimDuration, EntityState, Mood, PlayAnim, SoundRequest, SpeechEvent, SpeechFlags, SpeechRequest, StdHost};
+pub use host::{AnimDuration, Carry, NoteKind, NoteRequest, ScriptLoader, EntityState, Mood, PlayAnim, SoundRequest, SpeechEvent, SpeechFlags, SpeechRequest, StdHost};
 pub use interp::{Args, CmdResult, Context, Host, ScriptResult, has_flag};
 pub use player::{Attributes, PlayerState, Pool};
 pub use text::Script;

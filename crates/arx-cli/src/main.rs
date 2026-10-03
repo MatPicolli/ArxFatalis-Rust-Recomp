@@ -42,8 +42,15 @@ enum Cmd {
     /// List every level polygon (any flags) covering the Arx-coordinate point (x, z), to debug collision
     PolysAt { level: u32, x: f32, z: f32 },
     /// Play a level headlessly through its scripts: each step is `list <text>`, `pickup <id>`, `use <id>`,
-    /// `combine <id> <target id>`, `send <id> <event>`, `drop <id>` or `status`
+    /// `combine <id> <target id>`, `send <id> <event>`, `drop <id>`, `open <container>`, `close`, `contents <id>`, `take <container> <item|all>` or `status`
     Game { level: u32, steps: Vec<String> },
+    /// Send `action` to every fixture (doors, levers, chests, switches, ...) of a level (no argument = all levels)
+    /// and report, per class, how many reacted visibly (animation, sound, message, speech, state change) and
+    /// which unimplemented commands they hit
+    Fixtures { level: Option<u32> },
+    /// Original player movement speeds, derived from the hero animations the way the engine does (root motion
+    /// per millisecond, scaled by 0.0125; the engine's velocity damping then settles at that / 0.009)
+    PlayerSpeeds,
     /// Decode every .wav in the archives (sfx, speech) and report failures and totals; with a path,
     /// decode that file to a 16-bit PCM wav at `--out`
     Audio { path: Option<String>, #[arg(short, long)] out: Option<PathBuf> },
@@ -56,7 +63,9 @@ enum Cmd {
     /// Simulate the player in a level: drop from the start, then walk in 8 directions and report how
     /// far each walk got before hitting a wall (a headless check of the collision system)
     Walk { level: u32, /// ignore doors and other entities (level geometry only)
-        #[arg(long)] no_entities: bool },
+        #[arg(long)] no_entities: bool,
+        /// never jump during the fuzz (separates collision problems from long jumps over edges)
+        #[arg(long)] no_jump: bool },
     /// Parse a .tea animation (and with --model, pose that .ftl at several times); no path = parse all
     Tea { path: Option<String>, #[arg(long)] model: Option<String> },
     /// Parse level scene definitions (`graph/levels/levelN/levelN.dlf`); no argument = all levels
@@ -444,20 +453,114 @@ fn main() -> Result<()> {
                         s.world.update(&mut s.host, 0.0);
                         println!("  {} {event} -> {r:?}", name(&s, id));
                     }
+                    ["contents", id] => {
+                        let id = find(&s, id)?;
+                        let held = s.host.containers.get(&id).cloned();
+                        match held {
+                            None => println!("  {} holds nothing (no container)", name(&s, id)),
+                            Some(list) => {
+                                println!("  {} holds {} entries", name(&s, id), list.len());
+                                for i in list { println!("    {} x{}", name(&s, i), s.host.state(i).map_or(0, |x| x.count)); }
+                            }
+                        }
+                    }
+                    ["open", id] => {
+                        let id = find(&s, id)?;
+                        println!("  {} -> opened: {}", name(&s, id), inventory::open_container(&mut s.world, &mut s.host, s.player, id));
+                    }
+                    ["close"] => inventory::close_container(&mut s.world, &mut s.host, s.player),
+                    ["take", container, what] => {
+                        let c = find(&s, container)?;
+                        if *what == "all" {
+                            println!("  took {}", inventory::take_all(&mut s.world, &mut s.host, s.player, c));
+                        } else {
+                            let item = find(&s, what)?;
+                            println!("  {:?}", inventory::take_from_container(&mut s.world, &mut s.host, s.player, c, item));
+                        }
+                    }
                     ["status"] => {
+                        if let Some(c) = s.host.open_container { println!("  open container: {}", name(&s, c)); }
                         let p = &s.host.player;
                         println!("  life {}/{}  mana {}/{}  hunger {}", p.life.current, p.life.max, p.mana.current, p.mana.max, p.hunger);
                         for &i in &p.inventory { println!("  carrying {} x{}", name(&s, i), s.host.state(i).map_or(0, |x| x.count)); }
                     }
                     _ => println!("  unknown step"),
                 }
+                for n in s.host.take_notes() { println!("  {:?}: {}", n.kind, loc.text_or_key(&n.text)); }
                 for m in s.host.take_messages() { println!("  herosay: {}", loc.text_or_key(&m)); }
                 for e in s.host.take_speech() { if let arx_script::SpeechEvent::Say(r) = e { println!("  speech: {}", loc.text_or_key(&r.key)); } }
                 for snd in s.host.take_sounds() { println!("  sound: {}", snd.name); }
             }
         }
-        Cmd::Walk { level, no_entities } => {
-            use arx_physics::{CollisionWorld, Player, EYE_HEIGHT};
+        Cmd::Fixtures { level } => {
+            use arx_script::EntityKind;
+            use std::collections::BTreeMap;
+            #[derive(Default)]
+            struct Row { tried: usize, reacted: usize, unknown: BTreeMap<String, usize>, example: String, effects: BTreeMap<&'static str, usize> }
+            let mut rows: BTreeMap<String, Row> = BTreeMap::new();
+            for l in (0..=30u32).filter(|l| level.is_none_or(|x| x == *l) && pak.contains(&format!("graph/levels/level{l}/level{l}.dlf"))) {
+                let Ok(dlf) = pak.load_dlf(l) else { continue };
+                let Ok(fts) = arx_formats::fts::Fts::parse(&pak.read(&format!("game/graph/levels/level{l}/fast.fts"))?) else { continue };
+                let mut s = arx_level::Scripts::build(&pak, &dlf, glam::Vec3::from(fts.scene_pos));
+                s.host.take_sounds(); s.host.take_messages(); s.host.take_speech();
+                for id in 0..s.world.entities.len() as u32 {
+                    let e = s.world.entity(id);
+                    if e.kind != EntityKind::Fix || e.script.is_none() { continue; }
+                    let class = e.class.rsplit('/').next().unwrap_or(&e.class).to_owned();
+                    let before = s.host.state(id).cloned().unwrap_or_default();
+                    let vars_before = format!("{:?}", s.world.entity(id).vars);
+                    let unknown_before = s.world.stats.unknown_commands.clone();
+                    s.world.send_event(&mut s.host, Some(s.player), id, "action", vec![]);
+                    s.world.update(&mut s.host, 4000.0);
+                    let after = s.host.state(id).cloned().unwrap_or_default();
+                    let mut effects = Vec::new();
+                    if after.anim_serial != before.anim_serial { effects.push("animation"); }
+                    if !s.host.take_sounds().is_empty() { effects.push("sound"); }
+                    if !s.host.take_messages().is_empty() || !s.host.take_speech().is_empty() { effects.push("text"); }
+                    if (after.hidden, after.destroyed, after.collision, after.interactive) != (before.hidden, before.destroyed, before.collision, before.interactive) { effects.push("state"); }
+                    if format!("{:?}", s.world.entity(id).vars) != vars_before { effects.push("variables"); }
+                    let row = rows.entry(class).or_default();
+                    row.tried += 1;
+                    if row.example.is_empty() { row.example = s.world.entity(id).id_string.clone(); }
+                    if !effects.is_empty() { row.reacted += 1; }
+                    for f in &effects { *row.effects.entry(f).or_default() += 1; }
+                    for (k, n) in &s.world.stats.unknown_commands {
+                        if n > unknown_before.get(k).unwrap_or(&0) { *row.unknown.entry(k.clone()).or_default() += 1; }
+                    }
+                }
+            }
+            println!("{:<34} {:>5} {:>7}  effects / unimplemented commands hit by `action`", "class", "tried", "reacted");
+            for (class, r) in &rows {
+                let eff: Vec<String> = r.effects.iter().map(|(k, n)| format!("{k}x{n}")).collect();
+                let unk: Vec<String> = r.unknown.iter().map(|(k, n)| format!("{k}x{n}")).collect();
+                let flag = if r.reacted == 0 { "  <-- nothing observable" } else { "" };
+                println!("{class:<34} {:>5} {:>7}  {} {}{flag}", r.tried, r.reacted, eff.join(","), if unk.is_empty() { String::new() } else { format!("[unimplemented: {}]", unk.join(",")) });
+            }
+        }
+        Cmd::PlayerSpeeds => {
+            let anims = [
+                ("run (default forward)", "player_normal_run_test"), ("walk (stealth forward)", "human_normal_walk"),
+                ("run backward", "player_normal_run_backward_test"), ("walk backward", "human_normal_walk_backward"),
+                ("strafe run right", "player_normal_strafe_run_right"), ("strafe run left", "player_normal_strafe_run_left"),
+                ("strafe right (stealth)", "human_normal_strafe_right"),
+                ("crouch walk", "human_normal_crouch_walk_forward"), ("crouch walk backward", "human_normal_crouch_walk_backward"),
+                ("crouch strafe right", "human_normal_crouch_strafe_right"),
+                ("crouch in", "human_normal_crouch_in"), ("crouch out", "human_normal_crouch_out"),
+                ("jump anticipation", "human_normal_jump_part1_anticipation"), ("jump up", "human_normal_jump_part2_jumpup"),
+            ];
+            println!("{:<26} {:>9} {:>9} {:>11} {:>14}", "animation", "root move", "time ms", "scale /ms", "steady u/s");
+            for (label, file) in anims {
+                let path = format!("graph/obj3d/anims/npc/{file}.tea");
+                let Ok(bytes) = pak.read(&path) else { println!("{label:<26} missing {path}"); continue };
+                let t = arx_formats::tea::Tea::parse(&bytes)?;
+                let mv = t.frames.last().map_or(0.0, |f| f.translate.length());
+                let ms = t.duration_us as f32 / 1000.0;
+                let scale = mv / ms * 0.0125;
+                println!("{label:<26} {mv:>9.1} {ms:>9.0} {scale:>11.5} {:>14.1}", scale / 0.009 * 1000.0);
+            }
+        }
+        Cmd::Walk { level, no_entities, no_jump } => {
+            use arx_physics::{CollisionWorld, MoveInput, Player, EYE_HEIGHT};
             let fts = arx_formats::fts::Fts::parse(&pak.read(&format!("game/graph/levels/level{level}/fast.fts"))?)?;
             let t = std::time::Instant::now();
             let mut world = CollisionWorld::from_fts(&fts);
@@ -468,7 +571,14 @@ fn main() -> Result<()> {
                     let s = arx_level::Scripts::build(&pak, &dlf, scene_pos);
                     let obstacles = arx_level::EntityObstacles::build(&mut world, &pak, &dlf, scene_pos, &s.world, &s.host, &s.ids);
                     let enabled = obstacles.by_entity.values().filter(|o| world.obstacle_enabled(**o)).count();
-                    println!("entity obstacles: {} ({} solid right now)", obstacles.by_entity.len(), enabled);
+                    println!("entity obstacles: {} ({} solid right now), {} character cylinders", obstacles.by_entity.len(), enabled, obstacles.characters.len());
+                    let (mut rs, mut hs): (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
+                    for c in obstacles.characters.values().filter_map(|c| world.cylinder(*c)) { rs.push(c.radius); hs.push(c.height); }
+                    if !rs.is_empty() {
+                        let (rmin, rmax) = rs.iter().fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
+                        let (hmin, hmax) = hs.iter().fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
+                        println!("  character cylinders: radius {rmin:.0}..{rmax:.0}, height {hmin:.0}..{hmax:.0}");
+                    }
                     scripts = Some((s, obstacles));
                 }
             }
@@ -486,7 +596,7 @@ fn main() -> Result<()> {
                 if let Some(p) = nearest { start = p; }
             }
             let mut p = Player::new(start + glam::Vec3::Y * 40.0);
-            for _ in 0..300 { p.step(&world, 1.0 / 60.0, glam::Vec2::ZERO, false); }
+            for _ in 0..300 { p.step(&world, 1.0 / 60.0, MoveInput::default()); }
             println!("dropped from 40 above the start: feet y {:.1} (start y {:.1}), on_ground {}, eye {:.1}", p.feet.y, start.y, p.on_ground, p.feet.y + EYE_HEIGHT);
             if !p.on_ground {
                 // The saved start can be over nothing; use the centre of the largest upward-facing solid polygon instead.
@@ -496,7 +606,7 @@ fn main() -> Result<()> {
                     let n = vs.len() as f32;
                     let c = glam::Vec3::new(vs.iter().map(|v| v.pos[0]).sum::<f32>() / n, -vs.iter().map(|v| v.pos[1]).sum::<f32>() / n, -vs.iter().map(|v| v.pos[2]).sum::<f32>() / n);
                     p = Player::new(c + glam::Vec3::Y * 40.0);
-                    for _ in 0..300 { p.step(&world, 1.0 / 60.0, glam::Vec2::ZERO, false); }
+                    for _ in 0..300 { p.step(&world, 1.0 / 60.0, MoveInput::default()); }
                     println!("start was over nothing; relocated to the largest floor polygon: feet y {:.1}, on_ground {}", p.feet.y, p.on_ground);
                 }
             }
@@ -505,9 +615,9 @@ fn main() -> Result<()> {
                 let mut q = settled;
                 let dir = glam::Vec2::from_angle((deg as f32).to_radians());
                 let mut min_y = q.feet.y; let mut max_y = q.feet.y;
-                for _ in 0..240 { q.step(&world, 1.0 / 60.0, dir * 300.0, false); min_y = min_y.min(q.feet.y); max_y = max_y.max(q.feet.y); }
+                for _ in 0..240 { q.step(&world, 1.0 / 60.0, MoveInput::toward(dir)); min_y = min_y.min(q.feet.y); max_y = max_y.max(q.feet.y); }
                 let moved = (q.feet - settled.feet).truncate();
-                println!("walk {deg:>3} deg for 4s at 300/s (1200 units free): moved {:>6.0}, height change {:+.0}..{:+.0}, on_ground {}", glam::Vec2::new(q.feet.x - settled.feet.x, q.feet.z - settled.feet.z).length(), min_y - settled.feet.y, max_y - settled.feet.y, q.on_ground);
+                println!("run {deg:>3} deg for 4s (about 1000 units free): moved {:>6.0}, height change {:+.0}..{:+.0}, on_ground {}", glam::Vec2::new(q.feet.x - settled.feet.x, q.feet.z - settled.feet.z).length(), min_y - settled.feet.y, max_y - settled.feet.y, q.on_ground);
                 let _ = moved;
             }
             // Fuzz: wander randomly (with jumps) for a few minutes of game time and make sure the
@@ -521,8 +631,8 @@ fn main() -> Result<()> {
             let mut heading = 0.0f32;
             for f in 0..60 * 180 {
                 if f % 45 == 0 { heading += (rnd() - 0.5) * 3.0; }
-                let speed = if rnd() < 0.7 { 300.0 } else { 600.0 };
-                q.step(&world, 1.0 / 60.0, glam::Vec2::from_angle(heading) * speed, f % 200 == 0);
+                let sneak = rnd() < 0.3;
+                q.step(&world, 1.0 / 60.0, MoveInput { stealth: sneak, jump: !no_jump && f % 200 == 0, ..MoveInput::toward(glam::Vec2::from_angle(heading)) });
                 lo = lo.min(q.feet.y); hi = hi.max(q.feet.y);
                 frames += 1; grounded += q.on_ground as usize;
                 if q.on_ground { fall_run = 0; last_ground = q.feet } else { fall_run += 1; worst_fall = worst_fall.max(fall_run); if [1, 3, 6, 12, 30].contains(&fall_run) { println!("    airborne +{fall_run}: pos ({:.0}, {:.0}, {:.0}) vel_y {:.0}; floor anywhere below here: {:?}", q.feet.x, q.feet.y, q.feet.z, q.vel_y, world.floor_height(q.feet.x, q.feet.z, q.feet.y + 45.0)); }

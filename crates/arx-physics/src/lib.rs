@@ -2,21 +2,31 @@
 //!
 //! All coordinates here are **y-up** (the Bevy convention); [`CollisionWorld::from_fts`] converts
 //! from Arx's y-down data. The world is a bag of triangles in a 2D spatial hash. The player is a
-//! vertical cylinder that slides along steep triangles, steps over low ones and stands on walkable
-//! ones.
+//! vertical cylinder that slides along steep triangles, steps over low ones, stands on walkable
+//! ones and bumps its head on ceilings.
+//!
+//! The player's movement follows the original engine (`PlayerMovementIterate`): keys push the body with a
+//! force whose strength comes from the speed of the hero animation that would be playing, the body's
+//! horizontal velocity is damped every step, jumps rise a fixed 130 units in 200 ms and then fall slowly,
+//! and a long fall hurts. See [`MoveInput`], [`Player`] and `arx player-speeds`.
 
 use arx_formats::{fts::Fts, poly};
 use glam::{Vec2, Vec3};
 use std::collections::HashMap;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Dimensions of the original player cylinder.
 pub const PLAYER_RADIUS: f32 = 52.0;
 pub const PLAYER_HEIGHT: f32 = 170.0;
+/// Height of the cylinder once the crouch animation has finished.
+pub const CROUCH_HEIGHT: f32 = 120.0;
 /// Eyes are slightly below the top of the cylinder.
 pub const EYE_HEIGHT: f32 = 160.0;
-/// Highest ledge the player walks onto without jumping.
-pub const STEP_HEIGHT: f32 = 45.0;
+/// Eye height while crouched (the original attaches the camera to the head of the animated model).
+pub const CROUCH_EYE_HEIGHT: f32 = 110.0;
+/// Highest ledge the player walks onto without jumping (`PLAYER_CYLINDER_STEP` in the engine).
+pub const STEP_HEIGHT: f32 = 40.0;
 
 const CELL: f32 = 100.0;
 /// Triangles at least this flat (in either orientation) can support the player, as in the original
@@ -24,10 +34,41 @@ const CELL: f32 = 100.0;
 const SUPPORT_NORMAL_Y: f32 = 0.1;
 /// Triangles flatter than this are floors/ceilings; steeper ones block horizontal movement.
 const WALKABLE_NORMAL_Y: f32 = 0.55;
-const GRAVITY: f32 = 1500.0;
-/// How quickly horizontal velocity can change in the air, per second (1.0 = fully within a second).
-const AIR_CONTROL: f32 = 1.2;
-const JUMP_SPEED: f32 = 520.0;
+/// Surfaces at least this flat, in either orientation, stop the head.
+const CEILING_NORMAL_Y: f32 = 0.7;
+
+/// Horizontal velocity loses `0.009` of itself per millisecond (`dampen = 1 - 0.009 * dt` in the engine).
+const DAMPING_PER_MS: f32 = 0.009;
+/// Gravity in units/s^2 (`WORLD_GRAVITY` 0.1 / `TARGET_DT` 33.3 ms, per ms). After a jump or once a fall has
+/// reached [`FALL_TRIGGER_SPEED`] the engine switches to the much weaker `JUMP_GRAVITY`.
+const WORLD_GRAVITY: f32 = 3000.0;
+const FALL_GRAVITY: f32 = 600.0;
+const FALL_TRIGGER_SPEED: f32 = 450.0;
+/// A jump moves the body up by this much over this long, with no gravity (`jump_up_height`, `jump_up_time`).
+const JUMP_RISE: f32 = 130.0;
+const JUMP_RISE_MS: f32 = 200.0;
+/// A jump key press that cannot be carried out yet stays valid this long.
+const JUMP_REQUEST_MS: f32 = 350.0;
+/// Falls shorter than this do no damage; beyond it `(height - 400) / 15` is lost.
+pub const SAFE_FALL_HEIGHT: f32 = 400.0;
+/// Length of the crouch-in / crouch-out animations (`human_normal_crouch_in/out`).
+const CROUCH_ANIM_MS: f32 = 708.3;
+/// A new body step is never longer than this, so thin walls cannot be skipped.
+const MAX_SUBSTEP_SECS: f32 = 1.0 / 60.0;
+
+/// Impulse strength per millisecond, from the root motion of the animation the engine plays: the speed of the
+/// animation (root translation / duration) times 0.0125. Measured by `arx player-speeds`. The horizontal
+/// velocity settles at `scale / 0.009` per millisecond: 266.7 units/s running, 188.3 sneaking, 100 crouched.
+const SCALE_RUN: f32 = 0.002399;
+const SCALE_WALK: f32 = 0.001694;
+const SCALE_WALK_STRAFE: f32 = 0.001696;
+const SCALE_CROUCH_WALK: f32 = 0.000900;
+const SCALE_CROUCH_STRAFE: f32 = 0.000779;
+const SCALE_CROUCH_TRANSITION: f32 = 0.000500;
+/// While jumping or falling the engine uses fixed values instead of an animation's.
+const SCALE_AIR_FORWARD: f32 = 0.0079;
+const SCALE_AIR_BACKWARD: f32 = 0.0008;
+const SCALE_AIR_STRAFE: f32 = 0.0026;
 
 #[derive(Debug, Clone, Copy)]
 struct Tri {
@@ -52,6 +93,20 @@ struct Obstacle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObstacleId(pub usize);
 
+/// A standing character that blocks the player: a vertical cylinder, as the engine models NPCs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Cylinder {
+    /// Centre of the bottom disc.
+    pub base: Vec3,
+    pub radius: f32,
+    pub height: f32,
+    pub enabled: bool,
+}
+
+/// Index of a cylinder added with [`CollisionWorld::add_cylinder`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CylinderId(pub usize);
+
 #[derive(Default)]
 pub struct CollisionWorld {
     tris: Vec<Tri>,
@@ -59,6 +114,8 @@ pub struct CollisionWorld {
     obstacles: Vec<Obstacle>,
     /// One flag per obstacle; atomic so doors can be toggled while the world is shared.
     obstacle_enabled: Vec<AtomicBool>,
+    /// Characters; their position and state change while the world is shared, hence the lock.
+    cylinders: RwLock<Vec<Cylinder>>,
     /// Centre of the largest flat, upward-facing solid triangle: a safe place to put the player.
     fallback_spawn: Option<(f32, Vec3)>,
 }
@@ -185,6 +242,25 @@ impl CollisionWorld {
         self.obstacle_enabled[id.0].load(Ordering::Relaxed)
     }
 
+    /// Add a character cylinder (feet position `base`). Returns its id.
+    pub fn add_cylinder(&mut self, base: Vec3, radius: f32, height: f32) -> CylinderId {
+        let list = self.cylinders.get_mut().expect("cylinder lock");
+        list.push(Cylinder { base, radius, height, enabled: true });
+        CylinderId(list.len() - 1)
+    }
+
+    /// Move a character and/or switch it on or off (a dead or hidden character does not block).
+    pub fn set_cylinder(&self, id: CylinderId, base: Vec3, enabled: bool) {
+        if let Some(c) = self.cylinders.write().expect("cylinder lock").get_mut(id.0) {
+            c.base = base;
+            c.enabled = enabled;
+        }
+    }
+
+    pub fn cylinder(&self, id: CylinderId) -> Option<Cylinder> {
+        self.cylinders.read().expect("cylinder lock").get(id.0).copied()
+    }
+
     pub fn obstacle_count(&self) -> usize {
         self.obstacles.len()
     }
@@ -250,14 +326,55 @@ impl CollisionWorld {
             .max_by(f32::total_cmp)
     }
 
+    /// Lowest flat surface (floor of the storey above, ceiling, beam, table top) over the footprint whose height
+    /// is in `(from_y, to_y]`: what a head reaching up to `to_y` would hit.
+    fn ceiling_above(&self, pos: Vec3, from_y: f32, to_y: f32) -> Option<f32> {
+        let r = PLAYER_RADIUS * 0.5;
+        let mut best: Option<f32> = None;
+        for (dx, dz) in [(0.0, 0.0), (r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r)] {
+            let (x, z) = (pos.x + dx, pos.z + dz);
+            let p = Vec2::new(x, z);
+            let mut consider = |t: &Tri| {
+                if t.n.y.abs() < CEILING_NORMAL_Y || t.max_y <= from_y || t.min_y > to_y {
+                    return;
+                }
+                let (_, inside) = closest_on_tri_2d(p, Vec2::new(t.a.x, t.a.z), Vec2::new(t.b.x, t.b.z), Vec2::new(t.c.x, t.c.z));
+                if !inside {
+                    return;
+                }
+                let y = t.a.y - (t.n.x * (x - t.a.x) + t.n.z * (z - t.a.z)) / t.n.y;
+                if y > from_y && y <= to_y && best.is_none_or(|b| y < b) {
+                    best = Some(y);
+                }
+            };
+            for t in self.query(p, p) {
+                consider(t);
+            }
+            for (o, enabled) in self.obstacles.iter().zip(&self.obstacle_enabled) {
+                if o.min.x > x || o.max.x < x || o.min.z > z || o.max.z < z || o.max.y <= from_y || o.min.y > to_y || !enabled.load(Ordering::Relaxed) {
+                    continue;
+                }
+                for t in &o.tris {
+                    consider(t);
+                }
+            }
+        }
+        best
+    }
+
+    /// Free height above `base_y` at `pos` before a ceiling (infinite if there is none within `reach`).
+    fn headroom(&self, pos: Vec3, base_y: f32, reach: f32) -> f32 {
+        self.ceiling_above(pos, base_y + STEP_HEIGHT, base_y + reach).map_or(f32::INFINITY, |c| c - base_y)
+    }
+
     /// Push the cylinder at `pos` out of nearby steep triangles (and enabled obstacles) in the
     /// horizontal plane. `prev` is where the player was before this move: it decides which side of a
     /// wall the player belongs on, so a wall can never push them through itself. Obstacles whose top
     /// is below `pos.y + step` are low enough to step over (and are left to the floor pass).
-    fn push_out_of_walls(&self, pos: &mut Vec3, prev: Vec3, step: f32) {
+    fn push_out_of_walls(&self, pos: &mut Vec3, prev: Vec3, step: f32, height: f32) {
         let r = PLAYER_RADIUS;
         for _ in 0..8 {
-            let (lo, hi) = (pos.y + step, pos.y + PLAYER_HEIGHT);
+            let (lo, hi) = (pos.y + step, pos.y + height);
             let center = Vec2::new(pos.x, pos.z);
             let mut push: Option<Vec2> = None;
 
@@ -311,6 +428,22 @@ impl CollisionWorld {
                 }
             }
 
+            // Characters: circles around their cylinders, whichever side the player is on.
+            for c in self.cylinders.read().expect("cylinder lock").iter() {
+                if !c.enabled || c.base.y + c.height < lo || c.base.y > hi {
+                    continue;
+                }
+                let d = center - Vec2::new(c.base.x, c.base.z);
+                let (len, reach) = (d.length(), r + c.radius);
+                if len < reach {
+                    let away = if len > 1e-4 { d / len } else { (Vec2::new(prev.x, prev.z) - Vec2::new(c.base.x, c.base.z)).normalize_or(Vec2::X) };
+                    let amount = reach - len + 0.01;
+                    if push.is_none_or(|p| amount > p.length()) {
+                        push = Some(away * amount);
+                    }
+                }
+            }
+
             match push {
                 Some(p) => {
                     pos.x += p.x;
@@ -322,73 +455,386 @@ impl CollisionWorld {
     }
 }
 
+/// What a movement key press means in the original: the direction of the push and which animation (and so
+/// which speed) goes with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MoveKind {
+    #[default]
+    None,
+    Forward,
+    Backward,
+    Strafe,
+}
+
+/// One frame of player input.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MoveInput {
+    /// Horizontal direction the keys push toward in world space (unit length), or zero.
+    pub dir: Vec2,
+    pub kind: MoveKind,
+    /// Sneak (Shift in the original): the slower walking animations.
+    pub stealth: bool,
+    pub crouch: bool,
+    pub jump: bool,
+}
+
+impl MoveInput {
+    /// Push toward `dir` as if walking forward (used by tools and tests).
+    pub fn toward(dir: Vec2) -> Self {
+        let dir = dir.normalize_or_zero();
+        MoveInput { dir, kind: if dir == Vec2::ZERO { MoveKind::None } else { MoveKind::Forward }, ..Default::default() }
+    }
+
+    /// Combine the movement keys the way the engine does. `yaw` is the view direction in radians, 0 looking
+    /// along -Z and increasing counter-clockwise. Moving forward and sideways at once is a little weaker
+    /// forward (0.8) and strafing counts 6 against 10 forward / 5 backward; only the resulting direction
+    /// matters, the speed comes from the animation that goes with the dominant key.
+    pub fn from_keys(yaw: f32, forward: bool, backward: bool, left: bool, right: bool) -> Self {
+        let f = Vec2::new(-yaw.sin(), -yaw.cos());
+        let r = Vec2::new(yaw.cos(), -yaw.sin());
+        let strafing = left || right;
+        let diagonal = if strafing { 0.8 } else { 1.0 };
+        let mut tm = Vec2::ZERO;
+        if backward {
+            tm -= f * 5.0 * diagonal;
+        }
+        if forward {
+            tm += f * 10.0 * diagonal;
+        }
+        if left {
+            tm -= r * 6.0;
+        }
+        if right {
+            tm += r * 6.0;
+        }
+        let kind = if forward {
+            MoveKind::Forward
+        } else if backward {
+            MoveKind::Backward
+        } else if left != right {
+            MoveKind::Strafe
+        } else {
+            MoveKind::None
+        };
+        MoveInput { dir: tm.normalize_or_zero(), kind, ..Default::default() }
+    }
+}
+
+/// Where the player is in a crouch. The collision cylinder only shrinks once the crouch-in animation has
+/// finished, and while either animation plays the body moves slowly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Stance {
+    Standing,
+    /// Crouch-in animation playing; milliseconds left.
+    GoingDown(f32),
+    Crouched,
+    /// Crouch-out animation playing; milliseconds left.
+    GettingUp(f32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum JumpPhase {
+    None,
+    /// Rising for 200 ms; milliseconds so far.
+    Ascending(f32),
+    /// Falling after a jump or off a ledge; gravity is weak.
+    Descending,
+}
+
 /// First-person player body: feet position, vertical velocity, ground state.
 #[derive(Debug, Clone, Copy)]
 pub struct Player {
     pub feet: Vec3,
+    /// Vertical velocity in units/s, positive up.
     pub vel_y: f32,
     pub on_ground: bool,
-    /// Horizontal velocity: follows the wish direction on the ground, keeps its momentum in the air.
+    /// Horizontal velocity in units/s. It builds up while keys push and is damped every step.
     pub vel_h: Vec2,
     /// Last position that had solid ground under it (the engine's "last valid position").
     pub last_ground: Vec3,
     /// How many times the player fell out of the world and was put back on `last_ground`.
     pub rescues: u32,
+    pub stance: Stance,
+    pub phase: JumpPhase,
+    /// In a (weak-gravity) fall; the fall height is measured from `fall_start_y`.
+    pub falling: bool,
+    fall_start_y: f32,
+    clock_ms: f32,
+    last_landing_ms: f32,
+    jump_held: bool,
+    jump_request_ms: Option<f32>,
+    landed_fall: Option<f32>,
 }
 
 /// Falling this far below the last solid ground means the player left the level.
 const RESCUE_DEPTH: f32 = 3000.0;
 
+/// Damage for a fall of `height` units (zero up to [`SAFE_FALL_HEIGHT`]).
+pub fn fall_damage(height: f32) -> f32 {
+    ((height - SAFE_FALL_HEIGHT) / 15.0).max(0.0)
+}
+
 impl Player {
     pub fn new(feet: Vec3) -> Self {
-        Player { feet, vel_y: 0.0, on_ground: false, vel_h: Vec2::ZERO, last_ground: feet, rescues: 0 }
+        Player {
+            feet,
+            vel_y: 0.0,
+            on_ground: false,
+            vel_h: Vec2::ZERO,
+            last_ground: feet,
+            rescues: 0,
+            stance: Stance::Standing,
+            phase: JumpPhase::None,
+            falling: false,
+            fall_start_y: feet.y,
+            clock_ms: 0.0,
+            last_landing_ms: f32::NEG_INFINITY,
+            jump_held: false,
+            jump_request_ms: None,
+            landed_fall: None,
+        }
+    }
+
+    /// Height of the collision cylinder right now.
+    pub fn height(&self) -> f32 {
+        if self.stance == Stance::Crouched { CROUCH_HEIGHT } else { PLAYER_HEIGHT }
+    }
+
+    pub fn is_crouching(&self) -> bool {
+        self.stance != Stance::Standing
+    }
+
+    /// Eye height above the feet; it follows the crouch animations.
+    pub fn eye_height(&self) -> f32 {
+        let lerp = |from: f32, to: f32, left: f32| from + (to - from) * (1.0 - left / CROUCH_ANIM_MS);
+        match self.stance {
+            Stance::Standing => EYE_HEIGHT,
+            Stance::GoingDown(left) => lerp(EYE_HEIGHT, CROUCH_EYE_HEIGHT, left),
+            Stance::Crouched => CROUCH_EYE_HEIGHT,
+            Stance::GettingUp(left) => lerp(CROUCH_EYE_HEIGHT, EYE_HEIGHT, left),
+        }
     }
 
     pub fn eye(&self) -> Vec3 {
-        self.feet + Vec3::Y * EYE_HEIGHT
+        self.feet + Vec3::Y * self.eye_height()
     }
 
-    /// Advance by `dt` seconds. `wish` is the desired horizontal velocity in units/second.
-    pub fn step(&mut self, world: &CollisionWorld, dt: f32, wish: Vec2, jump: bool) {
-        // Sub-step so fast movement cannot skip through thin walls.
-        let max_move = PLAYER_RADIUS * 0.4;
-        let n = ((wish.length().max(self.vel_h.length()) * dt / max_move).ceil() as usize).max(1);
-        let sub = dt / n as f32;
-        let mut jump = jump && self.on_ground;
+    /// The height of the last landing that hurt (falls above [`SAFE_FALL_HEIGHT`]); each is reported once.
+    pub fn take_landing(&mut self) -> Option<f32> {
+        self.landed_fall.take()
+    }
+
+    /// Advance by `dt` seconds.
+    pub fn step(&mut self, world: &CollisionWorld, dt: f32, input: MoveInput) {
+        let n = ((dt / MAX_SUBSTEP_SECS).ceil() as usize).max(1);
+        let sub_ms = dt * 1000.0 / n as f32;
+        if input.jump && !self.jump_held {
+            self.jump_request_ms = Some(0.0);
+        }
+        self.jump_held = input.jump;
         for _ in 0..n {
-            self.vel_h = if self.on_ground && !jump { wish } else { self.vel_h.lerp(wish, (AIR_CONTROL * sub).min(1.0)) };
-            let v = self.vel_h;
-            self.step_once(world, sub, v, jump);
-            jump = false;
+            self.substep(world, sub_ms, input);
         }
         if self.on_ground {
             self.last_ground = self.feet;
         } else if self.feet.y < self.last_ground.y - RESCUE_DEPTH {
             self.feet = self.last_ground;
             self.vel_y = 0.0;
+            self.vel_h = Vec2::ZERO;
             self.on_ground = true;
+            self.phase = JumpPhase::None;
+            self.falling = false;
             self.rescues += 1;
         }
     }
 
-    fn step_once(&mut self, world: &CollisionWorld, dt: f32, wish: Vec2, jump: bool) {
-        // Horizontal move, then resolve against walls.
-        let mut pos = self.feet + Vec3::new(wish.x, 0.0, wish.y) * dt;
-        // Only a grounded player can step over low obstacles; a jump cannot hop over a parapet.
-        world.push_out_of_walls(&mut pos, self.feet, if self.on_ground { STEP_HEIGHT } else { 5.0 });
+    /// Strength of the push this step, from the animation the engine would be playing.
+    fn push_scale(&self, input: &MoveInput) -> f32 {
+        if self.phase != JumpPhase::None {
+            return match input.kind {
+                MoveKind::Backward => SCALE_AIR_BACKWARD,
+                MoveKind::Forward => SCALE_AIR_FORWARD,
+                MoveKind::Strafe => SCALE_AIR_STRAFE,
+                MoveKind::None => 0.0,
+            };
+        }
+        match self.stance {
+            Stance::GoingDown(_) | Stance::GettingUp(_) => SCALE_CROUCH_TRANSITION,
+            Stance::Crouched => match input.kind {
+                MoveKind::Strafe => SCALE_CROUCH_STRAFE,
+                _ => SCALE_CROUCH_WALK,
+            },
+            Stance::Standing if input.stealth => match input.kind {
+                MoveKind::Strafe => SCALE_WALK_STRAFE,
+                _ => SCALE_WALK,
+            },
+            Stance::Standing => SCALE_RUN,
+        }
+    }
 
-        if jump {
-            self.vel_y = JUMP_SPEED;
-            self.on_ground = false;
+    /// Landing slows the push for a while: half strength for 300 ms, then the engine's own ramp, which
+    /// (as in the original) overshoots below zero before it reaches full strength again at 600 ms.
+    fn landing_recovery(&self) -> f32 {
+        let since = self.clock_ms - self.last_landing_ms;
+        if since >= 600.0 {
+            return 1.0;
+        }
+        let mut mul = 0.5;
+        if since >= 300.0 {
+            mul += (300.0 - since) / 300.0;
+        }
+        mul.min(1.0)
+    }
+
+    fn substep(&mut self, world: &CollisionWorld, dt_ms: f32, input: MoveInput) {
+        let dt = dt_ms / 1000.0;
+        self.clock_ms += dt_ms;
+
+        // Crouching. The body stays crouched while there is no room to stand.
+        let can_stand = world.headroom(self.feet, self.feet.y, PLAYER_HEIGHT) >= PLAYER_HEIGHT;
+        let want_crouch = input.crouch || !can_stand;
+        self.stance = match (self.stance, want_crouch) {
+            (Stance::Standing, true) => Stance::GoingDown(CROUCH_ANIM_MS),
+            (Stance::GoingDown(_), false) => Stance::GettingUp(CROUCH_ANIM_MS),
+            (Stance::GoingDown(left), true) if left > dt_ms => Stance::GoingDown(left - dt_ms),
+            (Stance::GoingDown(_), true) => Stance::Crouched,
+            (Stance::Crouched, false) => Stance::GettingUp(CROUCH_ANIM_MS),
+            (Stance::GettingUp(_), true) => Stance::GoingDown(CROUCH_ANIM_MS),
+            (Stance::GettingUp(left), false) if left > dt_ms => Stance::GettingUp(left - dt_ms),
+            (Stance::GettingUp(_), false) => Stance::Standing,
+            (stance, _) => stance,
+        };
+
+        // Jump: needs the ground, and room to stand if the player was crouching.
+        if let Some(t) = &mut self.jump_request_ms {
+            *t += dt_ms;
+            if *t > JUMP_REQUEST_MS {
+                self.jump_request_ms = None;
+            }
+        }
+        if self.jump_request_ms.is_some() && self.on_ground && self.phase == JumpPhase::None {
+            self.jump_request_ms = None;
+            if self.stance == Stance::Standing || can_stand {
+                self.stance = Stance::Standing;
+                self.phase = JumpPhase::Ascending(0.0);
+                self.on_ground = false;
+                self.vel_y = 0.0;
+            }
+        }
+
+        // Horizontal: damping, then the push.
+        let damp = (1.0 - DAMPING_PER_MS * dt_ms).max(0.0);
+        self.vel_h *= damp;
+        if self.vel_h.x.abs() < 1.0 {
+            self.vel_h.x = 0.0;
+        }
+        if self.vel_h.y.abs() < 1.0 {
+            self.vel_h.y = 0.0;
+        }
+        if input.dir != Vec2::ZERO {
+            let push = self.push_scale(&input) * self.landing_recovery();
+            self.vel_h += input.dir * push * dt_ms * 1000.0;
+        }
+
+        // Vertical: gravity, unless on the ground or rising.
+        let mut rise = 0.0;
+        match self.phase {
+            JumpPhase::Ascending(elapsed) => {
+                let now = (elapsed + dt_ms).min(JUMP_RISE_MS);
+                rise = (now - elapsed) / JUMP_RISE_MS * JUMP_RISE;
+                self.phase = if now >= JUMP_RISE_MS { self.start_fall(rise) } else { JumpPhase::Ascending(now) };
+            }
+            _ if self.on_ground => self.vel_y = 0.0,
+            _ => self.vel_y -= if self.falling { FALL_GRAVITY } else { WORLD_GRAVITY } * dt,
+        }
+
+        // A drop that gets fast enough and has nothing close below counts as a fall.
+        if !self.on_ground && self.phase == JumpPhase::None && self.vel_y < -FALL_TRIGGER_SPEED {
+            let gap = world.floor_height(self.feet.x, self.feet.z, self.feet.y).map_or(f32::INFINITY, |f| self.feet.y - f);
+            if gap > 80.0 {
+                self.phase = self.start_fall(0.0);
+            }
+        }
+
+        let was_on_ground = self.on_ground;
+        self.move_body(world, self.vel_h * dt, rise, dt);
+        if !was_on_ground && self.on_ground {
+            self.land();
+        }
+    }
+
+    /// Begin a fall from `extra` above the feet (the rise still to be applied this step).
+    fn start_fall(&mut self, extra: f32) -> JumpPhase {
+        self.falling = true;
+        self.fall_start_y = self.feet.y + extra;
+        self.vel_y = 0.0;
+        JumpPhase::Descending
+    }
+
+    fn land(&mut self) {
+        self.phase = JumpPhase::None;
+        self.last_landing_ms = self.clock_ms;
+        if self.falling {
+            self.vel_h = Vec2::ZERO;
+            let height = self.fall_start_y - self.feet.y;
+            if height > SAFE_FALL_HEIGHT {
+                self.landed_fall = Some(height);
+            }
+            self.falling = false;
+        }
+    }
+
+    /// Move the body by the horizontal displacement `disp` and the vertical `rise`, resolving walls, ceilings
+    /// and floors.
+    fn move_body(&mut self, world: &CollisionWorld, disp: Vec2, rise: f32, dt: f32) {
+        let h = self.height();
+        let old = self.feet;
+        let mut pos = old + Vec3::new(disp.x, 0.0, disp.y);
+        // Only a grounded player can step over low obstacles; a jump cannot hop over a parapet.
+        world.push_out_of_walls(&mut pos, old, if self.on_ground { STEP_HEIGHT } else { 5.0 }, h);
+
+        // Too little headroom stops the body like a wall, unless it is already that low and not getting lower.
+        let on_ground = self.on_ground;
+        let base = |p: Vec3| if on_ground { world.footprint_floor(p, old.y + STEP_HEIGHT).unwrap_or(old.y) } else { old.y };
+        let room = |p: Vec3| world.headroom(p, base(p), h);
+        let before = room(old);
+        let fits = |p: Vec3| {
+            let r = room(p);
+            r >= h || r >= before - 0.5
+        };
+        if (pos.x != old.x || pos.z != old.z) && !fits(pos) {
+            let slide_x = Vec3::new(pos.x, pos.y, old.z);
+            let slide_z = Vec3::new(old.x, pos.y, pos.z);
+            pos = if fits(slide_x) {
+                slide_x
+            } else if fits(slide_z) {
+                slide_z
+            } else {
+                Vec3::new(old.x, pos.y, old.z)
+            };
         }
 
         // Highest floor under the footprint that the player could step onto from here.
         let floor = world.footprint_floor(pos, pos.y + STEP_HEIGHT);
 
-        if self.vel_y <= 0.0 {
+        if rise > 0.0 {
+            pos.y += rise;
+            self.on_ground = false;
+            if let Some(c) = world.ceiling_above(pos, old.y + STEP_HEIGHT, pos.y + h)
+                && c < pos.y + h
+            {
+                // Bumped the head: the rise ends and the fall begins from here.
+                pos.y = (c - h).max(old.y);
+                self.feet = pos;
+                self.phase = self.start_fall(0.0);
+                return;
+            }
+            self.feet = pos;
+            return;
+        }
+        if self.on_ground && self.vel_y <= 0.0 {
             // Standing: follow the floor up and down (stairs) within the step height.
-            if self.on_ground
-                && let Some(f) = floor
+            if let Some(f) = floor
                 && f >= pos.y - STEP_HEIGHT
             {
                 pos.y = f;
@@ -396,21 +842,18 @@ impl Player {
                 self.feet = pos;
                 return;
             }
-            // Falling: land on a floor we reach or cross during this step.
-            self.vel_y -= GRAVITY * dt;
-            pos.y += self.vel_y * dt;
-            match floor {
-                Some(f) if f >= pos.y => {
-                    pos.y = f;
-                    self.vel_y = 0.0;
-                    self.on_ground = true;
-                }
-                _ => self.on_ground = false,
-            }
-        } else {
-            self.vel_y -= GRAVITY * dt;
-            pos.y += self.vel_y * dt;
             self.on_ground = false;
+        }
+
+        // Falling: land on a floor we reach or cross during this step.
+        pos.y += self.vel_y * dt;
+        match floor {
+            Some(f) if f >= pos.y && self.vel_y <= 0.0 => {
+                pos.y = f;
+                self.vel_y = 0.0;
+                self.on_ground = true;
+            }
+            _ => self.on_ground = false,
         }
         self.feet = pos;
     }
@@ -424,27 +867,105 @@ mod tests {
         [[a, b, c], [a, c, d]]
     }
 
+    /// A flat floor at y = 0, `half` units to each side of the origin.
+    fn floor(half: f32) -> Vec<[Vec3; 3]> {
+        quad(Vec3::new(-half, 0.0, -half), Vec3::new(-half, 0.0, half), Vec3::new(half, 0.0, half), Vec3::new(half, 0.0, -half)).to_vec()
+    }
+
+    fn wall_z(z: f32, height: f32) -> [[Vec3; 3]; 2] {
+        quad(Vec3::new(-1000.0, 0.0, z), Vec3::new(1000.0, 0.0, z), Vec3::new(1000.0, height, z), Vec3::new(-1000.0, height, z))
+    }
+
     /// A 2000x2000 floor at y=0 with a 300-high wall across z=500.
     fn room() -> CollisionWorld {
-        let mut t = Vec::new();
-        t.extend(quad(Vec3::new(-1000.0, 0.0, -1000.0), Vec3::new(-1000.0, 0.0, 1000.0), Vec3::new(1000.0, 0.0, 1000.0), Vec3::new(1000.0, 0.0, -1000.0)));
-        t.extend(quad(Vec3::new(-1000.0, 0.0, 500.0), Vec3::new(1000.0, 0.0, 500.0), Vec3::new(1000.0, 300.0, 500.0), Vec3::new(-1000.0, 300.0, 500.0)));
+        let mut t = floor(1000.0);
+        t.extend(wall_z(500.0, 300.0));
         CollisionWorld::from_triangles(t)
     }
 
-    fn settle(w: &CollisionWorld, p: &mut Player, secs: f32) {
-        for _ in 0..(secs * 60.0) as usize {
-            p.step(w, 1.0 / 60.0, Vec2::ZERO, false);
+    fn floor_only() -> CollisionWorld {
+        CollisionWorld::from_triangles(floor(1000.0))
+    }
+
+    /// Run `secs` of 60 Hz frames with the same input.
+    fn run(w: &CollisionWorld, p: &mut Player, input: MoveInput, secs: f32) {
+        for _ in 0..(secs * 60.0).round() as usize {
+            p.step(w, 1.0 / 60.0, input);
         }
+    }
+
+    fn settle(w: &CollisionWorld, p: &mut Player, secs: f32) {
+        run(w, p, MoveInput::default(), secs);
+    }
+
+    fn forward() -> MoveInput {
+        MoveInput::toward(Vec2::new(0.0, 1.0))
     }
 
     #[test]
     fn falls_and_stands_on_floor() {
         let w = room();
         let mut p = Player::new(Vec3::new(0.0, 400.0, 0.0));
-        settle(&w, &mut p, 2.0);
+        settle(&w, &mut p, 3.0);
         assert!(p.on_ground);
         assert!(p.feet.y.abs() < 0.01, "feet at {}", p.feet.y);
+    }
+
+    #[test]
+    fn speeds_settle_at_the_originals_animation_driven_values() {
+        let w = CollisionWorld::from_triangles(floor(8000.0));
+        let speed_of = |input: MoveInput, warm_up: f32| {
+            let mut p = Player::new(Vec3::new(0.0, 0.0, -7000.0));
+            settle(&w, &mut p, 0.3);
+            if input.crouch {
+                run(&w, &mut p, MoveInput { dir: Vec2::ZERO, ..input }, 1.0);
+            }
+            run(&w, &mut p, input, warm_up);
+            let before = p.feet.z;
+            run(&w, &mut p, input, 1.0);
+            p.feet.z - before
+        };
+        let run_speed = speed_of(forward(), 1.5);
+        assert!((run_speed - 266.7).abs() < 4.0, "running: {run_speed} units/s");
+        let sneak = speed_of(MoveInput { stealth: true, ..forward() }, 1.5);
+        assert!((sneak - 188.3).abs() < 4.0, "sneaking: {sneak} units/s");
+        let crouch = speed_of(MoveInput { crouch: true, ..forward() }, 1.5);
+        assert!((crouch - 100.0).abs() < 3.0, "crouched: {crouch} units/s");
+        assert!(run_speed > sneak && sneak > crouch);
+    }
+
+    #[test]
+    fn movement_builds_up_and_stops_within_a_fraction_of_a_second() {
+        let w = CollisionWorld::from_triangles(floor(4000.0));
+        let mut p = Player::new(Vec3::new(0.0, 0.0, -3000.0));
+        settle(&w, &mut p, 0.3);
+        run(&w, &mut p, forward(), 0.1);
+        assert!(p.vel_h.length() > 40.0 && p.vel_h.length() < 200.0, "after 0.1 s: {}", p.vel_h.length());
+        run(&w, &mut p, forward(), 1.5);
+        run(&w, &mut p, MoveInput::default(), 0.4);
+        assert!(p.vel_h.length() < 10.0, "should have stopped: {}", p.vel_h.length());
+    }
+
+    #[test]
+    fn keys_combine_like_the_engine() {
+        let fwd = MoveInput::from_keys(0.0, true, false, false, false);
+        assert_eq!(fwd.kind, MoveKind::Forward);
+        assert!((fwd.dir - Vec2::new(0.0, -1.0)).length() < 1e-5, "yaw 0 looks along -Z: {:?}", fwd.dir);
+        let turned = MoveInput::from_keys(std::f32::consts::FRAC_PI_2, true, false, false, false);
+        assert!((turned.dir - Vec2::new(-1.0, 0.0)).length() < 1e-5, "{:?}", turned.dir);
+        let strafe = MoveInput::from_keys(0.0, false, false, false, true);
+        assert_eq!(strafe.kind, MoveKind::Strafe);
+        assert!((strafe.dir - Vec2::new(1.0, 0.0)).length() < 1e-5);
+        let diag = MoveInput::from_keys(0.0, true, false, false, true);
+        assert_eq!(diag.kind, MoveKind::Forward, "forward decides the animation");
+        assert!(diag.dir.x > 0.0 && diag.dir.y < 0.0 && (diag.dir.length() - 1.0).abs() < 1e-5);
+        // 8 forward against 6 sideways: more forward than sideways.
+        assert!(diag.dir.y.abs() > diag.dir.x.abs());
+        assert_eq!(MoveInput::from_keys(0.0, false, false, true, true).kind, MoveKind::None, "left and right cancel");
+        let back = MoveInput::from_keys(0.0, false, true, false, false);
+        assert_eq!(back.kind, MoveKind::Backward);
+        assert!(back.dir.y > 0.0);
+        assert_eq!(MoveInput::from_keys(0.0, true, true, false, false).dir, Vec2::new(0.0, -1.0), "forward beats backward");
     }
 
     #[test]
@@ -452,13 +973,100 @@ mod tests {
         let w = room();
         let mut p = Player::new(Vec3::ZERO);
         settle(&w, &mut p, 0.5);
-        // Walk (and sprint) straight into the wall for several seconds.
-        for speed in [300.0, 3000.0] {
-            for _ in 0..300 {
-                p.step(&w, 1.0 / 60.0, Vec2::new(0.0, speed), false);
+        for _ in 0..5 {
+            run(&w, &mut p, forward(), 1.0);
+            assert!(p.feet.z < 500.0, "passed through the wall: z = {}", p.feet.z);
+        }
+        assert!(p.feet.z > 500.0 - PLAYER_RADIUS - 2.0, "should be pressed against it: z = {}", p.feet.z);
+        // Even a huge frame time cannot skip it.
+        let mut q = Player::new(Vec3::new(0.0, 0.0, 400.0));
+        settle(&w, &mut q, 0.5);
+        for _ in 0..30 {
+            q.step(&w, 0.2, forward());
+        }
+        assert!(q.feet.z < 500.0, "z = {}", q.feet.z);
+    }
+
+    #[test]
+    fn a_jump_rises_about_130_units_and_takes_under_a_second() {
+        let w = CollisionWorld::from_triangles(floor(4000.0));
+        let mut p = Player::new(Vec3::ZERO);
+        settle(&w, &mut p, 0.5);
+        let (mut apex, mut air) = (0.0f32, 0.0f32);
+        let jump = MoveInput { jump: true, ..Default::default() };
+        p.step(&w, 1.0 / 60.0, jump);
+        for _ in 0..180 {
+            p.step(&w, 1.0 / 60.0, MoveInput::default());
+            apex = apex.max(p.feet.y);
+            if !p.on_ground {
+                air += 1.0 / 60.0;
             }
-            assert!(p.feet.z < 500.0, "passed through the wall at speed {speed}: z = {}", p.feet.z);
-            assert!(p.feet.z > 500.0 - PLAYER_RADIUS - 2.0 || speed > 0.0);
+        }
+        assert!((apex - 130.0).abs() < 8.0, "apex {apex}");
+        // 0.2 s up, then 130 units at 600 units/s^2: about 0.66 s down.
+        assert!(air > 0.75 && air < 1.0, "air time {air}");
+        assert!(p.on_ground && p.phase == JumpPhase::None);
+    }
+
+    #[test]
+    fn holding_jump_does_not_bounce_and_a_press_during_a_fall_is_remembered_briefly() {
+        let w = CollisionWorld::from_triangles(floor(4000.0));
+        let mut p = Player::new(Vec3::ZERO);
+        settle(&w, &mut p, 0.5);
+        let held = MoveInput { jump: true, ..Default::default() };
+        let mut jumps = 0;
+        let mut was_ground = true;
+        for _ in 0..360 {
+            p.step(&w, 1.0 / 60.0, held);
+            if was_ground && !p.on_ground {
+                jumps += 1;
+            }
+            was_ground = p.on_ground;
+        }
+        assert_eq!(jumps, 1, "one press, one jump");
+    }
+
+    #[test]
+    fn a_running_jump_carries_forward_and_landing_stops_the_slide() {
+        let w = CollisionWorld::from_triangles(floor(4000.0));
+        let mut p = Player::new(Vec3::new(0.0, 0.0, -3000.0));
+        settle(&w, &mut p, 0.3);
+        run(&w, &mut p, forward(), 1.5);
+        let start = p.feet.z;
+        p.step(&w, 1.0 / 60.0, MoveInput { jump: true, ..forward() });
+        let mut landed_at = None;
+        for i in 0..240 {
+            p.step(&w, 1.0 / 60.0, forward());
+            if p.on_ground && landed_at.is_none() {
+                landed_at = Some(i);
+                assert_eq!(p.vel_h, Vec2::ZERO, "landing from a jump kills the horizontal velocity");
+            }
+        }
+        assert!(landed_at.is_some());
+        let _ = start;
+        let mut q = Player::new(Vec3::new(0.0, 0.0, -3000.0));
+        settle(&w, &mut q, 0.3);
+        run(&w, &mut q, forward(), 1.5);
+        let z0 = q.feet.z;
+        q.step(&w, 1.0 / 60.0, MoveInput { jump: true, ..forward() });
+        for _ in 0..120 {
+            q.step(&w, 1.0 / 60.0, forward());
+            if q.on_ground {
+                break;
+            }
+        }
+        // The air push (7.9 against 2.4 for running) makes a held-forward jump far longer than the run-up.
+        let distance = q.feet.z - z0;
+        assert!(distance > 300.0 && distance < 800.0, "forward distance of a running jump: {distance}");
+    }
+
+    #[test]
+    fn landing_slows_the_push_with_the_engines_ramp() {
+        let mut p = Player::new(Vec3::ZERO);
+        p.last_landing_ms = 0.0;
+        for (since, expect) in [(0.0, 0.5), (299.0, 0.5), (450.0, 0.0), (599.0, -0.497), (600.0, 1.0), (5000.0, 1.0)] {
+            p.clock_ms = since;
+            assert!((p.landing_recovery() - expect).abs() < 0.01, "{since} ms: {}", p.landing_recovery());
         }
     }
 
@@ -467,33 +1075,36 @@ mod tests {
         let w = room();
         let mut p = Player::new(Vec3::ZERO);
         settle(&w, &mut p, 0.5);
+        p.step(&w, 1.0 / 60.0, MoveInput { jump: true, ..forward() });
         let mut apex = 0.0f32;
-        for i in 0..240 {
-            p.step(&w, 1.0 / 60.0, Vec2::new(0.0, 300.0), i == 0);
+        for _ in 0..240 {
+            p.step(&w, 1.0 / 60.0, forward());
             apex = apex.max(p.feet.y);
         }
-        assert!(apex > 50.0 && apex < 150.0, "jump apex {apex}");
+        assert!(apex > 100.0 && apex < 150.0, "jump apex {apex}");
         assert!(p.feet.z < 500.0);
         assert!(p.on_ground);
     }
 
     #[test]
     fn steps_up_low_ledges_but_not_high_ones() {
-        let mut t = Vec::new();
-        t.extend(quad(Vec3::new(-500.0, 0.0, -500.0), Vec3::new(-500.0, 0.0, 500.0), Vec3::new(500.0, 0.0, 500.0), Vec3::new(500.0, 0.0, -500.0)));
-        // 30-high step at z=100 (walkable), 120-high block at z=300 (not).
-        t.extend(quad(Vec3::new(-500.0, 30.0, 100.0), Vec3::new(500.0, 30.0, 100.0), Vec3::new(500.0, 30.0, 500.0), Vec3::new(-500.0, 30.0, 500.0)));
-        t.extend(quad(Vec3::new(-500.0, 0.0, 100.0), Vec3::new(500.0, 0.0, 100.0), Vec3::new(500.0, 30.0, 100.0), Vec3::new(-500.0, 30.0, 100.0)));
-        t.extend(quad(Vec3::new(-500.0, 120.0, 300.0), Vec3::new(500.0, 120.0, 300.0), Vec3::new(500.0, 120.0, 500.0), Vec3::new(-500.0, 120.0, 500.0)));
-        t.extend(quad(Vec3::new(-500.0, 0.0, 300.0), Vec3::new(500.0, 0.0, 300.0), Vec3::new(500.0, 120.0, 300.0), Vec3::new(-500.0, 120.0, 300.0)));
-        let w = CollisionWorld::from_triangles(t);
-        let mut p = Player::new(Vec3::new(0.0, 0.0, -200.0));
-        settle(&w, &mut p, 0.5);
-        for _ in 0..300 {
-            p.step(&w, 1.0 / 60.0, Vec2::new(0.0, 200.0), false);
+        let step_world = |height: f32| {
+            let mut t = floor(500.0);
+            t.extend(quad(Vec3::new(-500.0, height, 100.0), Vec3::new(500.0, height, 100.0), Vec3::new(500.0, height, 500.0), Vec3::new(-500.0, height, 500.0)));
+            t.extend(quad(Vec3::new(-500.0, 0.0, 100.0), Vec3::new(500.0, 0.0, 100.0), Vec3::new(500.0, height, 100.0), Vec3::new(-500.0, height, 100.0)));
+            CollisionWorld::from_triangles(t)
+        };
+        for (height, climbs) in [(30.0, true), (38.0, true), (46.0, false), (120.0, false)] {
+            let w = step_world(height);
+            let mut p = Player::new(Vec3::new(0.0, 0.0, -200.0));
+            settle(&w, &mut p, 0.5);
+            run(&w, &mut p, forward(), 2.0);
+            if climbs {
+                assert!(p.feet.z > 150.0 && (p.feet.y - height).abs() < 0.1, "{height}-high step: z {} y {}", p.feet.z, p.feet.y);
+            } else {
+                assert!(p.feet.z < 100.0 && p.feet.y.abs() < 0.1, "{height}-high ledge: z {} y {}", p.feet.z, p.feet.y);
+            }
         }
-        assert!(p.feet.z < 300.0 && p.feet.z > 100.0, "z = {}", p.feet.z);
-        assert!((p.feet.y - 30.0).abs() < 0.1, "should be standing on the 30-high step, y = {}", p.feet.y);
     }
 
     #[test]
@@ -502,28 +1113,12 @@ mod tests {
         let mut p = Player::new(Vec3::ZERO);
         settle(&w, &mut p, 0.5);
         let mut lowest = 0.0f32;
-        for _ in 0..1200 {
-            p.step(&w, 1.0 / 60.0, Vec2::new(300.0, 0.0), false); // keep walking off the +x edge
+        for _ in 0..1800 {
+            p.step(&w, 1.0 / 60.0, MoveInput::toward(Vec2::new(1.0, 0.0))); // keep walking off the +x edge
             lowest = lowest.min(p.feet.y);
         }
-        assert!(p.rescues >= 2, "rescues: {}", p.rescues);
-        // Never ends up more than one step's fall beyond the rescue depth.
-        assert!(lowest > -(RESCUE_DEPTH + 400.0), "fell to {lowest}");
-    }
-
-    fn floor_only() -> CollisionWorld {
-        CollisionWorld::from_triangles(quad(
-            Vec3::new(-1000.0, 0.0, -1000.0),
-            Vec3::new(-1000.0, 0.0, 1000.0),
-            Vec3::new(1000.0, 0.0, 1000.0),
-            Vec3::new(1000.0, 0.0, -1000.0),
-        ))
-    }
-
-    fn walk_into(w: &CollisionWorld, p: &mut Player, secs: f32) {
-        for _ in 0..(secs * 60.0) as usize {
-            p.step(w, 1.0 / 60.0, Vec2::new(0.0, 300.0), false);
-        }
+        assert!(p.rescues >= 1, "rescues: {}", p.rescues);
+        assert!(lowest > -(RESCUE_DEPTH + 800.0), "fell to {lowest}");
     }
 
     #[test]
@@ -531,38 +1126,28 @@ mod tests {
         let mut w = floor_only();
         // A door: a 200-wide, 230-high vertical panel across z = 300.
         let door = w
-            .add_obstacle(quad(
-                Vec3::new(-100.0, 0.0, 300.0),
-                Vec3::new(100.0, 0.0, 300.0),
-                Vec3::new(100.0, 230.0, 300.0),
-                Vec3::new(-100.0, 230.0, 300.0),
-            ))
+            .add_obstacle(quad(Vec3::new(-100.0, 0.0, 300.0), Vec3::new(100.0, 0.0, 300.0), Vec3::new(100.0, 230.0, 300.0), Vec3::new(-100.0, 230.0, 300.0)))
             .unwrap();
         let mut p = Player::new(Vec3::ZERO);
         settle(&w, &mut p, 0.5);
-        walk_into(&w, &mut p, 4.0);
+        run(&w, &mut p, forward(), 4.0);
         assert!(p.feet.z < 300.0, "walked through a closed door: z = {}", p.feet.z);
         assert!(p.feet.z > 300.0 - PLAYER_RADIUS - 5.0, "should be pressed against it: z = {}", p.feet.z);
 
         w.set_obstacle_enabled(door, false);
         assert!(!w.obstacle_enabled(door));
-        walk_into(&w, &mut p, 3.0);
+        run(&w, &mut p, forward(), 3.0);
         assert!(p.feet.z > 400.0, "should walk through an open door: z = {}", p.feet.z);
     }
 
     #[test]
     fn obstacle_does_not_block_what_is_not_in_the_way() {
         let mut w = floor_only();
-        w.add_obstacle(quad(
-            Vec3::new(500.0, 0.0, 0.0),
-            Vec3::new(500.0, 0.0, 200.0),
-            Vec3::new(500.0, 200.0, 200.0),
-            Vec3::new(500.0, 200.0, 0.0),
-        ));
+        w.add_obstacle(quad(Vec3::new(500.0, 0.0, 0.0), Vec3::new(500.0, 0.0, 200.0), Vec3::new(500.0, 200.0, 200.0), Vec3::new(500.0, 200.0, 0.0)));
         let mut p = Player::new(Vec3::new(0.0, 0.0, -500.0));
         settle(&w, &mut p, 0.5);
-        walk_into(&w, &mut p, 3.0);
-        assert!(p.feet.z > 300.0);
+        run(&w, &mut p, forward(), 5.0);
+        assert!(p.feet.z > 300.0, "z = {}", p.feet.z);
     }
 
     /// A steep wall leaning away from the player. Whichever way its stored normal points, the
@@ -576,13 +1161,13 @@ mod tests {
                 Vec3::new(600.0, 300.0, 400.0),
                 Vec3::new(-600.0, 300.0, 400.0),
             );
-            let mut tris: Vec<[Vec3; 3]> = floor_only().tris.iter().map(|t| [t.a, t.b, t.c]).collect();
+            let mut tris = floor(1000.0);
             let wall = if flip { [[a, c, b], [a, d, c]] } else { [[a, b, c], [a, c, d]] };
             tris.extend(wall);
             let w = CollisionWorld::from_triangles(tris);
             let mut p = Player::new(Vec3::ZERO);
             settle(&w, &mut p, 0.5);
-            walk_into(&w, &mut p, 5.0);
+            run(&w, &mut p, forward(), 5.0);
             assert!(p.feet.z < 300.0, "flip={flip}: passed the wall, z = {}", p.feet.z);
         }
     }
@@ -605,5 +1190,154 @@ mod tests {
         let mut q = Player::new(Vec3::new(0.0, 30.0, 0.0));
         settle(&w, &mut q, 1.0);
         assert!(!q.on_ground && q.feet.y < -100.0, "an open trapdoor is a hole, y = {}", q.feet.y);
+    }
+
+    /// A floor with a ceiling slab `clearance` above it for z > 300.
+    fn low_ceiling(clearance: f32) -> CollisionWorld {
+        let mut t = floor(1500.0);
+        t.extend(quad(Vec3::new(-1500.0, clearance, 300.0), Vec3::new(1500.0, clearance, 300.0), Vec3::new(1500.0, clearance, 1500.0), Vec3::new(-1500.0, clearance, 1500.0)));
+        CollisionWorld::from_triangles(t)
+    }
+
+    #[test]
+    fn crouching_lowers_the_body_and_eyes_after_the_animation() {
+        let w = floor_only();
+        let mut p = Player::new(Vec3::ZERO);
+        settle(&w, &mut p, 0.3);
+        assert_eq!((p.height(), p.eye_height()), (PLAYER_HEIGHT, EYE_HEIGHT));
+        let crouch = MoveInput { crouch: true, ..Default::default() };
+        run(&w, &mut p, crouch, 0.3);
+        assert!(matches!(p.stance, Stance::GoingDown(_)));
+        assert_eq!(p.height(), PLAYER_HEIGHT, "the cylinder shrinks only when the animation ends");
+        assert!(p.eye_height() < EYE_HEIGHT && p.eye_height() > CROUCH_EYE_HEIGHT);
+        run(&w, &mut p, crouch, 0.6);
+        assert_eq!((p.stance, p.height(), p.eye_height()), (Stance::Crouched, CROUCH_HEIGHT, CROUCH_EYE_HEIGHT));
+        run(&w, &mut p, MoveInput::default(), 1.0);
+        assert_eq!((p.stance, p.eye_height()), (Stance::Standing, EYE_HEIGHT));
+    }
+
+    #[test]
+    fn a_low_ceiling_needs_a_crouch_to_enter_and_keeps_you_crouched() {
+        // 150 high: too low to stand, enough to crouch.
+        let w = low_ceiling(150.0);
+        let mut p = Player::new(Vec3::new(0.0, 0.0, 0.0));
+        settle(&w, &mut p, 0.3);
+        // Standing, the head hits the ceiling's edge like a wall (the original does not crouch for you here).
+        run(&w, &mut p, forward(), 4.0);
+        assert!(p.feet.z < 300.0, "walked into a ceiling too low to stand under: z = {}", p.feet.z);
+        // Crouch first, and the way is open.
+        let crouch = MoveInput { crouch: true, ..forward() };
+        run(&w, &mut p, MoveInput { crouch: true, ..Default::default() }, 1.0);
+        run(&w, &mut p, crouch, 12.0);
+        assert!(p.feet.z > 500.0, "should get under the ceiling crouched: z = {}", p.feet.z);
+        // Releasing the key does not stand up under it...
+        run(&w, &mut p, MoveInput::default(), 2.0);
+        assert!(p.is_crouching() && p.height() == CROUCH_HEIGHT, "{:?}", p.stance);
+        // ...but walking back out does.
+        run(&w, &mut p, MoveInput::toward(Vec2::new(0.0, -1.0)), 12.0);
+        run(&w, &mut p, MoveInput::default(), 2.0);
+        assert_eq!(p.stance, Stance::Standing, "z = {}", p.feet.z);
+    }
+
+    #[test]
+    fn a_ceiling_lowering_onto_a_standing_player_forces_a_crouch() {
+        let w = low_ceiling(150.0);
+        let mut p = Player::new(Vec3::new(0.0, 0.0, 700.0));
+        settle(&w, &mut p, 0.3);
+        assert!(p.is_crouching(), "spawned under a 150-high ceiling");
+        settle(&w, &mut p, 1.0);
+        assert_eq!(p.stance, Stance::Crouched);
+    }
+
+    #[test]
+    fn a_gap_lower_than_a_crouch_cannot_be_entered() {
+        let w = low_ceiling(100.0);
+        let mut p = Player::new(Vec3::new(0.0, 0.0, 0.0));
+        settle(&w, &mut p, 0.3);
+        run(&w, &mut p, MoveInput { crouch: true, ..Default::default() }, 1.0);
+        run(&w, &mut p, MoveInput { crouch: true, ..forward() }, 12.0);
+        assert!(p.feet.z < 330.0, "a 100-high gap is too low to enter: z = {}", p.feet.z);
+    }
+
+    #[test]
+    fn jumping_under_a_ceiling_bumps_the_head() {
+        let w = low_ceiling(250.0);
+        let mut p = Player::new(Vec3::new(0.0, 0.0, 700.0));
+        settle(&w, &mut p, 0.5);
+        p.step(&w, 1.0 / 60.0, MoveInput { jump: true, ..Default::default() });
+        let mut apex = 0.0f32;
+        for _ in 0..120 {
+            p.step(&w, 1.0 / 60.0, MoveInput::default());
+            apex = apex.max(p.feet.y);
+        }
+        assert!(apex <= 250.0 - PLAYER_HEIGHT + 0.5, "head went through the ceiling: apex {apex}");
+        assert!(apex > 60.0, "should still rise to the ceiling: apex {apex}");
+        assert!(p.on_ground);
+    }
+
+    #[test]
+    fn long_falls_hurt_short_ones_do_not() {
+        let w = CollisionWorld::from_triangles(floor(4000.0));
+        let mut short = Player::new(Vec3::new(0.0, 300.0, 0.0));
+        settle(&w, &mut short, 3.0);
+        assert!(short.on_ground);
+        assert_eq!(short.take_landing(), None, "300 units is harmless");
+
+        let mut long = Player::new(Vec3::new(0.0, 900.0, 0.0));
+        long.vel_h = Vec2::new(100.0, 0.0);
+        settle(&w, &mut long, 6.0);
+        assert!(long.on_ground);
+        assert_eq!(long.vel_h, Vec2::ZERO, "a hard landing stops the slide");
+        let fell = long.take_landing().expect("a 900-unit drop must report a damaging landing");
+        assert!(fell > 700.0 && fell < 900.0, "fall height {fell}");
+        assert!((fall_damage(fell) - (fell - 400.0) / 15.0).abs() < 1e-4 && fall_damage(fell) > 20.0);
+        assert_eq!(long.take_landing(), None, "reported once");
+        assert_eq!(fall_damage(399.0), 0.0);
+    }
+
+    #[test]
+    fn falls_are_floaty_once_fast_enough() {
+        let w = CollisionWorld::from_triangles(floor(4000.0));
+        let mut p = Player::new(Vec3::new(0.0, 2000.0, 0.0));
+        let mut v_late = 0.0f32;
+        for _ in 0..200 {
+            p.step(&w, 1.0 / 60.0, MoveInput::default());
+            if p.falling {
+                v_late = p.vel_y;
+            }
+        }
+        // Gravity drops from 3000 to 600 units/s^2 once the fall passes 450 units/s, so after more than a second
+        // the speed is far below what 3000 units/s^2 would give (3000+).
+        assert!(v_late > -1700.0 && v_late < -500.0, "vel_y {v_late}");
+    }
+
+    #[test]
+    fn a_character_cylinder_blocks_until_it_is_switched_off_or_moved() {
+        let mut w = floor_only();
+        let npc = w.add_cylinder(Vec3::new(0.0, 0.0, 300.0), 30.0, 170.0);
+        let mut p = Player::new(Vec3::ZERO);
+        settle(&w, &mut p, 0.5);
+        run(&w, &mut p, forward(), 4.0);
+        assert!(p.feet.z < 300.0 - 30.0 + 1.0 && p.feet.z > 300.0 - 30.0 - PLAYER_RADIUS - 5.0, "pressed against the character: z = {}", p.feet.z);
+        // It can be walked around.
+        run(&w, &mut p, MoveInput::toward(Vec2::new(1.0, 0.0)), 1.5);
+        run(&w, &mut p, forward(), 2.0);
+        assert!(p.feet.z > 400.0, "should have got past it: z = {}", p.feet.z);
+        // A dead (disabled) one does not block.
+        let mut q = Player::new(Vec3::ZERO);
+        settle(&w, &mut q, 0.5);
+        w.set_cylinder(npc, Vec3::new(0.0, 0.0, 300.0), false);
+        run(&w, &mut q, forward(), 3.0);
+        assert!(q.feet.z > 350.0, "z = {}", q.feet.z);
+        // A short one (below the step height) is stepped over, a character far above is not in the way.
+        let w2 = {
+            let mut w = floor_only();
+            w.add_cylinder(Vec3::new(0.0, 200.0, 300.0), 30.0, 100.0);
+            w
+        };
+        let mut r = Player::new(Vec3::ZERO);
+        settle(&w2, &mut r, 0.5);
+        run(&w2, &mut r, forward(), 3.0);
+        assert!(r.feet.z > 350.0, "a cylinder floating above the head does not block: z = {}", r.feet.z);
     }
 }

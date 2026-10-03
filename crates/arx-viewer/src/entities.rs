@@ -3,7 +3,7 @@
 //! the nearest static lights.
 
 use crate::animated::{Animated, MeshSrc, no_cull};
-use crate::scripting::{Pickable, ScriptRef, Scripting};
+use crate::scripting::{BaseAngle, Pickable, ScriptRef, Scripting};
 use crate::convert::{TextureCache, load_texture, to_bevy};
 use arx_level::entity_rotation;
 use crate::level::{Kind, trans_kind};
@@ -259,6 +259,7 @@ pub fn spawn_entities(
             Transform { translation, rotation, scale: Vec3::splat(scale) },
             visibility,
             ScriptRef(script_id),
+            BaseAngle { angle: e.angle, npc: e.class.contains("/npc/") },
         ));
         parent.with_children(|p| {
             for bundle in parent_children {
