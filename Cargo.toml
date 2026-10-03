@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/arx-formats", "crates/arx-physics", "crates/arx-cli", "crates/arx-viewer"]
+members = ["crates/arx-formats", "crates/arx-physics", "crates/arx-script", "crates/arx-cli", "crates/arx-viewer"]
 
 [workspace.package]
 version = "0.1.0"

@@ -286,6 +286,7 @@ dependencies = [
  "anyhow",
  "arx-formats",
  "arx-physics",
+ "arx-script",
  "clap",
  "glam",
 ]
@@ -306,6 +307,10 @@ dependencies = [
  "arx-formats",
  "glam",
 ]
+
+[[package]]
+name = "arx-script"
+version = "0.1.0"
 
 [[package]]
 name = "arx-viewer"

@@ -32,6 +32,10 @@ enum Cmd {
     Ftl { path: Option<String> },
     /// Parse level geometry (`game/graph/levels/levelN/fast.fts`); no argument = all levels
     Fts { level: Option<u32> },
+    /// Load every entity script of a level, run INIT/INITEND for all, and report what the interpreter
+    /// could not handle (no argument = all levels, one world per level)
+    Script { level: Option<u32>, /// how many unknown commands / warnings to list
+        #[arg(short, long, default_value_t = 25)] top: usize },
     /// Simulate the player in a level: drop from the start, then walk in 8 directions and report how
     /// far each walk got before hitting a wall (a headless check of the collision system)
     Walk { level: u32 },
@@ -229,6 +233,42 @@ fn main() -> Result<()> {
             }
             let (floor_lo, floor_hi) = world_extent_y(&fts);
             println!("fuzz 3 min: {} rescues from falling out of the level; feet y {lo:.0}..{hi:.0} (level geometry spans {floor_lo:.0}..{floor_hi:.0}), on ground {:.0}% of frames, longest airborne run {} frames, final pos ({:.0}, {:.0}, {:.0})", q.rescues, 100.0 * grounded as f32 / frames as f32, worst_fall, q.feet.x, q.feet.y, q.feet.z);
+        }
+        Cmd::Script { level, top } => {
+            use arx_script::{Script, ScriptWorld, EntityKind};
+            struct NullHost;
+            impl arx_script::Host for NullHost {
+                fn command(&mut self, _: &str, _: &mut arx_script::Args) -> Option<arx_script::CmdResult> { None }
+            }
+            let mut total = arx_script::Stats::default();
+            let (mut ents, mut with_script, mut with_over) = (0, 0, 0);
+            for l in (0..=30u32).filter(|l| level.is_none_or(|x| x == *l) && pak.contains(&format!("graph/levels/level{l}/level{l}.dlf"))) {
+                let dlf = match pak.load_dlf(l) { Ok(d) => d, Err(e) => { println!("level {l}: {e}"); continue } };
+                let mut world = ScriptWorld::new();
+                let load = |path: &str| pak.read(path).ok().map(|b| std::sync::Arc::new(Script::new(&b)));
+                for e in &dlf.entities {
+                    let (dir, name) = e.class.rsplit_once('/').unwrap_or(("", &e.class));
+                    let class_script = load(&format!("{}.asl", e.class));
+                    let over = load(&format!("{dir}/{name}_{:04}/{name}.asl", e.instance));
+                    ents += 1; with_script += class_script.is_some() as usize; with_over += over.is_some() as usize;
+                    world.add_entity(EntityKind::from_class(&e.class), &e.class, e.instance, class_script, over);
+                }
+                let t = std::time::Instant::now();
+                let mut host = NullHost;
+                for id in 0..world.entities.len() as u32 { world.send_init(&mut host, id); }
+                world.update(&mut host, 0.0);
+                let s = &world.stats;
+                println!("level {l}: {} entities, init+initend: {} events, {} commands, {} runaway, {} warning kinds, {} unknown command kinds [{:.0?}]", world.entities.len(), s.events_run, s.commands_run, s.aborted_runaway, s.warnings.len(), s.unknown_commands.len(), t.elapsed());
+                total.events_run += s.events_run; total.commands_run += s.commands_run; total.aborted_runaway += s.aborted_runaway;
+                for (k, v) in &s.unknown_commands { *total.unknown_commands.entry(k.clone()).or_default() += v; }
+                for (k, v) in &s.warnings { *total.warnings.entry(k.clone()).or_default() += v; }
+            }
+            println!("
+TOTAL: {ents} entities ({with_script} class scripts, {with_over} instance scripts), {} events, {} commands, {} runaway", total.events_run, total.commands_run, total.aborted_runaway);
+            let mut u: Vec<_> = total.unknown_commands.iter().collect(); u.sort_by(|a, b| b.1.cmp(a.1));
+            println!("unknown commands (not part of the language core): {}", u.iter().take(top).map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(" "));
+            let mut w: Vec<_> = total.warnings.iter().collect(); w.sort_by(|a, b| b.1.cmp(a.1));
+            println!("warnings:"); for (k, v) in w.iter().take(top) { println!("  {v:>5}  {k}"); }
         }
         Cmd::Tea { path: None, .. } => {
             let (mut ok, mut bad) = (0, 0);

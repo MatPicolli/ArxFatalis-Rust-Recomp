@@ -12,5 +12,6 @@ path = "src/main.rs"
 arx-formats = { path = "../arx-formats" }
 glam.workspace = true
 arx-physics = { path = "../arx-physics" }
+arx-script = { path = "../arx-script" }
 anyhow.workspace = true
 clap.workspace = true
