@@ -3,9 +3,11 @@
 
 use crate::animated::Animated;
 use crate::anims;
+use crate::convert::to_bevy;
+use crate::speech::Speech;
 use crate::{Arx, Fly};
 use arx_formats::{dlf::Dlf, tea::Tea};
-use arx_level::{EntityObstacles, Scripts};
+use arx_level::{EntityObstacles, Scripts, inventory};
 use arx_physics::CollisionWorld;
 use arx_script::{EntityId, EntityKind, ScriptWorld, StdHost};
 use bevy::prelude::*;
@@ -20,7 +22,8 @@ pub struct ScriptRef(pub EntityId);
 /// A clickable bounding sphere for an entity (Bevy coordinates).
 pub struct Pickable {
     pub id: EntityId,
-    pub center: Vec3,
+    /// Centre of the sphere relative to the entity's position, so a dropped item can be picked up again.
+    pub offset: Vec3,
     pub radius: f32,
 }
 
@@ -102,6 +105,9 @@ pub fn apply_state(
         let st = st.clone(); // release the borrow of `s.host` so animations can be loaded below
         *vis = if st.hidden || st.destroyed { Visibility::Hidden } else { Visibility::Inherited };
         tf.scale = Vec3::splat(st.scale);
+        if let Some(p) = st.moved_to {
+            tf.translation = Vec3::from(to_bevy(p));
+        }
         if let (Some(mut a), true) = (animated, prev.is_none_or(|(_, serial)| serial != st.anim_serial)) {
             if let Some(play) = &st.playing {
                 if let Some(path) = st.anims.get(&play.slot).cloned() {
@@ -114,11 +120,14 @@ pub fn apply_state(
     }
 }
 
-/// Find what the player is looking at, and send it `action` when E is pressed.
+/// Find what the player is looking at, and act on it when E is pressed: with an item held, use the item on it;
+/// otherwise pick up items, talk to people, and send `action` to everything else.
 pub fn interact(
     keys: Res<ButtonInput<KeyCode>>,
     cam: Single<&Transform, With<Camera3d>>,
     pickables: Res<Pickables>,
+    mut ui: ResMut<crate::hud::Ui>,
+    speech: Res<Speech>,
     mut s: ResMut<Scripting>,
 ) {
     let s = &mut *s;
@@ -126,11 +135,12 @@ pub fn interact(
     let mut best: Option<(f32, EntityId)> = None;
     for p in &pickables.0 {
         let Some(st) = s.host.state(p.id) else { continue };
-        if st.hidden || st.destroyed || !st.interactive {
+        if st.hidden || st.destroyed || !st.interactive || st.in_inventory {
             continue;
         }
+        let center = Vec3::from(to_bevy(s.world.entity(p.id).pos)) + p.offset;
         // Ray / sphere intersection.
-        let to = p.center - origin;
+        let to = center - origin;
         let along = to.dot(dir);
         if along < 0.0 || along > REACH + p.radius {
             continue;
@@ -145,12 +155,32 @@ pub fn interact(
         }
     }
     s.target = best.map(|(_, id)| id);
-    if keys.just_pressed(KeyCode::KeyE)
-        && let Some(target) = s.target
-    {
-        let event = if s.world.entity(target).kind == EntityKind::Npc { "chat" } else { "action" };
-        let player = s.player;
-        s.world.send_event(&mut s.host, Some(player), target, event, Vec::new());
+    if !keys.just_pressed(KeyCode::KeyE) {
+        return;
+    }
+    let Some(target) = s.target else { return };
+    let player = s.player;
+    if let Some(held) = ui.held {
+        inventory::combine(&mut s.world, &mut s.host, player, held, target);
+        if !s.host.player.inventory.contains(&held) {
+            ui.held = None;
+        }
+        return;
+    }
+    match s.world.entity(target).kind {
+        EntityKind::Item => {
+            let name = crate::hud::display_name(s, &speech, target);
+            match inventory::pick_up(&mut s.world, &mut s.host, player, target) {
+                inventory::PickUp::Refused(_) => {}
+                _ => s.host.push_message(format!("Picked up {name}")),
+            }
+        }
+        EntityKind::Npc => {
+            s.world.send_event(&mut s.host, Some(player), target, "chat", Vec::new());
+        }
+        _ => {
+            s.world.send_event(&mut s.host, Some(player), target, "action", Vec::new());
+        }
     }
 }
 

@@ -3,6 +3,7 @@
 //! by the interpreter (the rest of their line is ignored), so gameplay-only commands cost nothing.
 
 use crate::interp::{Args, CmdResult, Host, has_flag};
+use crate::player::PlayerState;
 use crate::text::Script;
 use crate::world::{EntityId, EntityKind, Timer};
 use std::{collections::HashMap, sync::Arc};
@@ -31,6 +32,18 @@ pub struct EntityState {
     /// Bumped whenever anything the renderer cares about changes.
     pub revision: u32,
     pub name: String,
+    /// Items: how many are in this stack (1 for anything that cannot stack).
+    pub count: u32,
+    /// Items: the most the player can carry in one stack (`playerstacksize`).
+    pub stack_size: u32,
+    /// Items: hunger restored by eating it (`setfood`).
+    pub food: f32,
+    pub weight: f32,
+    pub price: f32,
+    /// Carried by the player (and so not in the world).
+    pub in_inventory: bool,
+    /// Moved by the game (dropped by the player), in Arx coordinates; the renderer places the entity here.
+    pub moved_to: Option<[f32; 3]>,
 }
 
 impl Default for EntityState {
@@ -47,6 +60,13 @@ impl Default for EntityState {
             anim_serial: 0,
             revision: 0,
             name: String::new(),
+            count: 1,
+            stack_size: 1,
+            food: 0.0,
+            weight: 0.0,
+            price: 0.0,
+            in_inventory: false,
+            moved_to: None,
         }
     }
 }
@@ -123,6 +143,8 @@ pub struct StdHost {
     sounds: Vec<SoundRequest>,
     speech: Vec<SpeechEvent>,
     messages: Vec<String>,
+    /// The player's life, mana, hunger and inventory.
+    pub player: PlayerState,
 }
 
 impl StdHost {
@@ -146,6 +168,11 @@ impl StdHost {
         self.speech.push(ev);
     }
 
+    /// Show a notification, as `herosay` does.
+    pub fn push_message(&mut self, text: String) {
+        self.messages.push(text);
+    }
+
     /// `herosay` messages (localisation keys or literal text) since the last call.
     pub fn take_messages(&mut self) -> Vec<String> {
         std::mem::take(&mut self.messages)
@@ -158,6 +185,29 @@ impl StdHost {
 
     pub fn state(&self, id: EntityId) -> Option<&EntityState> {
         self.states.get(id as usize)
+    }
+
+    /// Change an entity's state from outside a script (the game picking something up, ...).
+    pub fn modify(&mut self, id: EntityId, f: impl FnOnce(&mut EntityState)) {
+        f(self.state_mut(id));
+    }
+
+    /// Forget inventory entries that have been destroyed (eaten, ...).
+    pub fn prune_inventory(&mut self) {
+        let states = &self.states;
+        self.player.inventory.retain(|&i| states.get(i as usize).is_none_or(|s| !s.destroyed));
+    }
+
+    /// What `destroy` / `eatme` do to an entity: one item leaves a stack, anything else is destroyed. Returns
+    /// whether the entity itself is gone.
+    fn destroy_delayed(&mut self, id: EntityId, kind: EntityKind) -> bool {
+        let st = self.state_mut(id);
+        if kind == EntityKind::Item && st.count > 1 {
+            st.count -= 1;
+            return false;
+        }
+        st.destroyed = true;
+        true
     }
 
     fn state_mut(&mut self, id: EntityId) -> &mut EntityState {
@@ -370,13 +420,61 @@ impl Host for StdHost {
                 self.speech.push(SpeechEvent::Say(SpeechRequest { speaker, script_entity: me, key, flags: f, on_end }));
                 CmdResult::Success
             }
+            "playerstacksize" => {
+                let n = a.get_float().max(1.0) as u32;
+                self.state_mut(me).stack_size = n;
+                CmdResult::Success
+            }
+            "setfood" => {
+                let v = a.get_float();
+                self.state_mut(me).food = v;
+                CmdResult::Success
+            }
+            "setweight" => {
+                let v = a.get_float();
+                self.state_mut(me).weight = v;
+                CmdResult::Success
+            }
+            "setprice" => {
+                let v = a.get_float();
+                self.state_mut(me).price = v;
+                CmdResult::Success
+            }
+            "eatme" => {
+                let kind = a.world.entity(me).kind;
+                if kind == EntityKind::Item {
+                    let food = self.state(me).map_or(0.0, |s| s.food);
+                    self.player.eat(food);
+                }
+                self.destroy_delayed(me, kind);
+                CmdResult::Success
+            }
+            "specialfx" => {
+                match a.get_word().as_str() {
+                    "heal" => {
+                        let v = a.get_float();
+                        self.player.life.add(v);
+                    }
+                    "mana" => {
+                        let v = a.get_float();
+                        self.player.mana.add(v);
+                    }
+                    "newspell" => a.skip_word(),
+                    // Visual effects (torches, fire, ...): not implemented, ignore the rest of the line.
+                    _ => {
+                        a.skip_command();
+                    }
+                }
+                CmdResult::Success
+            }
             "destroy" => {
                 let w = a.get_word();
                 let target = a.string_var(&w);
                 match a.world.find(&target, me) {
                     Some(t) => {
-                        self.state_mut(t).destroyed = true;
-                        if t == me { CmdResult::AbortAccept } else { CmdResult::Success }
+                        let kind = a.world.entity(t).kind;
+                        let gone = self.destroy_delayed(t, kind);
+                        if t == me && gone { CmdResult::AbortAccept } else { CmdResult::Success }
                     }
                     None => CmdResult::Success,
                 }
@@ -530,6 +628,45 @@ on action {
         let (script, pos) = first.on_end.clone().unwrap();
         w.run_line(&mut h, id, &script, pos);
         assert_eq!(h.take_messages(), ["done"]);
+    }
+
+    #[test]
+    fn eating_heals_feeds_and_uses_up_one_of_a_stack() {
+        let (mut w, mut h, id) = setup(
+            "graph/obj3d/interactive/items/provisions/applepie/applepie",
+            EntityKind::Item,
+            "on init {
+ playerstacksize 10
+ setfood 14
+ setweight 1
+ setprice 40
+ accept
+}
+on inventoryuse {
+ specialfx heal 4
+ specialfx fiery
+ specialfx mana 2
+ eatme
+ accept
+}",
+        );
+        w.send_init(&mut h, id);
+        let st = h.state(id).unwrap();
+        assert_eq!((st.stack_size, st.food, st.weight, st.price), (10, 14.0, 1.0, 40.0));
+        h.modify(id, |s| s.count = 2);
+        h.player.life.current = 3.0;
+        h.player.hunger = 20.0;
+        w.send_event(&mut h, None, id, "inventoryuse", vec![]);
+        assert_eq!(h.player.life.current, 7.0);
+        assert_eq!(h.player.mana.current, 6.0, "already full");
+        assert_eq!(h.player.hunger, 76.0);
+        assert_eq!(h.state(id).unwrap().count, 1);
+        assert!(!h.state(id).unwrap().destroyed, "one is left");
+        w.send_event(&mut h, None, id, "inventoryuse", vec![]);
+        assert!(h.state(id).unwrap().destroyed, "the last one is gone");
+        h.player.inventory.push(id);
+        h.prune_inventory();
+        assert!(h.player.inventory.is_empty());
     }
 
     #[test]

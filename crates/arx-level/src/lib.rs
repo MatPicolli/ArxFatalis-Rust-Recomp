@@ -1,6 +1,8 @@
 //! Glue between the file formats, the script interpreter and the collision world: everything needed
 //! to bring a level's entities to life that does not depend on a renderer.
 
+pub mod inventory;
+
 use arx_formats::{PakSet, dlf::Dlf, ftl::Ftl};
 use arx_physics::{CollisionWorld, ObstacleId};
 use arx_script::{EntityId, EntityKind, Script, ScriptWorld, StdHost};

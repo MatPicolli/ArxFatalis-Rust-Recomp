@@ -29,7 +29,7 @@ Format and behaviour knowledge comes from the GPLv3 project **ArxLibertatis**
 | `arx-formats` | PAK archives + PKWare DCL decompression, `.ftl` models, `.fts` level geometry, `.llf` baked lighting, `.dlf` scenes, `.tea` animations + skeletons, `.wav` (MS-ADPCM/PCM), localisation text (`locale`) |
 | `arx-physics` | level collision (spatial hash), switchable entity obstacles (doors), first-person player body |
 | `arx-script` | `.asl` interpreter (events, variables, goto/gosub, timers, event queue) and `StdHost` for visual/sound commands |
-| `arx-level` | glue: runs a level's scripts, builds entity obstacles, `entity_rotation` |
+| `arx-level` | glue: runs a level's scripts, builds entity obstacles, `entity_rotation`, `inventory` (pick up / use / combine / drop) |
 | `arx-cli` (`arx`) | inspection/verification tools (see below) |
 | `arx-viewer` | Bevy app: model/texture browser and the walkable level viewer |
 
@@ -81,6 +81,7 @@ cargo run --release -p arx-cli -- orient-panel             # door/portcullis pla
 cargo run --release -p arx-cli -- orient-wall lever        # wall-mounted objects: back to wall vs. facing into it
 cargo run --release -p arx-cli -- audio                    # decode every game sound
 cargo run --release -p arx-cli -- locale                   # do entity names / speak keys resolve to text and voices?
+cargo run --release -p arx-cli -- game 1 "list key" "pickup key_base_0005" "combine key_base_0005 light_door_0076" "send light_door_0076 action" "status"   # headless gameplay
 ```
 
 Viewer helpers (all work headless; `--shot out.png` saves a screenshot then exits and **ignores real input**):
@@ -92,6 +93,7 @@ cargo run -p arx-viewer -- level 1 --cam 8650,2945,8550 --look 0,-89 --fly --sho
 ```
 
 ```bash
+cargo run -p arx-viewer -- level 1 --pickup food_fish_0006,key_base_0005 --show-inventory --life 5 --shot shots/e.png   # HUD bars + inventory
 cargo run -p arx-viewer -- level 1 --focus goblin_base_0051 --say goblin_base_0051:goblinlord_forbidden --mute --shot shots/d.png   # subtitle test
 ```
 
@@ -113,6 +115,11 @@ sets the screenshot frame (large levels need ~60 frames before everything appear
   `String`, `String2`, ... are variants and each has its own voice file `speech/<language>/<key>[N].wav` (no number for
   the first). `speak` options form a single flag word (`-to`, not `-t -o`); the rest of the line runs when the speech
   ends (`ScriptWorld::run_line`). `setname` stores a key, so show `locale.text_or_key(name)`.
+- Items: an item entity is a *stack* (`EntityState::count`, max `stack_size` from `playerstacksize`); picking up merges
+  into a carried stack of the same class. `eatme`/`destroy` remove one from a stack before destroying the entity.
+  Doors and chests are unlocked by sending `combine` with `^$param1` = the key's id string (`key_base_0005`), which the
+  door tests with `^$param1 isin £key`. `§` is the **int** variable prefix, `£` the **text** one (easy to swap).
+  `specialfx heal N` adds N life directly. A new hero has life 12 and mana 6 (attribute 6 x (level+2) / (level+1)).
 - Level 9 does not exist. Many levels' saved start is not on a real floor; the viewer starts at the nearest entity
   when the saved start is more than 250 units off its floor.
 
@@ -121,10 +128,12 @@ sets the screenshot frame (large levels need ~60 frames before everything appear
 Done: PAK/FTL/FTS/LLF/DLF/TEA/WAV readers, level rendering with baked lighting, placed entities with per-vertex
 lighting, skeletal animation (CPU skinning), walkable player with collision, script interpreter running every
 entity's start-up (all 23 levels), doors/levers/portcullises (animation, collision, sound), spatial sound,
-localised names, voiced dialogue with subtitles (`speak`, `playspeech`) and `herosay` notifications.
+localised names, voiced dialogue with subtitles (`speak`, `playspeech`) and `herosay` notifications, player life/mana/
+hunger with HUD bars, item pickup with stacking, an inventory panel (use, hold, drop), eating/healing, and keys that
+unlock doors and chests (`combine`).
 
-Missing: cinematic cameras for `speak -c`, NPC behaviour (`behavior`, `settarget`), pickup/inventory, combat, spells,
-player HUD (health/mana/inventory), footsteps/music/ambiance zones, fog and dynamic/flickering lights, menus and save games. About 60 script
+Missing: cinematic cameras for `speak -c`, NPC behaviour (`behavior`, `settarget`), combat, spells, equipment and weapons, inventory grid/weight limits,
+`replaceme` and `inventory add` (loot in NPCs/chests), XP/levels/skills and character creation, footsteps/music/ambiance zones, fog and dynamic/flickering lights, menus and save games. About 60 script
 commands are skipped (the interpreter ignores a command it does not know, line by line, and counts it in
 `Stats::unknown_commands`; `arx script` prints the most frequent ones). A few levels (3, 10, 19, 20) have genuine
 drops where the player falls out of the world and is put back on their last solid ground.

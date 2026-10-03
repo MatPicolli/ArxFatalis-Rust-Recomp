@@ -41,6 +41,9 @@ enum Cmd {
     OrientWall { #[arg(default_value = "")] class_filter: String },
     /// List every level polygon (any flags) covering the Arx-coordinate point (x, z), to debug collision
     PolysAt { level: u32, x: f32, z: f32 },
+    /// Play a level headlessly through its scripts: each step is `list <text>`, `pickup <id>`, `use <id>`,
+    /// `combine <id> <target id>`, `send <id> <event>`, `drop <id>` or `status`
+    Game { level: u32, steps: Vec<String> },
     /// Decode every .wav in the archives (sfx, speech) and report failures and totals; with a path,
     /// decode that file to a 16-bit PCM wav at `--out`
     Audio { path: Option<String>, #[arg(short, long)] out: Option<PathBuf> },
@@ -392,6 +395,66 @@ fn main() -> Result<()> {
             println!("{uses} literal speak/herosay uses, {} distinct speak keys: {} keys without text, {} voice files missing", keys.len(), no_text.len(), no_voice.len());
             for k in no_text.iter().take(8) { println!("  no text: {k}"); }
             for k in no_voice.iter().take(8) { println!("  no voice: {k}"); }
+        }
+        Cmd::Game { level, steps } => {
+            use arx_level::inventory::{self, PickUp};
+            let dlf = pak.load_dlf(level).map_err(anyhow::Error::msg)?;
+            let fts = arx_formats::fts::Fts::parse(&pak.read(&format!("game/graph/levels/level{level}/fast.fts"))?)?;
+            let pak = std::sync::Arc::new(pak);
+            let mut s = arx_level::Scripts::build(&pak, &dlf, glam::Vec3::from(fts.scene_pos));
+            let loc = pak.load_locale("english").unwrap_or_default();
+            let name = |s: &arx_level::Scripts, id: u32| {
+                let n = s.host.state(id).map(|st| st.name.as_str()).filter(|n| !n.is_empty());
+                format!("{} ({})", s.world.entity(id).id_string, n.map_or("?".to_owned(), |n| loc.text_or_key(n).to_owned()))
+            };
+            let find = |s: &arx_level::Scripts, id: &str| s.world.find(id, s.player).ok_or_else(|| anyhow::anyhow!("no entity {id}"));
+            for step in &steps {
+                let w: Vec<&str> = step.split_whitespace().collect();
+                println!("> {step}");
+                match w.as_slice() {
+                    ["list", text] => {
+                        for id in 0..s.world.entities.len() as u32 {
+                            let e = s.world.entity(id);
+                            if e.id_string.contains(text) { println!("  {}  pos {:.0},{:.0},{:.0}", name(&s, id), e.pos[0], e.pos[1], e.pos[2]); }
+                        }
+                    }
+                    ["pickup", id] => {
+                        let id = find(&s, id)?;
+                        let r = inventory::pick_up(&mut s.world, &mut s.host, s.player, id);
+                        println!("  {} -> {r:?}", name(&s, id));
+                        if let PickUp::Stacked(t) = r { println!("  stack {} x{}", name(&s, t), s.host.state(t).map_or(0, |x| x.count)); }
+                    }
+                    ["use", id] => {
+                        let id = find(&s, id)?;
+                        println!("  {} -> {}", name(&s, id), inventory::use_item(&mut s.world, &mut s.host, s.player, id));
+                    }
+                    ["combine", a, b] => {
+                        let (a, b) = (find(&s, a)?, find(&s, b)?);
+                        let r = inventory::combine(&mut s.world, &mut s.host, s.player, a, b);
+                        println!("  {} on {} -> {r:?}", name(&s, a), name(&s, b));
+                    }
+                    ["drop", id] => {
+                        let id = find(&s, id)?;
+                        let at = s.world.entity(s.player).pos;
+                        println!("  {} -> {}", name(&s, id), inventory::drop_item(&mut s.world, &mut s.host, s.player, id, at));
+                    }
+                    ["send", id, event] => {
+                        let id = find(&s, id)?;
+                        let r = s.world.send_event(&mut s.host, Some(s.player), id, event, vec![]);
+                        s.world.update(&mut s.host, 0.0);
+                        println!("  {} {event} -> {r:?}", name(&s, id));
+                    }
+                    ["status"] => {
+                        let p = &s.host.player;
+                        println!("  life {}/{}  mana {}/{}  hunger {}", p.life.current, p.life.max, p.mana.current, p.mana.max, p.hunger);
+                        for &i in &p.inventory { println!("  carrying {} x{}", name(&s, i), s.host.state(i).map_or(0, |x| x.count)); }
+                    }
+                    _ => println!("  unknown step"),
+                }
+                for m in s.host.take_messages() { println!("  herosay: {}", loc.text_or_key(&m)); }
+                for e in s.host.take_speech() { if let arx_script::SpeechEvent::Say(r) = e { println!("  speech: {}", loc.text_or_key(&r.key)); } }
+                for snd in s.host.take_sounds() { println!("  sound: {}", snd.name); }
+            }
         }
         Cmd::Walk { level, no_entities } => {
             use arx_physics::{CollisionWorld, Player, EYE_HEIGHT};

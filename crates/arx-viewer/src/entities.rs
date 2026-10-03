@@ -285,7 +285,7 @@ pub fn spawn_entities(
         }
         pickables.push(Pickable {
             id: script_id,
-            center: translation + rotation * ((lo + hi) * 0.5 * scale),
+            offset: rotation * ((lo + hi) * 0.5 * scale),
             radius: ((hi - lo).length() * 0.5 * scale).max(20.0),
         });
         stats.spawned += 1;

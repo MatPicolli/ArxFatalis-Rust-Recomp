@@ -11,6 +11,7 @@ mod animated;
 mod audio;
 mod convert;
 mod entities;
+mod hud;
 mod level;
 mod scripting;
 mod speech;
@@ -89,6 +90,16 @@ struct Args {
     /// a localised line, for testing text and voices
     #[arg(long)]
     say: Option<String>,
+    /// Level mode: put these entities (comma-separated ids such as `key_base_0005`) in the inventory shortly
+    /// after start-up, for headless testing
+    #[arg(long, value_delimiter = ',')]
+    pickup: Vec<String>,
+    /// Level mode: start with the inventory panel open
+    #[arg(long)]
+    show_inventory: bool,
+    /// Level mode: start with this much life (the maximum is 12 for a new hero), to see healing
+    #[arg(long)]
+    life: Option<f32>,
     /// Level mode: do not show dialogue subtitles
     #[arg(long)]
     no_subtitles: bool,
@@ -388,6 +399,8 @@ struct LevelArgs {
     use_entity: Vec<String>,
     focus: Option<String>,
     say: Option<String>,
+    pickup: Vec<String>,
+    life: Option<f32>,
 }
 
 #[derive(Resource)]
@@ -433,6 +446,8 @@ fn run_level(args: Args, pak: PakSet) {
         use_entity: args.use_entity.clone(),
         focus: args.focus.clone(),
         say: args.say.clone(),
+        pickup: args.pickup.clone(),
+        life: args.life,
     })
     .insert_resource(entities::EntityCache::default())
     .insert_resource(Fly {
@@ -450,7 +465,8 @@ fn run_level(args: Args, pak: PakSet) {
     .insert_resource(scripting::Obstacles::default())
     .insert_resource(audio::Sounds::new(args.mute))
     .insert_resource(speech::Speech::new(locale, args.language.clone(), !args.no_subtitles, args.mute))
-    .add_systems(Startup, speech::spawn_ui)
+    .add_systems(Startup, (speech::spawn_ui, hud::spawn))
+    .insert_resource(hud::Ui { open: args.show_inventory, ..default() })
     .add_systems(
         Update,
         (
@@ -462,7 +478,10 @@ fn run_level(args: Args, pak: PakSet) {
             scripting::sync_obstacles,
             audio::play_sounds,
             fly_camera,
+            hud::debug_pickup,
+            hud::input,
             scripting::interact,
+            hud::update,
             animated::animate,
             level_hud,
         )
@@ -710,7 +729,7 @@ fn level_hud(
     // Report the position in Arx coordinates so it can be fed back through --cam.
     let mode = if fly.walk { "walking" } else { "flying" };
     let help = if fly.walk {
-        "WASD move  Shift run  Space jump  E use  click: capture mouse  Esc: release  F: fly"
+        "WASD move  Shift run  Space jump  E use/take  I inventory  click: capture mouse  Esc: release  F: fly"
     } else {
         "WASD move  Q/E down/up  Shift fast  scroll speed  click: capture mouse  Esc: release  F: walk"
     };
