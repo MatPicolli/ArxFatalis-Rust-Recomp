@@ -8,6 +8,7 @@
 
 mod anims;
 mod animated;
+mod audio;
 mod convert;
 mod entities;
 mod level;
@@ -73,6 +74,9 @@ struct Args {
     /// shortly after start-up, as if the player had used them; for headless testing
     #[arg(long, value_delimiter = ',')]
     use_entity: Vec<String>,
+    /// Level mode: no sound
+    #[arg(long)]
+    mute: bool,
     /// Level mode: do not place entities (items, NPCs, fixtures)
     #[arg(long)]
     no_entities: bool,
@@ -385,10 +389,15 @@ struct Fly {
 fn run_level(args: Args, pak: PakSet) {
     let level = args.filter.as_deref().and_then(|s| s.parse().ok()).unwrap_or(1);
     let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window { title: format!("Arx Fatalis - level {level}"), ..default() }),
-        ..default()
-    }))
+    app.add_plugins(
+        DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: Some(Window { title: format!("Arx Fatalis - level {level}"), ..default() }),
+                ..default()
+            })
+            // Arx units are about centimetres; spatial audio works in metres.
+            .set(bevy::audio::AudioPlugin { default_spatial_scale: bevy::audio::SpatialScale::new(0.01), ..default() }),
+    )
     .insert_resource(ClearColor(Color::BLACK))
     .insert_resource(Arx(std::sync::Arc::new(pak)))
     .insert_resource(TextureCache::default())
@@ -415,12 +424,16 @@ fn run_level(args: Args, pak: PakSet) {
     .add_systems(Startup, setup_level)
     .insert_resource(scripting::Scripting::default())
     .insert_resource(scripting::Pickables::default())
+    .insert_resource(scripting::Obstacles::default())
+    .insert_resource(audio::Sounds::new(args.mute))
     .add_systems(
         Update,
         (
             scripting::tick,
             scripting::apply_state,
             scripting::auto_use,
+            scripting::sync_obstacles,
+            audio::play_sounds,
             fly_camera,
             scripting::interact,
             animated::animate,
@@ -443,6 +456,7 @@ fn setup_level(
     mut ecache: ResMut<entities::EntityCache>,
     mut scripting: ResMut<scripting::Scripting>,
     mut pickables: ResMut<scripting::Pickables>,
+    mut obstacles: ResMut<scripting::Obstacles>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
@@ -456,6 +470,7 @@ fn setup_level(
             ..default()
         }),
         Transform::default(),
+        SpatialListener::new(8.0),
     ));
     commands.spawn((
         Hud,
@@ -473,22 +488,57 @@ fn setup_level(
                 args.level, info.poly_count, info.mesh_count, t.elapsed()
             );
             let dlf = arx.0.load_dlf(args.level);
-            // The FTS position is at the feet (eyes ~160 higher); the DLF one is the editor camera.
-            let start = match &dlf {
-                Ok(d) if args.start == StartPos::Dlf => Vec3::from(convert::to_bevy([
-                    d.player_pos[0] + info.scene_pos.x,
-                    d.player_pos[1] + info.scene_pos.y,
-                    d.player_pos[2] + info.scene_pos.z,
-                ])),
-                _ => info.player_pos + Vec3::Y * 160.0,
+            // Where the player's feet start. The FTS position is a foot position; the DLF one is the
+            // editor camera (eye height). Both are editor positions, and can lie on a ledge far from
+            // the real floor: if the nearest entity (which stands on a real floor) is much higher or
+            // lower, start there instead.
+            let mut feet0 = match &dlf {
+                Ok(d) if args.start == StartPos::Dlf => {
+                    Vec3::from(arx_level::to_yup([
+                        d.player_pos[0] + info.scene_pos.x,
+                        d.player_pos[1] + info.scene_pos.y,
+                        d.player_pos[2] + info.scene_pos.z,
+                    ])) - Vec3::Y * arx_physics::EYE_HEIGHT
+                }
+                _ => info.player_pos,
             };
+            if let Ok(d) = &dlf {
+                let nearest = d
+                    .entities
+                    .iter()
+                    .filter(|e| !e.class.contains("/items/") && !e.class.contains("/system/camera"))
+                    .map(|e| Vec3::from(arx_level::to_yup([e.pos[0] + info.scene_pos.x, e.pos[1] + info.scene_pos.y, e.pos[2] + info.scene_pos.z])))
+                    .min_by(|a, b| (a.x - feet0.x).hypot(a.z - feet0.z).total_cmp(&(b.x - feet0.x).hypot(b.z - feet0.z)));
+                if let Some(anchor) = nearest.filter(|a| (a.y - feet0.y).abs() > 250.0) {
+                    feet0 = anchor;
+                }
+            }
+            let start = feet0 + Vec3::Y * arx_physics::EYE_HEIGHT;
             fly.pos = args.cam.unwrap_or(start);
-            fly.world = Some(info.collision.clone());
+            // Scripts decide which entities exist and what they look like; solid ones (doors,
+            // portcullises, ...) join the collision world before it is shared.
+            let mut collision = info.collision;
+            if let (Ok(d), true) = (&dlf, args.entities) {
+                let t = std::time::Instant::now();
+                *scripting = scripting::Scripting::build(&arx.0, d, info.scene_pos);
+                let ws = &scripting.world.stats;
+                eprintln!(
+                    "scripts: {} events, {} commands, {} warnings, {} unimplemented command kinds, run in {:.1?}",
+                    ws.events_run, ws.commands_run, ws.warnings.len(), ws.unknown_commands.len(), t.elapsed()
+                );
+                obstacles.entities = arx_level::EntityObstacles::build(
+                    &mut collision, &arx.0, d, info.scene_pos, &scripting.world, &scripting.host, &scripting.ids,
+                );
+                eprintln!("entity obstacles: {}", obstacles.entities.by_entity.len());
+            }
+            let collision = std::sync::Arc::new(collision);
+            obstacles.world = Some(collision.clone());
+            fly.world = Some(collision.clone());
             // Walking starts with the feet on the ground: an explicit camera is an eye position; the
             // default start is already a foot position (moved somewhere safe if it floats over nothing).
             let feet = match args.cam {
                 Some(eye) => eye - Vec3::Y * arx_physics::EYE_HEIGHT,
-                None => info.collision.spawn_point(start - Vec3::Y * arx_physics::EYE_HEIGHT * (args.start == StartPos::Dlf) as i32 as f32),
+                None => collision.spawn_point(feet0),
             };
             fly.player = arx_physics::Player::new(feet + Vec3::Y * 20.0);
             if args.cam.is_none() {
@@ -498,13 +548,6 @@ fn setup_level(
                 Ok(d) if args.entities => {
                     let lights = arx.0.load_llf(args.level).map(|l| l.lights).unwrap_or_default();
                     let lights = entities::StaticLight::from_level(&lights, info.scene_pos);
-                    let t = std::time::Instant::now();
-                    *scripting = scripting::Scripting::build(&arx.0, &d, info.scene_pos);
-                    let ws = &scripting.world.stats;
-                    eprintln!(
-                        "scripts: {} events, {} commands, {} warnings, {} unimplemented command kinds, run in {:.1?}",
-                        ws.events_run, ws.commands_run, ws.warnings.len(), ws.unknown_commands.len(), t.elapsed()
-                    );
                     let t = std::time::Instant::now();
                     let stats = entities::spawn_entities(
                         &mut commands, &arx.0, &d, info.scene_pos, &lights, args.npcs,

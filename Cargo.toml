@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/arx-formats", "crates/arx-physics", "crates/arx-script", "crates/arx-cli", "crates/arx-viewer"]
+members = ["crates/arx-formats", "crates/arx-physics", "crates/arx-script", "crates/arx-level", "crates/arx-cli", "crates/arx-viewer"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,7 +12,7 @@ memmap2 = "0.9"
 thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
-bevy = "0.19"
+bevy = { version = "0.19", features = ["wav"] }
 glam = "0.32"
 image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "tga", "png"] }
 

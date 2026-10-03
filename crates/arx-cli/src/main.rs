@@ -32,6 +32,11 @@ enum Cmd {
     Ftl { path: Option<String> },
     /// Parse level geometry (`game/graph/levels/levelN/fast.fts`); no argument = all levels
     Fts { level: Option<u32> },
+    /// List every level polygon (any flags) covering the Arx-coordinate point (x, z), to debug collision
+    PolysAt { level: u32, x: f32, z: f32 },
+    /// Decode every .wav in the archives (sfx, speech) and report failures and totals; with a path,
+    /// decode that file to a 16-bit PCM wav at `--out`
+    Audio { path: Option<String>, #[arg(short, long)] out: Option<PathBuf> },
     /// Load every entity script of a level, run INIT/INITEND for all, and report what the interpreter
     /// could not handle (no argument = all levels, one world per level)
     Script { level: Option<u32>, /// how many unknown commands / warnings to list
@@ -40,7 +45,8 @@ enum Cmd {
         #[arg(short, long)] details: bool },
     /// Simulate the player in a level: drop from the start, then walk in 8 directions and report how
     /// far each walk got before hitting a wall (a headless check of the collision system)
-    Walk { level: u32 },
+    Walk { level: u32, /// ignore doors and other entities (level geometry only)
+        #[arg(long)] no_entities: bool },
     /// Parse a .tea animation (and with --model, pose that .ftl at several times); no path = parse all
     Tea { path: Option<String>, #[arg(long)] model: Option<String> },
     /// Parse level scene definitions (`graph/levels/levelN/levelN.dlf`); no argument = all levels
@@ -50,8 +56,8 @@ enum Cmd {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let pak = PakSet::open_game_dir(&cli.game_dir)
-        .with_context(|| format!("opening {}", cli.game_dir.display()))?;
+    let pak = std::sync::Arc::new(PakSet::open_game_dir(&cli.game_dir)
+        .with_context(|| format!("opening {}", cli.game_dir.display()))?);
 
     match cli.cmd {
         Cmd::Stats => {
@@ -145,13 +151,58 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Walk { level } => {
+        Cmd::PolysAt { level, x, z } => {
+            let fts = arx_formats::fts::Fts::parse(&pak.read(&format!("game/graph/levels/level{level}/fast.fts"))?)?;
+            let inside = |p: &arx_formats::fts::Poly, idx: [usize; 3]| {
+                let v = |i: usize| (p.verts[i].pos[0], p.verts[i].pos[2]);
+                let (a, b, c) = (v(idx[0]), v(idx[1]), v(idx[2]));
+                let s = |p1: (f32, f32), p2: (f32, f32), p3: (f32, f32)| (p1.0 - p3.0) * (p2.1 - p3.1) - (p2.0 - p3.0) * (p1.1 - p3.1);
+                let (d1, d2, d3) = (s((x, z), a, b), s((x, z), b, c), s((x, z), c, a));
+                !((d1 < 0.0 || d2 < 0.0 || d3 < 0.0) && (d1 > 0.0 || d2 > 0.0 || d3 > 0.0))
+            };
+            let mut rows = Vec::new();
+            for p in &fts.polys {
+                let hit = inside(p, [0, 1, 2]) || (p.is_quad() && inside(p, [3, 2, 1]));
+                if !hit { continue; }
+                let ys: Vec<f32> = p.verts[..p.vertex_count()].iter().map(|v| v.pos[1]).collect();
+                let (y0, y1) = ys.iter().fold((f32::MAX, f32::MIN), |(a, b), y| (a.min(*y), b.max(*y)));
+                rows.push((y0, y1, p.flags, p.norm[1], p.tex, fts.textures.get(&p.tex).cloned().unwrap_or_default()));
+            }
+            rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let cw = arx_physics::CollisionWorld::from_fts(&fts);
+            println!("collision world floor at that point (y-up, searching up to y=-1000): {:?}", cw.floor_height(x, -z, -1000.0));
+            println!("{} polygons cover ({x}, {z}); Arx y is down, so the first rows are the highest:", rows.len());
+            for (y0, y1, f, ny, tex, name) in rows { println!("  y {y0:>8.1}..{y1:>8.1}  flags {f:#09x}  norm.y {ny:>5.2}  tex {tex} {name}"); }
+        }
+        Cmd::Walk { level, no_entities } => {
             use arx_physics::{CollisionWorld, Player, EYE_HEIGHT};
             let fts = arx_formats::fts::Fts::parse(&pak.read(&format!("game/graph/levels/level{level}/fast.fts"))?)?;
             let t = std::time::Instant::now();
-            let world = CollisionWorld::from_fts(&fts);
+            let mut world = CollisionWorld::from_fts(&fts);
+            let mut scripts = None;
+            if !no_entities {
+                if let Ok(dlf) = pak.load_dlf(level) {
+                    let scene_pos = glam::Vec3::from(fts.scene_pos);
+                    let s = arx_level::Scripts::build(&pak, &dlf, scene_pos);
+                    let obstacles = arx_level::EntityObstacles::build(&mut world, &pak, &dlf, scene_pos, &s.world, &s.host, &s.ids);
+                    let enabled = obstacles.by_entity.values().filter(|o| world.obstacle_enabled(**o)).count();
+                    println!("entity obstacles: {} ({} solid right now)", obstacles.by_entity.len(), enabled);
+                    scripts = Some((s, obstacles));
+                }
+            }
+            let _ = &scripts;
             println!("collision world: {} triangles, built in {:.0?}", world.triangle_count(), t.elapsed());
-            let start = glam::Vec3::new(fts.player_pos[0], -fts.player_pos[1], -fts.player_pos[2]);
+            let mut start = glam::Vec3::new(fts.player_pos[0], -fts.player_pos[1], -fts.player_pos[2]);
+            // The saved start is an editor position and can be on a ledge nowhere near the real floor;
+            // entities stand on real floors, so start from the one nearest to it.
+            if let Ok(dlf) = pak.load_dlf(level) {
+                let sp = glam::Vec3::from(fts.scene_pos);
+                let nearest = dlf.entities.iter()
+                    .filter(|e| !e.class.contains("/items/") && !e.class.contains("/system/camera"))
+                    .map(|e| arx_level::to_yup([e.pos[0] + sp.x, e.pos[1] + sp.y, e.pos[2] + sp.z]))
+                    .min_by(|a, b| (a.x - start.x).hypot(a.z - start.z).total_cmp(&(b.x - start.x).hypot(b.z - start.z)));
+                if let Some(p) = nearest { start = p; }
+            }
             let mut p = Player::new(start + glam::Vec3::Y * 40.0);
             for _ in 0..300 { p.step(&world, 1.0 / 60.0, glam::Vec2::ZERO, false); }
             println!("dropped from 40 above the start: feet y {:.1} (start y {:.1}), on_ground {}, eye {:.1}", p.feet.y, start.y, p.on_ground, p.feet.y + EYE_HEIGHT);
@@ -235,6 +286,23 @@ fn main() -> Result<()> {
             }
             let (floor_lo, floor_hi) = world_extent_y(&fts);
             println!("fuzz 3 min: {} rescues from falling out of the level; feet y {lo:.0}..{hi:.0} (level geometry spans {floor_lo:.0}..{floor_hi:.0}), on ground {:.0}% of frames, longest airborne run {} frames, final pos ({:.0}, {:.0}, {:.0})", q.rescues, 100.0 * grounded as f32 / frames as f32, worst_fall, q.feet.x, q.feet.y, q.feet.z);
+        }
+        Cmd::Audio { path: Some(path), out } => {
+            let pcm = arx_formats::wav::decode(&pak.read(&path)?)?;
+            println!("{path}: {} Hz, {} ch, {:.2}s", pcm.rate, pcm.channels, pcm.duration_secs());
+            if let Some(out) = out { std::fs::write(&out, pcm.to_wav_bytes())?; println!("wrote {}", out.display()); }
+        }
+        Cmd::Audio { path: None, .. } => {
+            let (mut ok, mut bad, mut secs) = (0, 0, 0.0f64);
+            let mut by_dir: BTreeMap<String, usize> = BTreeMap::new();
+            for name in pak.list("").into_iter().filter(|n| n.ends_with(".wav")) {
+                match arx_formats::wav::decode(&pak.read(name)?) {
+                    Ok(p) => { ok += 1; secs += p.duration_secs() as f64; *by_dir.entry(name.split('/').take(2).collect::<Vec<_>>().join("/")).or_default() += 1; }
+                    Err(e) => { bad += 1; if bad <= 10 { eprintln!("FAIL {name}: {e}"); } }
+                }
+            }
+            println!("{ok} decoded ({:.1} hours of audio), {bad} failed", secs / 3600.0);
+            println!("by directory: {by_dir:?}");
         }
         Cmd::Script { level, top, details } => {
             use arx_script::{Script, ScriptWorld, EntityKind};

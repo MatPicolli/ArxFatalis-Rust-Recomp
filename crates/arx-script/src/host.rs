@@ -50,6 +50,23 @@ impl Default for EntityState {
     }
 }
 
+/// A request from a script to play (or stop) a sound, for the audio system to carry out.
+#[derive(Debug, Clone)]
+pub struct SoundRequest {
+    pub entity: EntityId,
+    /// Sample name without folder or extension (`door_wood_open` plays `sfx/door_wood_open.wav`).
+    pub name: String,
+    pub looping: bool,
+    /// Replace this entity's previous "unique" sound.
+    pub unique: bool,
+    /// Stop the entity's unique sound instead of playing anything.
+    pub stop: bool,
+    /// Vary the pitch by up to 10% each way.
+    pub random_pitch: bool,
+    /// Heard from the entity's position (otherwise at full volume wherever the player is).
+    pub positional: bool,
+}
+
 /// Returns the length in milliseconds of the animation file at a virtual path.
 pub type AnimDuration = Box<dyn Fn(&str) -> Option<f64> + Send + Sync>;
 
@@ -57,6 +74,7 @@ pub type AnimDuration = Box<dyn Fn(&str) -> Option<f64> + Send + Sync>;
 pub struct StdHost {
     states: Vec<EntityState>,
     anim_duration: Option<AnimDuration>,
+    sounds: Vec<SoundRequest>,
 }
 
 impl StdHost {
@@ -68,6 +86,11 @@ impl StdHost {
     /// the animation ends).
     pub fn set_anim_duration(&mut self, f: AnimDuration) {
         self.anim_duration = Some(f);
+    }
+
+    /// Sound requests made since the last call.
+    pub fn take_sounds(&mut self) -> Vec<SoundRequest> {
+        std::mem::take(&mut self.sounds)
     }
 
     pub fn state(&self, id: EntityId) -> Option<&EntityState> {
@@ -213,6 +236,24 @@ impl Host for StdHost {
                 let slot = a.get_word().to_ascii_lowercase();
                 self.play(entity, &slot, looping, a)
             }
+            "play" => {
+                let flags = a.get_flags();
+                let w = a.get_word();
+                let name = a.string_var(&w).to_ascii_lowercase();
+                let name = name.strip_suffix(".wav").unwrap_or(&name).replace('\\', "/");
+                // Inventory-use sounds are played at the player, whatever the flags say.
+                let positional = !has_flag(&flags, 'o') && a.ctx.event != "inventoryuse";
+                self.sounds.push(SoundRequest {
+                    entity: me,
+                    name,
+                    looping: has_flag(&flags, 'l'),
+                    unique: has_flag(&flags, 'i'),
+                    stop: has_flag(&flags, 's'),
+                    random_pitch: has_flag(&flags, 'p'),
+                    positional,
+                });
+                CmdResult::Success
+            }
             "destroy" => {
                 let w = a.get_word();
                 let target = a.string_var(&w);
@@ -301,6 +342,28 @@ on action {
         w.update(&mut h, 600.0);
         assert!(h.state(id).unwrap().interactive);
         assert_eq!(w.timer_count(), 0);
+    }
+
+    #[test]
+    fn play_queues_sound_requests_with_flags_and_variables() {
+        // Local text variables use the Latin-1 pound sign, which is a single byte in script files.
+        let src: Vec<u8> = "on init {\n set \u{a3}sfx \"Door_Wood_Open\"\n accept\n}\non open {\n play ~\u{a3}sfx~\n play -li hum\n play -s hum\n play -o click.wav\n accept\n}"
+            .chars()
+            .map(|c| c as u8)
+            .collect();
+        let mut w = ScriptWorld::new();
+        let id = w.add_entity(EntityKind::Fix, "x/y/door", 1, Some(Arc::new(Script::new(&src))), None);
+        let mut h = StdHost::new();
+        w.send_init(&mut h, id);
+        w.send_event(&mut h, None, id, "open", vec![]);
+        let s = h.take_sounds();
+        assert_eq!(s.len(), 4);
+        assert_eq!(s[0].name, "door_wood_open");
+        assert!(s[0].positional && !s[0].looping);
+        assert!(s[1].looping && s[1].unique && s[1].name == "hum");
+        assert!(s[2].stop);
+        assert!(!s[3].positional && s[3].name == "click");
+        assert!(h.take_sounds().is_empty());
     }
 
     #[test]

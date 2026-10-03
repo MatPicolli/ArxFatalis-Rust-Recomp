@@ -5,6 +5,7 @@
 use crate::animated::{Animated, MeshSrc, no_cull};
 use crate::scripting::{Pickable, ScriptRef, Scripting};
 use crate::convert::{TextureCache, load_texture, to_bevy};
+use arx_level::entity_rotation;
 use crate::level::{Kind, trans_kind};
 use arx_formats::{PakSet, dlf::Dlf, ftl::Ftl, llf::Light, poly, skeleton::Skeleton};
 use bevy::{asset::RenderAssetUsages, mesh::PrimitiveTopology, prelude::*, render::render_resource::Face};
@@ -83,13 +84,6 @@ fn light_vertex(lights: &[&StaticLight], ambient: f32, pos: Vec3, normal: Vec3) 
 fn srgb_to_linear(c: f32) -> f32 {
     let c = (c / 255.0).clamp(0.0, 1.0);
     if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
-}
-
-/// Rotation of an entity: Arx applies `Rz(-roll) * Rx(pitch) * Ry(yaw)` in its own axes; the
-/// Arx->Bevy axis flip (diag(1,-1,-1)) turns that into `Rz(roll) * Rx(pitch) * Ry(-yaw)`.
-fn entity_rotation(angle: [f32; 3]) -> Quat {
-    let [pitch, yaw, roll] = angle.map(f32::to_radians);
-    Quat::from_rotation_z(roll) * Quat::from_rotation_x(pitch) * Quat::from_rotation_y(-yaw)
 }
 
 /// Editor-only helper objects that are invisible in the game.

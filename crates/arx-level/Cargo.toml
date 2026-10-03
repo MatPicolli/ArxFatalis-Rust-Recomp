@@ -1,18 +1,11 @@
 [package]
-name = "arx-viewer"
+name = "arx-level"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "arx-viewer"
-path = "src/main.rs"
-
 [dependencies]
 arx-formats = { path = "../arx-formats" }
-bevy.workspace = true
-image.workspace = true
-clap.workspace = true
 arx-physics = { path = "../arx-physics" }
 arx-script = { path = "../arx-script" }
-arx-level = { path = "../arx-level" }
+glam.workspace = true

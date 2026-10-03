@@ -13,5 +13,6 @@ arx-formats = { path = "../arx-formats" }
 glam.workspace = true
 arx-physics = { path = "../arx-physics" }
 arx-script = { path = "../arx-script" }
+arx-level = { path = "../arx-level" }
 anyhow.workspace = true
 clap.workspace = true

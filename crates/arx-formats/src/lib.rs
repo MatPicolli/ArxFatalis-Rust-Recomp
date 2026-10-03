@@ -12,5 +12,6 @@ pub mod poly;
 pub mod reader;
 pub mod skeleton;
 pub mod tea;
+pub mod wav;
 
 pub use pak::{PakEntry, PakError, PakSet};

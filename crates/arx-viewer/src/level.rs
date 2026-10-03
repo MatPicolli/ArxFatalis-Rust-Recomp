@@ -15,7 +15,7 @@ pub struct LevelInfo {
     pub scene_pos: Vec3,
     pub poly_count: usize,
     pub mesh_count: usize,
-    pub collision: std::sync::Arc<arx_physics::CollisionWorld>,
+    pub collision: arx_physics::CollisionWorld,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -161,6 +161,6 @@ pub fn spawn_level(
         scene_pos: Vec3::from(fts.scene_pos),
         poly_count: fts.polys.len(),
         mesh_count,
-        collision: std::sync::Arc::new(arx_physics::CollisionWorld::from_fts(&fts)),
+        collision: arx_physics::CollisionWorld::from_fts(&fts),
     })
 }

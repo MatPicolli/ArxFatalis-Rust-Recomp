@@ -1,10 +1,13 @@
-//! Runs the level's entity scripts and reflects their effects in the scene.
+//! Runs the level's entity scripts and reflects their effects in the scene: visibility, scale,
+//! animations, door collision, and what the player is looking at.
 
 use crate::animated::Animated;
 use crate::anims;
 use crate::{Arx, Fly};
-use arx_formats::{PakSet, dlf::Dlf, tea::Tea};
-use arx_script::{EntityId, EntityKind, Script, ScriptWorld, StdHost};
+use arx_formats::{dlf::Dlf, tea::Tea};
+use arx_level::{EntityObstacles, Scripts};
+use arx_physics::CollisionWorld;
+use arx_script::{EntityId, EntityKind, ScriptWorld, StdHost};
 use bevy::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 
@@ -24,6 +27,13 @@ pub struct Pickable {
 #[derive(Resource, Default)]
 pub struct Pickables(pub Vec<Pickable>);
 
+/// Entity obstacles in the shared collision world, kept in step with the scripts.
+#[derive(Resource, Default)]
+pub struct Obstacles {
+    pub entities: EntityObstacles,
+    pub world: Option<Arc<CollisionWorld>>,
+}
+
 #[derive(Resource, Default)]
 pub struct Scripting {
     pub world: ScriptWorld,
@@ -39,52 +49,18 @@ pub struct Scripting {
 }
 
 impl Scripting {
-    /// Load every entity's scripts, then run the level start-up sequence: `load`, `init` and
-    /// `initend` for each entity, then `game_ready` for all.
-    pub fn build(pak: &Arc<PakSet>, dlf: &Dlf, scene_pos: Vec3) -> Scripting {
-        let mut world = ScriptWorld::new();
-        let mut host = StdHost::new();
-        {
-            // Animation length in ms, straight from the header (frame count at 24 fps).
-            let pak = pak.clone();
-            host.set_anim_duration(Box::new(move |path| {
-                let bytes = pak.read(path).ok()?;
-                let frames = i32::from_le_bytes(bytes.get(280..284)?.try_into().ok()?);
-                Some(frames as f64 * 1000.0 / 24.0)
-            }));
-        }
-        let player = world.add_entity(EntityKind::Player, "graph/obj3d/interactive/npc/player/player", 1, None, None);
-
-        let load = |path: &str| pak.read(path).ok().map(|b| Arc::new(Script::new(&b)));
-        let mut ids = Vec::with_capacity(dlf.entities.len());
-        for e in &dlf.entities {
-            let (dir, name) = e.class.rsplit_once('/').unwrap_or(("", &e.class));
-            let class_script = load(&format!("{}.asl", e.class));
-            let over_script = load(&format!("{dir}/{name}_{:04}/{name}.asl", e.instance));
-            let id = world.add_entity(EntityKind::from_class(&e.class), &e.class, e.instance, class_script, over_script);
-            world.entity_mut(id).pos = [e.pos[0] + scene_pos.x, e.pos[1] + scene_pos.y, e.pos[2] + scene_pos.z];
-            ids.push(id);
-        }
-
-        for &id in &ids {
-            world.send_event(&mut host, None, id, "load", Vec::new());
-        }
-        for &id in &ids {
-            world.send_init(&mut host, id);
-        }
-        for &id in &ids {
-            world.send_event(&mut host, None, id, "game_ready", Vec::new());
-        }
-        world.update(&mut host, 0.0);
+    /// Load every entity's scripts and run the level start-up sequence (see [`Scripts::build`]).
+    pub fn build(pak: &Arc<arx_formats::PakSet>, dlf: &Dlf, scene_pos: Vec3) -> Scripting {
+        let Scripts { world, host, ids, player } = Scripts::build(pak, dlf, scene_pos);
         Scripting { world, host, ids, player, ..default() }
     }
 
-    fn load_anim(&mut self, pak: &PakSet, path: &str) -> Option<Arc<Tea>> {
+    fn load_anim(&mut self, pak: &arx_formats::PakSet, path: &str) -> Option<Arc<Tea>> {
         self.anim_cache.entry(path.to_owned()).or_insert_with(|| anims::load_anim(pak, path)).clone()
     }
 
     /// Cached animation lookup for the entity spawner.
-    pub fn anim(&mut self, pak: &PakSet, path: &str) -> Option<Arc<Tea>> {
+    pub fn anim(&mut self, pak: &arx_formats::PakSet, path: &str) -> Option<Arc<Tea>> {
         self.load_anim(pak, path)
     }
 }
@@ -99,6 +75,14 @@ pub fn tick(time: Res<Time>, fly: Res<Fly>, mut s: ResMut<Scripting>) {
     let player = s.player;
     s.world.entity_mut(player).pos = [feet.x, -feet.y, -feet.z];
     s.world.update(&mut s.host, time.delta_secs_f64().min(0.1) * 1000.0);
+}
+
+/// Make doors and other entities solid or passable as their scripts say (`collision on/off`,
+/// hidden, destroyed).
+pub fn sync_obstacles(s: Res<Scripting>, o: Res<Obstacles>) {
+    if let Some(world) = &o.world {
+        o.entities.sync(world, &s.host);
+    }
 }
 
 /// Copy script-driven state (visibility, scale, animation) onto the spawned entities.
@@ -172,8 +156,19 @@ pub fn interact(
 
 /// Headless testing aid (`--use-entity id[:event]`): send an event (default `action`) from the
 /// player to the named entities a moment after start-up, and report what the scripts did.
-pub fn auto_use(mut frames: Local<u32>, args: Res<crate::LevelArgs>, mut s: ResMut<Scripting>) {
+pub fn auto_use(mut frames: Local<u32>, args: Res<crate::LevelArgs>, mut s: ResMut<Scripting>, o: Res<Obstacles>) {
     *frames += 1;
+    if *frames == 40 {
+        // One frame after the events took effect, report whether the doors are solid now.
+        for spec in &args.use_entity {
+            let name = spec.split_once(':').map_or(spec.as_str(), |(n, _)| n);
+            if let Some(t) = s.world.find(name, s.player) {
+                let solid = o.entities.by_entity.get(&t).zip(o.world.as_ref()).map(|(id, w)| w.obstacle_enabled(*id));
+                eprintln!("{name}: obstacle solid after the script ran: {solid:?}");
+            }
+        }
+        return;
+    }
     if *frames != 20 {
         return;
     }
@@ -188,8 +183,9 @@ pub fn auto_use(mut frames: Local<u32>, args: Res<crate::LevelArgs>, mut s: ResM
         let result = s.world.send_event(&mut s.host, Some(player), t, event, Vec::new());
         s.world.update(&mut s.host, 0.0);
         let st = s.host.state(t);
+        let solid = o.entities.by_entity.get(&t).zip(o.world.as_ref()).map(|(id, w)| w.obstacle_enabled(*id));
         eprintln!(
-            "sent {event} to {name}: {result:?}; playing {:?}, collision {:?}, interactive {:?}; open={}",
+            "sent {event} to {name}: {result:?}; playing {:?}, collision flag {:?}, interactive {:?}; open={}; obstacle currently solid: {solid:?} (applied next frame)",
             st.and_then(|x| x.playing.as_ref().map(|p| p.slot.clone())),
             st.map(|x| x.collision),
             st.map(|x| x.interactive),
