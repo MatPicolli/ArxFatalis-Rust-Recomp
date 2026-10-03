@@ -35,7 +35,9 @@ enum Cmd {
     /// Load every entity script of a level, run INIT/INITEND for all, and report what the interpreter
     /// could not handle (no argument = all levels, one world per level)
     Script { level: Option<u32>, /// how many unknown commands / warnings to list
-        #[arg(short, long, default_value_t = 25)] top: usize },
+        #[arg(short, long, default_value_t = 25)] top: usize,
+        /// with a level: list what the scripts did to each entity (hidden, destroyed, mesh, scale)
+        #[arg(short, long)] details: bool },
     /// Simulate the player in a level: drop from the start, then walk in 8 directions and report how
     /// far each walk got before hitting a wall (a headless check of the collision system)
     Walk { level: u32 },
@@ -234,12 +236,8 @@ fn main() -> Result<()> {
             let (floor_lo, floor_hi) = world_extent_y(&fts);
             println!("fuzz 3 min: {} rescues from falling out of the level; feet y {lo:.0}..{hi:.0} (level geometry spans {floor_lo:.0}..{floor_hi:.0}), on ground {:.0}% of frames, longest airborne run {} frames, final pos ({:.0}, {:.0}, {:.0})", q.rescues, 100.0 * grounded as f32 / frames as f32, worst_fall, q.feet.x, q.feet.y, q.feet.z);
         }
-        Cmd::Script { level, top } => {
+        Cmd::Script { level, top, details } => {
             use arx_script::{Script, ScriptWorld, EntityKind};
-            struct NullHost;
-            impl arx_script::Host for NullHost {
-                fn command(&mut self, _: &str, _: &mut arx_script::Args) -> Option<arx_script::CmdResult> { None }
-            }
             let mut total = arx_script::Stats::default();
             let (mut ents, mut with_script, mut with_over) = (0, 0, 0);
             for l in (0..=30u32).filter(|l| level.is_none_or(|x| x == *l) && pak.contains(&format!("graph/levels/level{l}/level{l}.dlf"))) {
@@ -254,9 +252,26 @@ fn main() -> Result<()> {
                     world.add_entity(EntityKind::from_class(&e.class), &e.class, e.instance, class_script, over);
                 }
                 let t = std::time::Instant::now();
-                let mut host = NullHost;
-                for id in 0..world.entities.len() as u32 { world.send_init(&mut host, id); }
+                let mut host = arx_script::StdHost::new();
+                let n = world.entities.len() as u32;
+                for id in 0..n { world.send_event(&mut host, None, id, "load", vec![]); }
+                for id in 0..n { world.send_init(&mut host, id); }
+                for id in 0..n { world.send_event(&mut host, None, id, "game_ready", vec![]); }
                 world.update(&mut host, 0.0);
+                if level.is_some() && details {
+                    for id in 0..n {
+                        let e = world.entity(id);
+                        if let Some(st) = host.state(id) {
+                            let mut notes = Vec::new();
+                            if st.destroyed { notes.push("DESTROYED".to_string()); }
+                            if st.hidden { notes.push("hidden".to_string()); }
+                            if let Some(m) = &st.mesh { notes.push(format!("mesh={m}")); }
+                            if (st.scale - 1.0).abs() > 1e-6 { notes.push(format!("scale={}", st.scale)); }
+                            if !st.interactive { notes.push("not-interactive".to_string()); }
+                            if !notes.is_empty() { println!("    {:<34} {}", e.id_string, notes.join(" ")); }
+                        }
+                    }
+                }
                 let s = &world.stats;
                 println!("level {l}: {} entities, init+initend: {} events, {} commands, {} runaway, {} warning kinds, {} unknown command kinds [{:.0?}]", world.entities.len(), s.events_run, s.commands_run, s.aborted_runaway, s.warnings.len(), s.unknown_commands.len(), t.elapsed());
                 total.events_run += s.events_run; total.commands_run += s.commands_run; total.aborted_runaway += s.aborted_runaway;

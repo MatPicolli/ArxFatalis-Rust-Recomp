@@ -3,10 +3,10 @@
 //! the nearest static lights.
 
 use crate::animated::{Animated, MeshSrc, no_cull};
-use crate::anims;
+use crate::scripting::{Pickable, ScriptRef, Scripting};
 use crate::convert::{TextureCache, load_texture, to_bevy};
 use crate::level::{Kind, trans_kind};
-use arx_formats::{PakSet, dlf::Dlf, ftl::Ftl, llf::Light, poly, skeleton::Skeleton, tea::Tea};
+use arx_formats::{PakSet, dlf::Dlf, ftl::Ftl, llf::Light, poly, skeleton::Skeleton};
 use bevy::{asset::RenderAssetUsages, mesh::PrimitiveTopology, prelude::*, render::render_resource::Face};
 use std::{collections::HashMap, sync::Arc};
 
@@ -102,7 +102,6 @@ pub struct EntityCache {
     models: HashMap<String, Option<Arc<Ftl>>>,
     materials: HashMap<(String, Kind, bool), Option<Handle<StandardMaterial>>>,
     skeletons: HashMap<String, Arc<Skeleton>>,
-    anims: HashMap<String, Option<Arc<Tea>>>,
 }
 
 #[derive(Default, Debug)]
@@ -130,6 +129,8 @@ pub fn spawn_entities(
     scene_pos: Vec3,
     lights: &[StaticLight],
     include_npcs: bool,
+    scripting: &mut Scripting,
+    pickables: &mut Vec<Pickable>,
     ecache: &mut EntityCache,
     tcache: &mut TextureCache,
     meshes: &mut Assets<Mesh>,
@@ -137,12 +138,16 @@ pub fn spawn_entities(
     images: &mut Assets<Image>,
 ) -> EntityStats {
     let mut stats = EntityStats::default();
-    for e in &dlf.entities {
-        if is_hidden(&e.class) || (!include_npcs && e.class.contains("/npc/")) {
+    for (index, e) in dlf.entities.iter().enumerate() {
+        let script_id = scripting.ids[index];
+        // What the entity's scripts did to it during start-up.
+        let st = scripting.host.state(script_id).cloned().unwrap_or_default();
+        if is_hidden(&e.class) || st.destroyed || (!include_npcs && e.class.contains("/npc/")) {
             stats.hidden += 1;
             continue;
         }
-        let model_path = format!("game/{}.ftl", e.class);
+        let model_class = st.mesh.as_deref().unwrap_or(&e.class);
+        let model_path = format!("game/{model_class}.ftl");
         let model = ecache
             .models
             .entry(model_path.clone())
@@ -156,6 +161,7 @@ pub fn spawn_entities(
             continue;
         };
 
+        let scale = st.scale;
         let world_arx = [e.pos[0] + scene_pos.x, e.pos[1] + scene_pos.y, e.pos[2] + scene_pos.z];
         let translation = Vec3::from(to_bevy(world_arx));
         let rotation = entity_rotation(e.angle);
@@ -186,7 +192,7 @@ pub fn spawn_entities(
                 let v = &ftl.vertices[f.vid[k] as usize];
                 let stored = Vec3::from(to_bevy(v.norm));
                 let n_local = if stored.length_squared() > 0.25 { stored.normalize() } else { flat };
-                let world_pos = translation + rotation * local[k];
+                let world_pos = translation + rotation * (local[k] * scale);
                 let lit = light_vertex(&near, ambient, world_pos, rotation * n_local);
                 b.src.push(f.vid[k] as u32);
                 b.positions.push(local[k].to_array());
@@ -200,14 +206,15 @@ pub fn spawn_entities(
             }
         }
 
-        // NPCs idle with the animation their script registers as WAIT.
-        let anim = (e.class.contains("/npc/"))
-            .then(|| anims::script_anim(pak, &e.class, e.instance, "wait"))
-            .flatten()
-            .and_then(|path| {
-                ecache.anims.entry(path.clone()).or_insert_with(|| anims::load_anim(pak, &path)).clone()
-            });
-        let skeleton = anim.as_ref().and_then(|a| {
+        // The animation to start with: whatever the scripts are playing, else NPCs idle (WAIT).
+        let is_npc = e.class.contains("/npc/");
+        let playing_path = st.playing.as_ref().and_then(|p| st.anims.get(&p.slot)).cloned();
+        let anim_path = playing_path.or_else(|| is_npc.then(|| st.anims.get("wait").cloned()).flatten());
+        let looping = st.playing.as_ref().is_none_or(|p| p.looping);
+        let anim = anim_path.and_then(|p| scripting.anim(pak, &p));
+        // Entities with any loaded animation get a skeleton so later `playanim` can move them.
+        let probe = anim.clone().or_else(|| st.anims.values().next().and_then(|p| scripting.anim(pak, p)));
+        let skeleton = probe.and_then(|a| {
             let sk = ecache.skeletons.entry(model_path.clone()).or_insert_with(|| Arc::new(Skeleton::from_ftl(&ftl)));
             (sk.bones.len() == a.group_count).then(|| sk.clone())
         });
@@ -252,7 +259,12 @@ pub fn spawn_entities(
             }
             parent_children.push((Mesh3d(handle), MeshMaterial3d(mat)));
         }
-        let mut parent = commands.spawn((Transform { translation, rotation, scale: Vec3::ONE }, Visibility::default()));
+        let visibility = if st.hidden { Visibility::Hidden } else { Visibility::Inherited };
+        let mut parent = commands.spawn((
+            Transform { translation, rotation, scale: Vec3::splat(scale) },
+            visibility,
+            ScriptRef(script_id),
+        ));
         parent.with_children(|p| {
             for bundle in parent_children {
                 if animated {
@@ -262,12 +274,25 @@ pub fn spawn_entities(
                 }
             }
         });
-        if let (Some(skeleton), Some(anim)) = (skeleton, anim) {
+        if let Some(skeleton) = skeleton {
             // Desynchronise identical NPCs.
-            let offset = (e.instance as i64).wrapping_mul(7_919_000).rem_euclid(anim.duration_us);
-            parent.insert(Animated { skeleton, anim: Some(anim), meshes: mesh_srcs, elapsed_us: offset });
+            let offset = anim.as_ref().map_or(0, |a| (e.instance as i64).wrapping_mul(7_919_000).rem_euclid(a.duration_us));
+            parent.insert(Animated { skeleton, anim, meshes: mesh_srcs, elapsed_us: offset, looping });
             stats.animated += 1;
         }
+
+        // Bounding sphere for picking.
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for v in &ftl.vertices {
+            let p = Vec3::from(to_bevy(v.pos));
+            lo = lo.min(p);
+            hi = hi.max(p);
+        }
+        pickables.push(Pickable {
+            id: script_id,
+            center: translation + rotation * ((lo + hi) * 0.5 * scale),
+            radius: ((hi - lo).length() * 0.5 * scale).max(20.0),
+        });
         stats.spawned += 1;
     }
     stats

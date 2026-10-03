@@ -18,6 +18,8 @@ pub struct Animated {
     pub anim: Option<Arc<Tea>>,
     pub meshes: Vec<MeshSrc>,
     pub elapsed_us: i64,
+    /// Looping animations wrap; one-shot ones hold their last frame.
+    pub looping: bool,
 }
 
 /// Mark a mesh entity so it is not culled by its (stale) bind-pose bounds.
@@ -30,7 +32,8 @@ pub fn animate(time: Res<Time>, mut query: Query<&mut Animated>, mut meshes: Res
     for mut a in &mut query {
         a.elapsed_us += dt;
         let Some(anim) = a.anim.clone() else { continue };
-        let pose = a.skeleton.pose(&anim, anim.looped_time(a.elapsed_us));
+        let t = if a.looping { anim.looped_time(a.elapsed_us) } else { a.elapsed_us.clamp(0, anim.duration_us) };
+        let pose = a.skeleton.pose(&anim, t);
         let world: Vec<[f32; 3]> = pose.iter().map(|p| to_bevy(p.to_array())).collect();
         for m in &a.meshes {
             let Some(mut mesh) = meshes.get_mut(&m.handle) else { continue };

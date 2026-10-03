@@ -11,8 +11,9 @@ this project is **GPL-3.0-or-later**.
 | crate | purpose |
 |---|---|
 | `arx-formats` | Pure-Rust readers: PAK archives (+ PKWare DCL decompression), `.ftl` models, `.fts` level geometry, `.llf` baked lighting, `.dlf` scene definition (entities, fogs, paths/zones), `.tea` animations and skeletons. No Bevy dependency. |
+| `arx-script` | Interpreter for the `.asl` entity scripting language (events, variables, goto/gosub, timers, event queue) and a host for the visual commands. No Bevy dependency. |
 | `arx-physics` | Level collision (spatial hash over polygons) and the first-person player body. No Bevy dependency. |
-| `arx-cli` (`arx`) | `stats`, `ls`, `extract`, `extract-all`, `verify`, `ftl`, `fts`, `dlf`, `tea`, `walk` |
+| `arx-cli` (`arx`) | `stats`, `ls`, `extract`, `extract-all`, `verify`, `ftl`, `fts`, `dlf`, `tea`, `walk`, `script` |
 | `arx-viewer` | Bevy asset explorer for models and textures, and a free-fly level viewer with placed entities |
 
 ## Usage
@@ -29,12 +30,14 @@ cargo run -p arx-viewer -- level 1                # walk around level 1 (levels 
 cargo run -p arx-viewer -- level 1 --fly          # start in free flight (F toggles)
 cargo run -p arx-viewer -- level 1 --no-npcs     # hide NPCs
 cargo run -p arx-viewer -- models goblin_base --anim goblin_normal_wait   # play an animation; , and . cycle
+cargo run --release -p arx-cli -- script 1 -d  # run every entity script of level 1, list what they did to entities
+cargo run -p arx-viewer -- level 1 --use-entity light_door_0074:open   # headless: send an event, then --shot
 cargo run --release -p arx-cli -- walk 1         # headless collision test: drop, walk 8 ways, 3-minute fuzz
 cargo run -p arx-viewer -- level 1 --start dlf   # start at the level file's editor camera instead
 cargo run -p arx-viewer -- level 1 --cam 8650,-6000,8550 --look 0,-89   # Arx coords, yaw,pitch degrees
 ```
 
-Walking: WASD move, Shift run, Space jump. Click to capture the mouse for look, Esc releases it
+Walking: WASD move, Shift run, Space jump, E use the thing you are looking at (sends it `action`, or `chat` for NPCs). Click to capture the mouse for look, Esc releases it
 (right-drag also looks). F toggles free flight: Q/E down/up, Shift fast, scroll changes speed.
 The HUD prints the eye position in Arx coordinates, ready to paste into `--cam`.
 
@@ -51,5 +54,6 @@ proper rotation, so triangle winding is unchanged.
 2. [x] Level geometry (`fast.fts`) with baked vertex lighting (`.llf`), mipmaps, free-fly camera
 3. [~] Scene definition: entities placed and lit per vertex like the original; fogs, paths and zones are parsed but not used yet. Still missing: dynamic/flickering lights, fog rendering, particles
 4. [~] Animations and player: skeletal animation (CPU skinned; NPCs idle with the animation their script names), walking with gravity, steps, jumping and wall sliding. Still missing: ceilings, crouching/swimming, doors and other interactive fixtures, collision with entities, comparison against the original's exact movement feel
-5. [ ] Scripting (`.asl`), inventory, combat, magic
-6. [ ] Audio (`.wav`), UI, save games
+5. [~] Scripting: the interpreter runs every entity's `load`/`init`/`initend`/`game_ready` at level start (all 23 levels, 117k commands, no runaways) and entities are shaped by it (mesh variants, scale, hidden/destroyed, animations); `E` triggers events and doors/levers animate. Implemented game commands: usemesh, setscale, objecthide, loadanim, playanim (incl. `-e`), collision, setinteractivity, setgroup, setname, destroy. Still missing: sound, speech/dialogue, inventory, NPC behaviour (`behavior`, `settarget`), spells, teleport, entity collision, ~60 other commands
+6. [ ] Inventory, combat, magic
+7. [ ] Audio (`.wav`), UI, save games

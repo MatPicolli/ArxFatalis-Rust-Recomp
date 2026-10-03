@@ -63,7 +63,7 @@ impl PakEntry {
     }
 }
 
-/// Normalise a resource path: lowercase, `/` separators, no leading/trailing separators.
+/// Normalise a resource path: lowercase, `/` separators, no leading, trailing or repeated separators.
 pub fn normalize(path: &str) -> String {
     path.replace('\\', "/").trim_matches('/').to_ascii_lowercase()
 }

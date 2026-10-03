@@ -11,6 +11,7 @@ mod animated;
 mod convert;
 mod entities;
 mod level;
+mod scripting;
 
 use arx_formats::PakSet;
 use bevy::{
@@ -68,6 +69,10 @@ struct Args {
     /// Level mode: start in free-flight mode instead of walking (toggle with F)
     #[arg(long)]
     fly: bool,
+    /// Level mode: send `action` to these entities (comma-separated ids such as `light_door_0007`)
+    /// shortly after start-up, as if the player had used them; for headless testing
+    #[arg(long, value_delimiter = ',')]
+    use_entity: Vec<String>,
     /// Level mode: do not place entities (items, NPCs, fixtures)
     #[arg(long)]
     no_entities: bool,
@@ -80,7 +85,7 @@ struct Args {
 }
 
 #[derive(Resource)]
-struct Arx(PakSet);
+struct Arx(std::sync::Arc<PakSet>);
 
 #[derive(Resource)]
 struct Browse {
@@ -152,7 +157,7 @@ fn main() {
         ..default()
     }))
     .insert_resource(ClearColor(Color::srgb(0.08, 0.08, 0.1)))
-    .insert_resource(Arx(pak))
+    .insert_resource(Arx(std::sync::Arc::new(pak)))
     .insert_resource(Browse { mode: args.mode, index: args.index.min(items.len() - 1), items, dirty: true })
     .insert_resource(Orbit { target: Vec3::ZERO, yaw: if args.mode == Mode::Textures { 0.0 } else { 0.6 }, pitch: if args.mode == Mode::Textures { 0.0 } else { 0.35 }, distance: 300.0 })
     .insert_resource(TextureCache::default())
@@ -253,7 +258,7 @@ fn load_current(
                 bounds = Some(m.bounds);
                 commands.spawn((
                     Shown,
-                    animated::Animated { skeleton, anim, meshes: m.meshes, elapsed_us: 0 },
+                    animated::Animated { skeleton, anim, meshes: m.meshes, elapsed_us: 0, looping: true },
                 ));
             }
             bounds
@@ -361,6 +366,7 @@ struct LevelArgs {
     entities: bool,
     npcs: bool,
     start: StartPos,
+    use_entity: Vec<String>,
 }
 
 #[derive(Resource)]
@@ -384,7 +390,7 @@ fn run_level(args: Args, pak: PakSet) {
         ..default()
     }))
     .insert_resource(ClearColor(Color::BLACK))
-    .insert_resource(Arx(pak))
+    .insert_resource(Arx(std::sync::Arc::new(pak)))
     .insert_resource(TextureCache::default())
     .insert_resource(LevelArgs {
         level,
@@ -394,6 +400,7 @@ fn run_level(args: Args, pak: PakSet) {
         entities: !args.no_entities,
         npcs: !args.no_npcs,
         start: args.start,
+        use_entity: args.use_entity.clone(),
     })
     .insert_resource(entities::EntityCache::default())
     .insert_resource(Fly {
@@ -406,7 +413,21 @@ fn run_level(args: Args, pak: PakSet) {
         world: None,
     })
     .add_systems(Startup, setup_level)
-    .add_systems(Update, (fly_camera, animated::animate, level_hud).chain());
+    .insert_resource(scripting::Scripting::default())
+    .insert_resource(scripting::Pickables::default())
+    .add_systems(
+        Update,
+        (
+            scripting::tick,
+            scripting::apply_state,
+            scripting::auto_use,
+            fly_camera,
+            scripting::interact,
+            animated::animate,
+            level_hud,
+        )
+            .chain(),
+    );
     if let Some(path) = args.shot {
         app.insert_resource(Shot { path, frames: 0 }).add_systems(Update, take_shot);
     }
@@ -420,6 +441,8 @@ fn setup_level(
     mut fly: ResMut<Fly>,
     mut cache: ResMut<TextureCache>,
     mut ecache: ResMut<entities::EntityCache>,
+    mut scripting: ResMut<scripting::Scripting>,
+    mut pickables: ResMut<scripting::Pickables>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
@@ -476,8 +499,16 @@ fn setup_level(
                     let lights = arx.0.load_llf(args.level).map(|l| l.lights).unwrap_or_default();
                     let lights = entities::StaticLight::from_level(&lights, info.scene_pos);
                     let t = std::time::Instant::now();
+                    *scripting = scripting::Scripting::build(&arx.0, &d, info.scene_pos);
+                    let ws = &scripting.world.stats;
+                    eprintln!(
+                        "scripts: {} events, {} commands, {} warnings, {} unimplemented command kinds, run in {:.1?}",
+                        ws.events_run, ws.commands_run, ws.warnings.len(), ws.unknown_commands.len(), t.elapsed()
+                    );
+                    let t = std::time::Instant::now();
                     let stats = entities::spawn_entities(
                         &mut commands, &arx.0, &d, info.scene_pos, &lights, args.npcs,
+                        &mut scripting, &mut pickables.0,
                         &mut ecache, &mut cache, &mut meshes, &mut materials, &mut images,
                     );
                     eprintln!("entities: {stats:?} with {} static lights, built in {:.1?}", lights.len(), t.elapsed());
@@ -509,7 +540,13 @@ fn fly_camera(
     mut fly: ResMut<Fly>,
     mut cursor: Single<&mut CursorOptions, With<Window>>,
     mut cam: Single<&mut Transform, With<Camera3d>>,
+    shot: Option<Res<Shot>>,
 ) {
+    // Screenshot runs are scripted: ignore the real keyboard and mouse so they are reproducible.
+    let live = shot.is_none();
+    let keys: &ButtonInput<KeyCode> = if live { &keys } else { &ButtonInput::default() };
+    let mouse: &ButtonInput<MouseButton> = if live { &mouse } else { &ButtonInput::default() };
+    let motion = if live { motion.delta } else { Vec2::ZERO };
     // Click to capture the mouse for look; Escape releases it. Right-drag also looks around.
     if mouse.just_pressed(MouseButton::Left) {
         cursor.grab_mode = CursorGrabMode::Locked;
@@ -521,8 +558,8 @@ fn fly_camera(
     }
     let captured = cursor.grab_mode != CursorGrabMode::None;
     if captured || mouse.pressed(MouseButton::Right) {
-        fly.yaw -= motion.delta.x * 0.003;
-        fly.pitch = (fly.pitch - motion.delta.y * 0.003).clamp(-1.55, 1.55);
+        fly.yaw -= motion.x * 0.003;
+        fly.pitch = (fly.pitch - motion.y * 0.003).clamp(-1.55, 1.55);
     }
 
     if keys.just_pressed(KeyCode::KeyF) {
@@ -547,7 +584,7 @@ fn fly_camera(
         fly.player.step(&world, dt, wish.normalize_or_zero() * speed, keys.pressed(KeyCode::Space));
         fly.pos = fly.player.eye();
     } else {
-        if scroll.delta.y != 0.0 {
+        if live && scroll.delta.y != 0.0 {
             fly.speed = (fly.speed * (1.0 + scroll.delta.y * 0.15)).clamp(20.0, 20000.0);
         }
         let mut dir = Vec3::ZERO;
@@ -570,17 +607,28 @@ fn fly_camera(
     cam.rotation = rot;
 }
 
-fn level_hud(fly: Res<Fly>, args: Res<LevelArgs>, mut hud: Single<&mut Text, With<Hud>>) {
+fn level_hud(
+    fly: Res<Fly>,
+    args: Res<LevelArgs>,
+    script: Res<scripting::Scripting>,
+    mut hud: Single<&mut Text, With<Hud>>,
+) {
     // Report the position in Arx coordinates so it can be fed back through --cam.
     let mode = if fly.walk { "walking" } else { "flying" };
     let help = if fly.walk {
-        "WASD move  Shift run  Space jump  click: capture mouse  Esc: release  F: fly"
+        "WASD move  Shift run  Space jump  E use  click: capture mouse  Esc: release  F: fly"
     } else {
         "WASD move  Q/E down/up  Shift fast  scroll speed  click: capture mouse  Esc: release  F: walk"
     };
+    let target = script.target.map_or(String::new(), |t| {
+        let e = script.world.entity(t);
+        let name = script.host.state(t).map(|s| s.name.as_str()).filter(|n| !n.is_empty());
+        format!("
+[E] {}{}", e.id_string, name.map_or(String::new(), |n| format!("  ({n})")))
+    });
     hud.0 = format!(
         "level {} ({mode})   eye {:.0},{:.0},{:.0}   yaw {:.0} pitch {:.0}   rescues {}
-{help}",
+{help}{target}",
         args.level,
         fly.pos.x,
         -fly.pos.y,

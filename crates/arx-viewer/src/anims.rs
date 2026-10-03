@@ -1,5 +1,4 @@
-//! Finding animations for a model: folder conventions, bone-count compatibility, and a minimal
-//! look into entity scripts for the animation they register under a given slot name.
+//! Finding animations for a model: folder conventions and bone-count compatibility.
 
 use arx_formats::{PakSet, tea::Tea};
 use std::sync::Arc;
@@ -30,30 +29,4 @@ pub fn compatible_anims(pak: &PakSet, model: &str, bones: usize) -> Vec<String> 
         .filter(|p| group_count(pak, p) == Some(bones))
         .map(str::to_owned)
         .collect()
-}
-
-/// First animation registered for `slot` (e.g. `"wait"`) by a `LOADANIM <slot> "<name>"` line,
-/// looking in the instance's own script first and then in the class script.
-pub fn script_anim(pak: &PakSet, class: &str, instance: i32, slot: &str) -> Option<String> {
-    let (dir, name) = class.rsplit_once('/')?;
-    let candidates = [format!("{dir}/{name}_{instance:04}/{name}.asl"), format!("{class}.asl")];
-    for path in candidates {
-        let Ok(bytes) = pak.read(&path) else { continue };
-        // Scripts are Latin-1 text.
-        let text: String = bytes.iter().map(|&b| b as char).collect();
-        for line in text.lines() {
-            let line = line.split("//").next().unwrap_or("");
-            let mut words = line.split_whitespace();
-            if words.next().is_some_and(|w| w.eq_ignore_ascii_case("loadanim"))
-                && words.next().is_some_and(|w| w.eq_ignore_ascii_case(slot))
-                && let Some(file) = words.next()
-            {
-                let file = file.trim_matches('"').to_ascii_lowercase();
-                if file != "none" {
-                    return Some(format!("{}/{file}.tea", anim_dir(class)));
-                }
-            }
-        }
-    }
-    None
 }

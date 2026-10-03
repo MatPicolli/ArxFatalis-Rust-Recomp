@@ -14,3 +14,4 @@ bevy.workspace = true
 image.workspace = true
 clap.workspace = true
 arx-physics = { path = "../arx-physics" }
+arx-script = { path = "../arx-script" }
