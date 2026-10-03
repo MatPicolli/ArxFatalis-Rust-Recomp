@@ -1,0 +1,16 @@
+[package]
+name = "arx-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "arx"
+path = "src/main.rs"
+
+[dependencies]
+arx-formats = { path = "../arx-formats" }
+glam.workspace = true
+arx-physics = { path = "../arx-physics" }
+anyhow.workspace = true
+clap.workspace = true

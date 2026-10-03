@@ -1,0 +1,9 @@
+[package]
+name = "arx-physics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arx-formats = { path = "../arx-formats" }
+glam.workspace = true

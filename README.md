@@ -1,0 +1,55 @@
+# Arx Fatalis recomp (Rust + Bevy)
+
+A Rust reimplementation of the 2002 RPG *Arx Fatalis* on the Bevy engine. It loads the **original game
+assets** from your own installation; no game data is included.
+
+Format and behaviour knowledge comes from [ArxLibertatis](https://github.com/arx/ArxLibertatis) (GPLv3), so
+this project is **GPL-3.0-or-later**.
+
+## Crates
+
+| crate | purpose |
+|---|---|
+| `arx-formats` | Pure-Rust readers: PAK archives (+ PKWare DCL decompression), `.ftl` models, `.fts` level geometry, `.llf` baked lighting, `.dlf` scene definition (entities, fogs, paths/zones), `.tea` animations and skeletons. No Bevy dependency. |
+| `arx-physics` | Level collision (spatial hash over polygons) and the first-person player body. No Bevy dependency. |
+| `arx-cli` (`arx`) | `stats`, `ls`, `extract`, `extract-all`, `verify`, `ftl`, `fts`, `dlf`, `tea`, `walk` |
+| `arx-viewer` | Bevy asset explorer for models and textures, and a free-fly level viewer with placed entities |
+
+## Usage
+
+The game directory defaults to `D:\Steam\steamapps\common\Arx Fatalis`; override with `--game-dir` or `ARX_DIR`.
+
+```bash
+cargo run --release -p arx-cli -- verify          # read & decompress every file in every PAK
+cargo run --release -p arx-cli -- ls graph/levels
+cargo run -p arx-viewer -- models barrel          # browse models whose path contains "barrel"
+cargo run -p arx-viewer -- textures npc_          # browse textures
+cargo run -p arx-viewer -- models bat --shot out.png   # headless screenshot, then exit
+cargo run -p arx-viewer -- level 1                # walk around level 1 (levels 0-8, 10-23)
+cargo run -p arx-viewer -- level 1 --fly          # start in free flight (F toggles)
+cargo run -p arx-viewer -- level 1 --no-npcs     # hide NPCs
+cargo run -p arx-viewer -- models goblin_base --anim goblin_normal_wait   # play an animation; , and . cycle
+cargo run --release -p arx-cli -- walk 1         # headless collision test: drop, walk 8 ways, 3-minute fuzz
+cargo run -p arx-viewer -- level 1 --start dlf   # start at the level file's editor camera instead
+cargo run -p arx-viewer -- level 1 --cam 8650,-6000,8550 --look 0,-89   # Arx coords, yaw,pitch degrees
+```
+
+Walking: WASD move, Shift run, Space jump. Click to capture the mouse for look, Esc releases it
+(right-drag also looks). F toggles free flight: Q/E down/up, Shift fast, scroll changes speed.
+The HUD prints the eye position in Arx coordinates, ready to paste into `--cam`.
+
+Model/texture controls: Left/Right = prev/next, PgUp/PgDn = +-25, Home = first, left-drag = orbit, scroll = zoom.
+
+## Coordinates
+
+Arx is +Y down, +Z forward. Bevy is +Y up, -Z forward. The conversion `(x, y, z) -> (x, -y, -z)` is a
+proper rotation, so triangle winding is unchanged.
+
+## Roadmap
+
+1. [x] PAK reader, `.ftl` models, asset explorer
+2. [x] Level geometry (`fast.fts`) with baked vertex lighting (`.llf`), mipmaps, free-fly camera
+3. [~] Scene definition: entities placed and lit per vertex like the original; fogs, paths and zones are parsed but not used yet. Still missing: dynamic/flickering lights, fog rendering, particles
+4. [~] Animations and player: skeletal animation (CPU skinned; NPCs idle with the animation their script names), walking with gravity, steps, jumping and wall sliding. Still missing: ceilings, crouching/swimming, doors and other interactive fixtures, collision with entities, comparison against the original's exact movement feel
+5. [ ] Scripting (`.asl`), inventory, combat, magic
+6. [ ] Audio (`.wav`), UI, save games
