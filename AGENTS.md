@@ -26,7 +26,7 @@ Format and behaviour knowledge comes from the GPLv3 project **ArxLibertatis**
 
 | crate | role |
 |---|---|
-| `arx-formats` | PAK archives + PKWare DCL decompression, `.ftl` models, `.fts` level geometry, `.llf` baked lighting, `.dlf` scenes, `.tea` animations + skeletons, `.wav` (MS-ADPCM/PCM) |
+| `arx-formats` | PAK archives + PKWare DCL decompression, `.ftl` models, `.fts` level geometry, `.llf` baked lighting, `.dlf` scenes, `.tea` animations + skeletons, `.wav` (MS-ADPCM/PCM), localisation text (`locale`) |
 | `arx-physics` | level collision (spatial hash), switchable entity obstacles (doors), first-person player body |
 | `arx-script` | `.asl` interpreter (events, variables, goto/gosub, timers, event queue) and `StdHost` for visual/sound commands |
 | `arx-level` | glue: runs a level's scripts, builds entity obstacles, `entity_rotation` |
@@ -80,6 +80,7 @@ cargo run --release -p arx-cli -- polys-at 11 8144 7467    # level polygons cove
 cargo run --release -p arx-cli -- orient-panel             # door/portcullis placement vs. level geometry
 cargo run --release -p arx-cli -- orient-wall lever        # wall-mounted objects: back to wall vs. facing into it
 cargo run --release -p arx-cli -- audio                    # decode every game sound
+cargo run --release -p arx-cli -- locale                   # do entity names / speak keys resolve to text and voices?
 ```
 
 Viewer helpers (all work headless; `--shot out.png` saves a screenshot then exits and **ignores real input**):
@@ -90,8 +91,12 @@ cargo run -p arx-viewer -- level 1 --use-entity light_door_0074:open --shot shot
 cargo run -p arx-viewer -- level 1 --cam 8650,2945,8550 --look 0,-89 --fly --shot shots/c.png   # Arx coords, yaw,pitch
 ```
 
+```bash
+cargo run -p arx-viewer -- level 1 --focus goblin_base_0051 --say goblin_base_0051:goblinlord_forbidden --mute --shot shots/d.png   # subtitle test
+```
+
 Environment: `ARX_FULLBRIGHT=1` ignores baked lighting (dark levels hide misalignment), `ARX_SHOT_FRAME=n`
-sets the screenshot frame (large levels need ~60 frames before everything appears), `ARX_LOG_SOUND=1` logs sounds.
+sets the screenshot frame (large levels need ~60 frames before everything appears), `ARX_LOG_SOUND=1` logs sounds, `ARX_LOG_SPEECH=1` logs dialogue and `herosay` messages.
 
 ## Lessons (do not repeat these)
 
@@ -104,6 +109,10 @@ sets the screenshot frame (large levels need ~60 frames before everything appear
 - Windows path length: extracting many scripts to a deep folder needs the `\\?\` prefix when read from Python.
 - `arx` panics with "failed printing to stdout" when its output is piped into `head` and the pipe closes early; this is
   harmless (it uses `println!`), not a bug in whatever you were checking.
+- Text: `localisation/utext_<language>.ini` is UTF-16. Keys are case- and bracket-insensitive (`[description_door]`);
+  `String`, `String2`, ... are variants and each has its own voice file `speech/<language>/<key>[N].wav` (no number for
+  the first). `speak` options form a single flag word (`-to`, not `-t -o`); the rest of the line runs when the speech
+  ends (`ScriptWorld::run_line`). `setname` stores a key, so show `locale.text_or_key(name)`.
 - Level 9 does not exist. Many levels' saved start is not on a real floor; the viewer starts at the nearest entity
   when the saved start is more than 250 units off its floor.
 
@@ -111,10 +120,11 @@ sets the screenshot frame (large levels need ~60 frames before everything appear
 
 Done: PAK/FTL/FTS/LLF/DLF/TEA/WAV readers, level rendering with baked lighting, placed entities with per-vertex
 lighting, skeletal animation (CPU skinning), walkable player with collision, script interpreter running every
-entity's start-up (all 23 levels), doors/levers/portcullises (animation, collision, sound), spatial sound.
+entity's start-up (all 23 levels), doors/levers/portcullises (animation, collision, sound), spatial sound,
+localised names, voiced dialogue with subtitles (`speak`, `playspeech`) and `herosay` notifications.
 
-Missing: dialogue (`speak`/`herosay`), NPC behaviour (`behavior`, `settarget`), pickup/inventory, combat, spells,
-HUD, footsteps/music/ambiance zones, fog and dynamic/flickering lights, menus and save games. About 60 script
+Missing: cinematic cameras for `speak -c`, NPC behaviour (`behavior`, `settarget`), pickup/inventory, combat, spells,
+player HUD (health/mana/inventory), footsteps/music/ambiance zones, fog and dynamic/flickering lights, menus and save games. About 60 script
 commands are skipped (the interpreter ignores a command it does not know, line by line, and counts it in
 `Stats::unknown_commands`; `arx script` prints the most frequent ones). A few levels (3, 10, 19, 20) have genuine
 drops where the player falls out of the world and is put back on their last solid ground.

@@ -12,7 +12,7 @@ mod text;
 mod vars;
 mod world;
 
-pub use host::{AnimDuration, EntityState, PlayAnim, SoundRequest, StdHost};
+pub use host::{AnimDuration, EntityState, Mood, PlayAnim, SoundRequest, SpeechEvent, SpeechFlags, SpeechRequest, StdHost};
 pub use interp::{Args, CmdResult, Context, Host, ScriptResult, has_flag};
 pub use text::Script;
 pub use vars::{Value, Vars};

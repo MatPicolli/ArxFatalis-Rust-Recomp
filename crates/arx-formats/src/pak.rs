@@ -239,6 +239,13 @@ impl PakSet {
         crate::dlf::Dlf::parse(&bytes).map_err(|e| format!("{path}: {e}"))
     }
 
+    /// Localised text for a language (`english`, `francais`, ...), or `None` if the game has no text file
+    /// for it.
+    pub fn load_locale(&self, language: &str) -> Option<crate::locale::Locale> {
+        let bytes = self.read(&format!("localisation/utext_{language}.ini")).ok()?;
+        Some(crate::locale::Locale::parse(&bytes))
+    }
+
     pub fn len(&self) -> usize {
         self.files.len()
     }

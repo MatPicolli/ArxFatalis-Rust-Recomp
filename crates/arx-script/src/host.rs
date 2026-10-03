@@ -3,8 +3,9 @@
 //! by the interpreter (the rest of their line is ignored), so gameplay-only commands cost nothing.
 
 use crate::interp::{Args, CmdResult, Host, has_flag};
+use crate::text::Script;
 use crate::world::{EntityId, EntityKind, Timer};
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub struct PlayAnim {
@@ -67,6 +68,51 @@ pub struct SoundRequest {
     pub positional: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Mood {
+    #[default]
+    Neutral,
+    Happy,
+    Angry,
+}
+
+/// How a spoken line is delivered (`speak` flags).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpeechFlags {
+    /// `-t`: audio only, no text.
+    pub no_text: bool,
+    /// `-u`: cannot be cut short.
+    pub unbreakable: bool,
+    /// `-o`: heard everywhere, not from the speaker's position.
+    pub off_voice: bool,
+    pub mood: Mood,
+}
+
+/// Something spoken, for the application to voice and show.
+#[derive(Debug, Clone)]
+pub struct SpeechRequest {
+    /// Who speaks (the player with `speak -p`).
+    pub speaker: EntityId,
+    /// The entity whose script asked for the speech.
+    pub script_entity: EntityId,
+    /// Localisation key: text from the locale file, sound `speech/<language>/<key>[N].wav`.
+    pub key: String,
+    pub flags: SpeechFlags,
+    /// A command to run when the speech ends (the rest of the `speak` line): script and position.
+    pub on_end: Option<(Arc<Script>, usize)>,
+}
+
+#[derive(Debug, Clone)]
+pub enum SpeechEvent {
+    Say(SpeechRequest),
+    /// `speak ""`: silence this entity.
+    Clear(EntityId),
+    /// `speak killall`
+    KillAll,
+    /// `playspeech name`: play a speech sample with no text.
+    PlaySample { entity: EntityId, name: String },
+}
+
 /// Returns the length in milliseconds of the animation file at a virtual path.
 pub type AnimDuration = Box<dyn Fn(&str) -> Option<f64> + Send + Sync>;
 
@@ -75,6 +121,8 @@ pub struct StdHost {
     states: Vec<EntityState>,
     anim_duration: Option<AnimDuration>,
     sounds: Vec<SoundRequest>,
+    speech: Vec<SpeechEvent>,
+    messages: Vec<String>,
 }
 
 impl StdHost {
@@ -86,6 +134,21 @@ impl StdHost {
     /// the animation ends).
     pub fn set_anim_duration(&mut self, f: AnimDuration) {
         self.anim_duration = Some(f);
+    }
+
+    /// Speech requests made since the last call.
+    pub fn take_speech(&mut self) -> Vec<SpeechEvent> {
+        std::mem::take(&mut self.speech)
+    }
+
+    /// Queue a speech event as if a script had asked for it (test aid).
+    pub fn push_speech(&mut self, ev: SpeechEvent) {
+        self.speech.push(ev);
+    }
+
+    /// `herosay` messages (localisation keys or literal text) since the last call.
+    pub fn take_messages(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.messages)
     }
 
     /// Sound requests made since the last call.
@@ -254,6 +317,59 @@ impl Host for StdHost {
                 });
                 CmdResult::Success
             }
+            "herosay" => {
+                let flags = a.get_flags();
+                if has_flag(&flags, 'd') {
+                    a.skip_word(); // debug text, never shown
+                    return Some(CmdResult::Success);
+                }
+                let w = a.get_word();
+                let text = a.string_var(&w);
+                if !text.is_empty() {
+                    self.messages.push(text);
+                }
+                CmdResult::Success
+            }
+            "playspeech" => {
+                let w = a.get_word();
+                let name = a.string_var(&w).to_ascii_lowercase().replace('\\', "/");
+                self.speech.push(SpeechEvent::PlaySample { entity: me, name });
+                CmdResult::Success
+            }
+            "speak" => {
+                let flags = a.get_flags();
+                let mut f = SpeechFlags {
+                    no_text: has_flag(&flags, 't'),
+                    unbreakable: has_flag(&flags, 'u'),
+                    off_voice: has_flag(&flags, 'o'),
+                    mood: if has_flag(&flags, 'h') {
+                        Mood::Happy
+                    } else if has_flag(&flags, 'a') {
+                        Mood::Angry
+                    } else {
+                        Mood::Neutral
+                    },
+                };
+                let speaker = if has_flag(&flags, 'p') { a.world.player.unwrap_or(me) } else { me };
+                if has_flag(&flags, 'c') {
+                    skip_cinematic_arguments(a);
+                    f.no_text = false;
+                }
+                let word = a.get_word();
+                if word == "killall" {
+                    self.speech.push(SpeechEvent::KillAll);
+                    return Some(CmdResult::Success);
+                }
+                let key = speech_key(&a.string_var(&word));
+                if key.is_empty() {
+                    self.speech.push(SpeechEvent::Clear(me));
+                    return Some(CmdResult::Success);
+                }
+                // Whatever else is on the line runs once the speech has ended.
+                let on_end = a.skip_command().map(|pos| (a.ctx.script.clone(), pos));
+                self.speech.push(SpeechEvent::Say(SpeechRequest { speaker, script_entity: me, key, flags: f, on_end }));
+                CmdResult::Success
+            }
             "destroy" => {
                 let w = a.get_word();
                 let target = a.string_var(&w);
@@ -267,6 +383,25 @@ impl Host for StdHost {
             }
             _ => return None,
         })
+    }
+}
+
+/// `[key]` -> `key`, lowercased.
+fn speech_key(text: &str) -> String {
+    let t = text.trim();
+    t.strip_prefix('[').and_then(|r| r.strip_suffix(']')).unwrap_or(t).to_ascii_lowercase()
+}
+
+/// `speak -c <kind> ...`: cinematic camera arguments. Cameras are not implemented, but the words must be
+/// consumed so the rest of the line parses.
+fn skip_cinematic_arguments(a: &mut Args) {
+    let words = match a.get_word().as_str() {
+        "zoom" | "side" | "side_l" | "side_r" => 6,
+        "ccctalker_l" | "ccctalker_r" | "ccclistener_l" | "ccclistener_r" => 3,
+        _ => 0, // "keep" and anything unknown
+    };
+    for _ in 0..words {
+        a.skip_word();
     }
 }
 
@@ -364,6 +499,37 @@ on action {
         assert!(s[2].stop);
         assert!(!s[3].positional && s[3].name == "click");
         assert!(h.take_sounds().is_empty());
+    }
+
+    #[test]
+    fn speak_and_herosay_queue_speech_and_messages() {
+        let (mut w, mut h, id) = setup(
+            "x/npc/guard/guard",
+            EntityKind::Npc,
+            "on chat {\n speak [Goblin_Hail] herosay done\n speak -p player_wow\n speak -to whisper\n herosay [description_door]\n herosay -d debug\n speak killall\n speak \"\"\n accept\n}",
+        );
+        let player = w.add_entity(EntityKind::Player, "x/npc/player/player", 1, None, None);
+        w.player = Some(player);
+        w.send_event(&mut h, None, id, "chat", vec![]);
+        let ev = h.take_speech();
+        assert_eq!(ev.len(), 5, "{ev:?}");
+        let SpeechEvent::Say(first) = &ev[0] else { panic!("{:?}", ev[0]) };
+        assert_eq!(first.key, "goblin_hail");
+        assert_eq!(first.speaker, id);
+        let (script, pos) = first.on_end.as_ref().expect("the rest of the line runs when the speech ends");
+        assert!(String::from_utf8_lossy(&script.data[*pos..]).trim_start().starts_with("herosay"));
+        let SpeechEvent::Say(second) = &ev[1] else { panic!() };
+        assert_eq!(second.speaker, player, "-p makes the player speak");
+        assert!(second.on_end.is_none());
+        let SpeechEvent::Say(third) = &ev[2] else { panic!() };
+        assert!(third.flags.no_text && third.flags.off_voice);
+        assert!(matches!(ev[3], SpeechEvent::KillAll));
+        assert!(matches!(ev[4], SpeechEvent::Clear(e) if e == id));
+        assert_eq!(h.take_messages(), ["[description_door]"], "the debug herosay is dropped");
+        // When the speech ends the application runs the rest of the line.
+        let (script, pos) = first.on_end.clone().unwrap();
+        w.run_line(&mut h, id, &script, pos);
+        assert_eq!(h.take_messages(), ["done"]);
     }
 
     #[test]

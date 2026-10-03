@@ -32,6 +32,9 @@ enum Cmd {
     Ftl { path: Option<String> },
     /// Parse level geometry (`game/graph/levels/levelN/fast.fts`); no argument = all levels
     Fts { level: Option<u32> },
+    /// Load a language's text and check that every entity name scripts set (setname) resolves; with a key,
+    /// print its variants
+    Locale { #[arg(default_value = "english")] language: String, key: Option<String> },
     /// Entity orientation check: sample points along each door/portcullis should be in free space with an end touching a wall; compares the engine's rotation with raw-yaw alternatives
     OrientPanel { #[arg(default_value = "light_door")] class_filter: String },
     /// Orientation check for wall-mounted objects: counts entities whose back is against a wall versus facing into one
@@ -320,6 +323,75 @@ fn main() -> Result<()> {
             }
             println!("{n} '{class_filter}' entities. For each hypothesis: sits cleanly in an opening / panel crosses a wall (bad) / floating clear of walls (bad)");
             for ((name, _), s) in hyps.iter().zip(&score) { println!("  {name:<22} {:>4} / {:>4} / {:>4}", s.0, s.1, s.2); }
+        }
+        Cmd::Locale { language, key } => {
+            let loc = pak.load_locale(&language).with_context(|| format!("no localisation/utext_{language}.ini"))?;
+            if let Some(key) = key {
+                println!("{} variants for {key:?}:", loc.count(&key));
+                for (i, v) in loc.variants(&key).iter().enumerate() { println!("  {}: {v}", i + 1); }
+                return Ok(());
+            }
+            println!("{language}: {} keys", loc.len());
+            let (mut named, mut missing) = (0, std::collections::BTreeMap::<String, usize>::new());
+            for l in (0..=30u32).filter(|l| pak.contains(&format!("graph/levels/level{l}/level{l}.dlf"))) {
+                let Ok(dlf) = pak.load_dlf(l) else { continue };
+                let Ok(fts) = arx_formats::fts::Fts::parse(&pak.read(&format!("game/graph/levels/level{l}/fast.fts"))?) else { continue };
+                let s = arx_level::Scripts::build(&pak, &dlf, glam::Vec3::from(fts.scene_pos));
+                for &id in &s.ids {
+                    let Some(st) = s.host.state(id) else { continue };
+                    if st.name.is_empty() { continue; }
+                    named += 1;
+                    if loc.get(&st.name).is_none() { *missing.entry(st.name.clone()).or_default() += 1; }
+                }
+            }
+            println!("{named} entity names set by scripts; {} distinct names have no text:", missing.len());
+            for (k, n) in missing.iter().take(20) { println!("  {k} (x{n})"); }
+
+            // Every literal key given to `speak` / `herosay` by any script: does it have text and a voice?
+            let (mut uses, mut no_text, mut no_voice) = (0usize, std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+            let mut keys = std::collections::BTreeSet::new();
+            for (path, _) in pak.iter().filter(|(p, _)| p.ends_with(".asl")) {
+                let Ok(bytes) = pak.read(path) else { continue };
+                let text: String = bytes.iter().map(|&b| (b as char).to_ascii_lowercase()).collect();
+                for line in text.lines().filter(|l| !l.trim_start().starts_with("//")) {
+                    let mut words = line.split_whitespace().map(|w| w.trim_matches(|c| c == '(' || c == ')'));
+                    while let Some(w) = words.next() {
+                        let spoken = w == "speak";
+                        if !spoken && w != "herosay" { continue; }
+                        let mut next = words.next();
+                        let mut cinematic = false;
+                        if let Some(f) = next.filter(|f| f.starts_with('-')) {
+                            cinematic = spoken && f.contains('c');
+                            next = words.next();
+                        }
+                        if cinematic {
+                            // `-c <kind> <camera numbers...>` precedes the key.
+                            let skip = match next { Some("zoom" | "side" | "side_l" | "side_r") => 6, Some(k) if k.starts_with("ccc") => 3, _ => 0 };
+                            for _ in 0..skip { words.next(); }
+                            if skip == 0 && next != Some("keep") { continue; }
+                            next = words.next();
+                        }
+                        let Some(key) = next else { break };
+                        let key = key.trim_matches('"');
+                        let plain = key.trim_start_matches('[').trim_end_matches(']');
+                        if plain.is_empty() || plain == "killall" || key.contains(['~', '#', '^', '$', '@', '\u{a7}', '\u{a3}']) || plain.starts_with(|c: char| c.is_ascii_digit()) || key.starts_with('[') != key.ends_with(']') { continue; }
+                        uses += 1;
+                        let k = plain.to_owned();
+                        if loc.count(&k) == 0 { no_text.insert(k.clone()); }
+                        if spoken { keys.insert(k); }
+                    }
+                }
+            }
+            for k in &keys {
+                let n = loc.count(k).max(1);
+                for v in 1..=n {
+                    let file = if v == 1 { format!("speech/{language}/{k}.wav") } else { format!("speech/{language}/{k}{v}.wav") };
+                    if !pak.contains(&file) { no_voice.insert(file); }
+                }
+            }
+            println!("{uses} literal speak/herosay uses, {} distinct speak keys: {} keys without text, {} voice files missing", keys.len(), no_text.len(), no_voice.len());
+            for k in no_text.iter().take(8) { println!("  no text: {k}"); }
+            for k in no_voice.iter().take(8) { println!("  no voice: {k}"); }
         }
         Cmd::Walk { level, no_entities } => {
             use arx_physics::{CollisionWorld, Player, EYE_HEIGHT};

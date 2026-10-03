@@ -261,6 +261,11 @@ impl ScriptWorld {
         }
     }
 
+    /// Run the single command line at `pos` of `script` as `entity` (a speech's "when finished" command).
+    pub fn run_line(&mut self, host: &mut dyn Host, entity: EntityId, script: &Arc<Script>, pos: usize) {
+        run_event(self, host, script, None, entity, "", Vec::new(), pos, true);
+    }
+
     pub fn timer_count(&self) -> usize {
         self.timers.len()
     }

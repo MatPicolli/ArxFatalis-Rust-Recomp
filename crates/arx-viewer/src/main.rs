@@ -13,6 +13,7 @@ mod convert;
 mod entities;
 mod level;
 mod scripting;
+mod speech;
 
 use arx_formats::PakSet;
 use bevy::{
@@ -81,6 +82,16 @@ struct Args {
     /// Level mode: no sound
     #[arg(long)]
     mute: bool,
+    /// Level mode: language of text and voices (`english`, `deutsch`, `francais`, ...)
+    #[arg(long, default_value = "english")]
+    language: String,
+    /// Level mode: after start-up, have this entity (`id:key`, e.g. `goblin_base_0051:goblin_forbidden`) speak
+    /// a localised line, for testing text and voices
+    #[arg(long)]
+    say: Option<String>,
+    /// Level mode: do not show dialogue subtitles
+    #[arg(long)]
+    no_subtitles: bool,
     /// Level mode: do not place entities (items, NPCs, fixtures)
     #[arg(long)]
     no_entities: bool,
@@ -376,6 +387,7 @@ struct LevelArgs {
     start: StartPos,
     use_entity: Vec<String>,
     focus: Option<String>,
+    say: Option<String>,
 }
 
 #[derive(Resource)]
@@ -393,6 +405,10 @@ struct Fly {
 
 fn run_level(args: Args, pak: PakSet) {
     let level = args.filter.as_deref().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let locale = pak.load_locale(&args.language).unwrap_or_else(|| {
+        eprintln!("no localisation for language {:?}; text will show its keys", args.language);
+        Default::default()
+    });
     let mut app = App::new();
     app.add_plugins(
         DefaultPlugins
@@ -416,6 +432,7 @@ fn run_level(args: Args, pak: PakSet) {
         start: args.start,
         use_entity: args.use_entity.clone(),
         focus: args.focus.clone(),
+        say: args.say.clone(),
     })
     .insert_resource(entities::EntityCache::default())
     .insert_resource(Fly {
@@ -432,10 +449,14 @@ fn run_level(args: Args, pak: PakSet) {
     .insert_resource(scripting::Pickables::default())
     .insert_resource(scripting::Obstacles::default())
     .insert_resource(audio::Sounds::new(args.mute))
+    .insert_resource(speech::Speech::new(locale, args.language.clone(), !args.no_subtitles, args.mute))
+    .add_systems(Startup, speech::spawn_ui)
     .add_systems(
         Update,
         (
             scripting::tick,
+            speech::debug_say,
+            speech::update,
             scripting::apply_state,
             scripting::auto_use,
             scripting::sync_obstacles,
@@ -683,6 +704,7 @@ fn level_hud(
     fly: Res<Fly>,
     args: Res<LevelArgs>,
     script: Res<scripting::Scripting>,
+    speech: Res<speech::Speech>,
     mut hud: Single<&mut Text, With<Hud>>,
 ) {
     // Report the position in Arx coordinates so it can be fed back through --cam.
@@ -694,9 +716,9 @@ fn level_hud(
     };
     let target = script.target.map_or(String::new(), |t| {
         let e = script.world.entity(t);
-        let name = script.host.state(t).map(|s| s.name.as_str()).filter(|n| !n.is_empty());
-        format!("
-[E] {}{}", e.id_string, name.map_or(String::new(), |n| format!("  ({n})")))
+        // Names are localisation keys (`[description_door]`).
+        let name = script.host.state(t).map(|s| s.name.as_str()).filter(|n| !n.is_empty()).map(|n| speech.text(n));
+        format!("\n[E] {}", name.unwrap_or_else(|| e.id_string.clone()))
     });
     hud.0 = format!(
         "level {} ({mode})   eye {:.0},{:.0},{:.0}   yaw {:.0} pitch {:.0}   rescues {}
