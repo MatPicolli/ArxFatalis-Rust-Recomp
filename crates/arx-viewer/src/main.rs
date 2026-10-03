@@ -74,6 +74,10 @@ struct Args {
     /// shortly after start-up, as if the player had used them; for headless testing
     #[arg(long, value_delimiter = ',')]
     use_entity: Vec<String>,
+    /// Level mode: start with the camera in front of this entity (e.g. `light_door_0074`), looking at
+    /// it; `id:back` views it from behind, `id:side` from the side
+    #[arg(long)]
+    focus: Option<String>,
     /// Level mode: no sound
     #[arg(long)]
     mute: bool,
@@ -371,6 +375,7 @@ struct LevelArgs {
     npcs: bool,
     start: StartPos,
     use_entity: Vec<String>,
+    focus: Option<String>,
 }
 
 #[derive(Resource)]
@@ -410,6 +415,7 @@ fn run_level(args: Args, pak: PakSet) {
         npcs: !args.no_npcs,
         start: args.start,
         use_entity: args.use_entity.clone(),
+        focus: args.focus.clone(),
     })
     .insert_resource(entities::EntityCache::default())
     .insert_resource(Fly {
@@ -543,6 +549,29 @@ fn setup_level(
             fly.player = arx_physics::Player::new(feet + Vec3::Y * 20.0);
             if args.cam.is_none() {
                 fly.pos = fly.player.eye();
+            }
+            if let (Some(spec), Ok(d)) = (&args.focus, &dlf) {
+                let (name, side) = spec.split_once(':').unwrap_or((spec, "front"));
+                // Entity ids are `<class name>_<nnnn>`.
+                let found = d.entities.iter().find(|e| {
+                    format!("{}_{:04}", e.class.rsplit('/').next().unwrap_or(""), e.instance) == name
+                });
+                match found {
+                    Some(e) => {
+                        let origin = Vec3::from(arx_level::to_yup([e.pos[0] + info.scene_pos.x, e.pos[1] + info.scene_pos.y, e.pos[2] + info.scene_pos.z]));
+                        let rot = arx_level::entity_rotation(e.angle, e.class.contains("/npc/"));
+                        let dir = match side { "back" => Vec3::Z, "side" => Vec3::X, _ => Vec3::NEG_Z };
+                        // Stand 300 units away along the entity's own axis, at about half the eye height.
+                        let at = origin + rot * dir * 300.0 + Vec3::Y * 110.0;
+                        fly.pos = at;
+                        fly.walk = false;
+                        let look = (origin + Vec3::Y * 100.0) - at;
+                        fly.yaw = f32::atan2(-look.x, -look.z);
+                        fly.pitch = (look.y / look.xz().length().max(1.0)).atan();
+                        eprintln!("focus {name}: entity at {origin:?}, angle {:?}, camera {at:?}", e.angle);
+                    }
+                    None => eprintln!("--focus: no entity named {name}"),
+                }
             }
             match dlf {
                 Ok(d) if args.entities => {

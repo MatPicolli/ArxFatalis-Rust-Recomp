@@ -13,12 +13,34 @@ pub fn to_yup(p: [f32; 3]) -> Vec3 {
     Vec3::new(p[0], -p[1], -p[2])
 }
 
-/// Rotation of an entity, from its `(pitch, yaw, roll)` angles in degrees. Arx applies
-/// `Rz(-roll) * Rx(pitch) * Ry(yaw)` in its own axes; after the Arx to y-up flip that is
-/// `Rz(roll) * Rx(pitch) * Ry(-yaw)`.
-pub fn entity_rotation(angle: [f32; 3]) -> Quat {
-    let [pitch, yaw, roll] = angle.map(f32::to_radians);
-    Quat::from_rotation_z(roll) * Quat::from_rotation_x(pitch) * Quat::from_rotation_y(-yaw)
+/// Rotation of an entity in y-up space, from its `(pitch, yaw, roll)` angles in degrees.
+///
+/// The engine does not use the stored yaw directly: before drawing it remaps it to `270 - yaw` for
+/// objects and `180 - yaw` for NPCs (`UpdateInter` / `RenderInter`), then builds a quaternion in Arx
+/// axes, which differ by kind:
+/// - objects: `Rz(-roll) * Rx(pitch) * Ry(yaw')`;
+/// - NPCs: the engine's `QuatFromAngles(pitch, yaw', roll)`, which maps pitch to the Z axis and roll
+///   to the X axis (NPCs normally only have a yaw).
+///
+/// The result is converted from Arx axes to y-up by conjugating with the 180 degree flip about X.
+pub fn entity_rotation(angle: [f32; 3], is_npc: bool) -> Quat {
+    let [pitch, yaw, roll] = angle;
+    if is_npc {
+        let (a, b, c) = ((pitch * 0.5).to_radians(), ((180.0 - yaw) * 0.5).to_radians(), (roll * 0.5).to_radians());
+        let (sin_pitch, cos_pitch) = a.sin_cos();
+        let (sin_yaw, cos_yaw) = b.sin_cos();
+        let (sin_roll, cos_roll) = c.sin_cos();
+        // `QuatFromAngles` in the original source (its local names are historical).
+        let x = sin_roll * cos_yaw * cos_pitch - cos_roll * sin_yaw * sin_pitch;
+        let y = cos_roll * sin_yaw * cos_pitch + sin_roll * cos_yaw * sin_pitch;
+        let z = cos_roll * cos_yaw * sin_pitch - sin_roll * sin_yaw * cos_pitch;
+        let w = cos_roll * cos_yaw * cos_pitch + sin_roll * sin_yaw * sin_pitch;
+        // Arx axes -> y-up: negate the Y and Z components of the rotation axis.
+        return Quat::from_xyzw(x, -y, -z, w).normalize();
+    }
+    let yaw = 270.0 - yaw;
+    // Rz(-roll) * Rx(pitch) * Ry(yaw) in Arx axes becomes Rz(roll) * Rx(pitch) * Ry(-yaw) in y-up.
+    Quat::from_rotation_z(roll.to_radians()) * Quat::from_rotation_x(pitch.to_radians()) * Quat::from_rotation_y(-yaw.to_radians())
 }
 
 /// The script world of a level after its start-up sequence has run.
@@ -108,7 +130,7 @@ impl EntityObstacles {
                 .clone();
             let Some(ftl) = model else { continue };
             let origin = to_yup([e.pos[0] + scene_pos.x, e.pos[1] + scene_pos.y, e.pos[2] + scene_pos.z]);
-            let rot = entity_rotation(e.angle);
+            let rot = entity_rotation(e.angle, false);
             let world_pos = |i: u16| origin + rot * (to_yup(ftl.vertices[i as usize].pos) * st.scale);
             let tris = ftl.faces.iter().map(|f| [world_pos(f.vid[0]), world_pos(f.vid[1]), world_pos(f.vid[2])]);
             if let Some(oid) = collision.add_obstacle(tris) {
@@ -136,12 +158,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rotation_conventions() {
-        // Yaw 90 in Arx turns +Z (Arx forward) towards +X (Arx: x right). In y-up space forward is -Z,
-        // and the rotation about the vertical axis is negated by the flip.
-        let r = entity_rotation([0.0, 90.0, 0.0]);
-        let v = r * Vec3::NEG_Z;
-        assert!((v - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-5, "{v:?}");
+    fn engine_yaw_remapping() {
+        // An object with stored yaw 270 is drawn unrotated; yaw 0 is turned by 270 degrees in Arx axes.
+        let upright = entity_rotation([0.0, 270.0, 0.0], false);
+        assert!(upright.angle_between(Quat::IDENTITY) < 1e-5);
+        // Stored yaw 90 -> engine yaw 180: a half turn about the vertical axis.
+        let half = entity_rotation([0.0, 90.0, 0.0], false) * Vec3::X;
+        assert!((half - Vec3::NEG_X).length() < 1e-5, "{half:?}");
+        // NPCs: stored yaw 180 is drawn unrotated, stored 90 turns them a quarter.
+        assert!(entity_rotation([0.0, 180.0, 0.0], true).angle_between(Quat::IDENTITY) < 1e-5);
+        let quarter = entity_rotation([0.0, 90.0, 0.0], true) * Vec3::X;
+        assert!(quarter.y.abs() < 1e-5 && (quarter.x.abs() < 1e-5), "{quarter:?}");
         assert_eq!(to_yup([1.0, 2.0, 3.0]), Vec3::new(1.0, -2.0, -3.0));
     }
 }

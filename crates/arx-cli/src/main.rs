@@ -32,6 +32,10 @@ enum Cmd {
     Ftl { path: Option<String> },
     /// Parse level geometry (`game/graph/levels/levelN/fast.fts`); no argument = all levels
     Fts { level: Option<u32> },
+    /// Entity orientation check: sample points along each door/portcullis should be in free space with an end touching a wall; compares the engine's rotation with raw-yaw alternatives
+    OrientPanel { #[arg(default_value = "light_door")] class_filter: String },
+    /// Orientation check for wall-mounted objects: counts entities whose back is against a wall versus facing into one
+    OrientWall { #[arg(default_value = "")] class_filter: String },
     /// List every level polygon (any flags) covering the Arx-coordinate point (x, z), to debug collision
     PolysAt { level: u32, x: f32, z: f32 },
     /// Decode every .wav in the archives (sfx, speech) and report failures and totals; with a path,
@@ -173,6 +177,149 @@ fn main() -> Result<()> {
             println!("collision world floor at that point (y-up, searching up to y=-1000): {:?}", cw.floor_height(x, -z, -1000.0));
             println!("{} polygons cover ({x}, {z}); Arx y is down, so the first rows are the highest:", rows.len());
             for (y0, y1, f, ny, tex, name) in rows { println!("  y {y0:>8.1}..{y1:>8.1}  flags {f:#09x}  norm.y {ny:>5.2}  tex {tex} {name}"); }
+        }
+        Cmd::OrientWall { class_filter } => {
+            use glam::{Quat, Vec3};
+            // Moller-Trumbore, returns hit distance along a unit direction.
+            fn ray_tri(o: Vec3, d: Vec3, t: &[Vec3; 3]) -> Option<f32> {
+                let (e1, e2) = (t[1] - t[0], t[2] - t[0]);
+                let p = d.cross(e2);
+                let det = e1.dot(p);
+                if det.abs() < 1e-6 { return None; }
+                let inv = 1.0 / det;
+                let s = o - t[0];
+                let u = s.dot(p) * inv;
+                if !(0.0..=1.0).contains(&u) { return None; }
+                let q = s.cross(e1);
+                let v = d.dot(q) * inv;
+                if v < 0.0 || u + v > 1.0 { return None; }
+                let dist = e2.dot(q) * inv;
+                (dist > 0.0).then_some(dist)
+            }
+            let (mut toward_wall, mut away_from_wall, mut n, mut flipped_check) = (0, 0, 0, 0);
+            // [hypothesis][diagonal?] -> (back against wall, facing into wall)
+            let mut split = [[(0i32, 0i32); 2]; 2];
+            let mut by_class: BTreeMap<String, (i32, i32)> = BTreeMap::new();
+            for l in (0..=30u32).filter(|l| pak.contains(&format!("graph/levels/level{l}/level{l}.dlf"))) {
+                let Ok(dlf) = pak.load_dlf(l) else { continue };
+                let Ok(fts) = arx_formats::fts::Fts::parse(&pak.read(&format!("game/graph/levels/level{l}/fast.fts"))?) else { continue };
+                let sp = Vec3::from(fts.scene_pos);
+                // Level walls only: steep triangles.
+                let mut walls: Vec<[Vec3; 3]> = Vec::new();
+                for p in fts.polys.iter().filter(|p| p.flags & (arx_formats::poly::HIDE | arx_formats::poly::NODRAW | arx_formats::poly::TRANS | arx_formats::poly::WATER) == 0) {
+                    let v: Vec<Vec3> = p.verts[..p.vertex_count()].iter().map(|v| arx_level::to_yup(v.pos)).collect();
+                    let mut push = |a: Vec3, b: Vec3, c: Vec3| { if (b - a).cross(c - a).normalize_or_zero().y.abs() < 0.5 { walls.push([a, b, c]); } };
+                    push(v[0], v[1], v[2]);
+                    if v.len() == 4 { push(v[3], v[2], v[1]); }
+                }
+                for e in dlf.entities.iter().filter(|e| (e.class.contains("/fix_inter/") || e.class.contains("/items/")) && !e.class.contains("door") && !e.class.contains("teleport") && e.class.contains(&class_filter)) {
+                    let Some(m) = pak.read(&format!("game/{}.ftl", e.class)).ok().and_then(|b| arx_formats::ftl::Ftl::parse(&b).ok()) else { continue };
+                    let origin = arx_level::to_yup([e.pos[0] + sp.x, e.pos[1] + sp.y, e.pos[2] + sp.z]);
+                    let rot: Quat = arx_level::entity_rotation(e.angle, e.class.contains("/npc/"));
+                    let alt: Quat = Quat::from_rotation_z(e.angle[2].to_radians()) * Quat::from_rotation_x(e.angle[0].to_radians()) * Quat::from_rotation_y(e.angle[1].to_radians());
+                    let yaw_mod = e.angle[1].rem_euclid(90.0);
+                    let diagonal = (yaw_mod > 6.0 && yaw_mod < 84.0) as usize;
+                    // Where the mesh body lies relative to the origin, horizontally, in world space.
+                    let n_v = m.vertices.len() as f32;
+                    let centroid = m.vertices.iter().map(|v| arx_level::to_yup(v.pos)).sum::<Vec3>() / n_v;
+                    let body = rot * centroid;
+                    let (body_h, mid_y) = (Vec3::new(body.x, 0.0, body.z), origin.y + body.y);
+                    if body_h.length() < 15.0 { continue; }
+                    let dir = body_h.normalize();
+                    let o = Vec3::new(origin.x, mid_y, origin.z);
+                    let hit = |d: Vec3| walls.iter().filter_map(|t| ray_tri(o, d, t)).fold(f32::MAX, f32::min);
+                    let (front, back) = (hit(dir), hit(-dir));
+                    for (hi, r) in [rot, alt].into_iter().enumerate() {
+                        let b = r * centroid;
+                        let bh = Vec3::new(b.x, 0.0, b.z);
+                        if bh.length() < 15.0 { continue; }
+                        let d = bh.normalize();
+                        let oo = Vec3::new(origin.x, origin.y + b.y, origin.z);
+                        let h = |dd: Vec3| walls.iter().filter_map(|t| ray_tri(oo, dd, t)).fold(f32::MAX, f32::min);
+                        let (f2, b2) = (h(d), h(-d));
+                        if b2 < 40.0 && f2 > 100.0 { split[hi][diagonal].0 += 1; } else if f2 < 40.0 && b2 > 100.0 { split[hi][diagonal].1 += 1; }
+                    }
+                    // A wall-mounted object has its back (opposite the body) against the wall.
+                    if back < 40.0 && front > 100.0 { toward_wall += 1; by_class.entry(e.class.rsplit('/').next().unwrap_or("").to_string()).or_default().0 += 1; }
+                    else if front < 40.0 && back > 100.0 { away_from_wall += 1; by_class.entry(e.class.rsplit('/').next().unwrap_or("").to_string()).or_default().1 += 1; }
+                    n += 1;
+                    let _ = &mut flipped_check;
+                }
+            }
+            println!("{n} entities with an off-centre mesh body; wall right behind the origin and open in front: {toward_wall}; wall in front of the body (object faces into the wall): {away_from_wall}");
+            for (hi, name) in ["current Ry(-yaw)", "alternative Ry(+yaw)"].iter().enumerate() {
+                println!("  {name:<22} axis-aligned yaws: back-to-wall {:>3} / into-wall {:>3}   diagonal yaws: back-to-wall {:>3} / into-wall {:>3}", split[hi][0].0, split[hi][0].1, split[hi][1].0, split[hi][1].1);
+            }
+            let mut v: Vec<_> = by_class.into_iter().collect();
+            v.sort_by_key(|(_, (a, b))| -(a + b));
+            for (cls, (back, front)) in v.into_iter().take(25) { println!("  {cls:<28} back-to-wall {back:>3}   facing-into-wall {front:>3}"); }
+        }
+        Cmd::OrientPanel { class_filter } => {
+            use glam::{Quat, Vec3};
+            fn closest(p: Vec3, t: &[Vec3; 3]) -> Vec3 {
+                // Ericson, Real-Time Collision Detection: closest point on triangle.
+                let (a, b, c) = (t[0], t[1], t[2]);
+                let ab = b - a; let ac = c - a; let ap = p - a;
+                let d1 = ab.dot(ap); let d2 = ac.dot(ap);
+                if d1 <= 0.0 && d2 <= 0.0 { return a; }
+                let bp = p - b; let d3 = ab.dot(bp); let d4 = ac.dot(bp);
+                if d3 >= 0.0 && d4 <= d3 { return b; }
+                let vc = d1 * d4 - d3 * d2;
+                if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 { return a + ab * (d1 / (d1 - d3)); }
+                let cp = p - c; let d5 = ab.dot(cp); let d6 = ac.dot(cp);
+                if d6 >= 0.0 && d5 <= d6 { return c; }
+                let vb = d5 * d2 - d1 * d6;
+                if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 { return a + ac * (d2 / (d2 - d6)); }
+                let va = d3 * d6 - d5 * d4;
+                if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 { return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6))); }
+                let denom = 1.0 / (va + vb + vc);
+                a + ab * (vb * denom) + ac * (vc * denom)
+            }
+            let rad = f32::to_radians;
+            type Hyp = Box<dyn Fn([f32; 3]) -> Quat>;
+            let hyps: Vec<(&str, Hyp)> = vec![
+                ("Ry(-yaw)  [current]", Box::new(|a| arx_level::entity_rotation(a, false))),
+                ("Ry(+yaw)", Box::new(move |a| Quat::from_rotation_y(rad(a[1])))),
+                ("Ry(-yaw+90)", Box::new(move |a| Quat::from_rotation_y(-rad(a[1]) + std::f32::consts::FRAC_PI_2))),
+                ("Ry(-yaw+180)", Box::new(move |a| Quat::from_rotation_y(-rad(a[1]) + std::f32::consts::PI))),
+                ("Ry(+yaw+90)", Box::new(move |a| Quat::from_rotation_y(rad(a[1]) + std::f32::consts::FRAC_PI_2))),
+                ("Ry(-yaw-90)", Box::new(move |a| Quat::from_rotation_y(-rad(a[1]) - std::f32::consts::FRAC_PI_2))),
+            ];
+            let mut score = vec![(0usize, 0usize, 0usize); hyps.len()]; // (clean panel & touches wall, panel crosses wall, floating in free space)
+            let mut n = 0;
+            for l in (0..=30u32).filter(|l| pak.contains(&format!("graph/levels/level{l}/level{l}.dlf"))) {
+                let Ok(dlf) = pak.load_dlf(l) else { continue };
+                let Ok(fts) = arx_formats::fts::Fts::parse(&pak.read(&format!("game/graph/levels/level{l}/fast.fts"))?) else { continue };
+                let sp = Vec3::from(fts.scene_pos);
+                let mut walls: Vec<[Vec3; 3]> = Vec::new();
+                for p in fts.polys.iter().filter(|p| p.flags & (arx_formats::poly::HIDE | arx_formats::poly::NODRAW | arx_formats::poly::TRANS | arx_formats::poly::WATER) == 0) {
+                    let v: Vec<Vec3> = p.verts[..p.vertex_count()].iter().map(|v| arx_level::to_yup(v.pos)).collect();
+                    let mut push = |a: Vec3, b: Vec3, c: Vec3| { if (b - a).cross(c - a).normalize_or_zero().y.abs() < 0.6 { walls.push([a, b, c]); } };
+                    push(v[0], v[1], v[2]);
+                    if v.len() == 4 { push(v[3], v[2], v[1]); }
+                }
+                for e in dlf.entities.iter().filter(|e| e.class.contains("/fix_inter/") && e.class.contains(&class_filter)) {
+                    let Some(m) = pak.read(&format!("game/{}.ftl", e.class)).ok().and_then(|b| arx_formats::ftl::Ftl::parse(&b).ok()) else { continue };
+                    let origin = arx_level::to_yup([e.pos[0] + sp.x, e.pos[1] + sp.y, e.pos[2] + sp.z]);
+                    let pts: Vec<Vec3> = m.vertices.iter().map(|v| arx_level::to_yup(v.pos)).collect();
+                    let (lo, hi) = pts.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(*p), b.max(*p)));
+                    let along_x = (hi.x - lo.x) >= (hi.z - lo.z);
+                    let mid = (lo + hi) * 0.5;
+                    let sample = |t: f32| if along_x { Vec3::new(lo.x + (hi.x - lo.x) * t, mid.y, mid.z) } else { Vec3::new(mid.x, mid.y, lo.z + (hi.z - lo.z) * t) };
+                    n += 1;
+                    for (i, (_, rot)) in hyps.iter().enumerate() {
+                        let r = rot(e.angle);
+                        let dist = |local: Vec3| { let w = origin + r * local; walls.iter().map(|t| (closest(w, t) - w).length()).fold(f32::MAX, f32::min) };
+                        let interior: Vec<f32> = (1..=8).map(|k| dist(sample(k as f32 / 9.0))).collect();
+                        let crosses = interior.iter().filter(|d| **d < 6.0).count() >= 2;
+                        let ends = dist(sample(-0.04)).min(dist(sample(1.04)));
+                        if i == 0 && (crosses || ends >= 25.0) { println!("  level {l:<2} {:<22} #{:<4} yaw {:>7.1} {} (min interior distance {:.1}, end distance {:.1})", e.class.rsplit('/').next().unwrap_or(""), e.instance, e.angle[1], if crosses { "CROSSES WALL" } else { "floating" }, interior.iter().cloned().fold(f32::MAX, f32::min), ends); }
+                        if crosses { score[i].1 += 1; } else if ends < 25.0 { score[i].0 += 1; } else { score[i].2 += 1; }
+                    }
+                }
+            }
+            println!("{n} '{class_filter}' entities. For each hypothesis: sits cleanly in an opening / panel crosses a wall (bad) / floating clear of walls (bad)");
+            for ((name, _), s) in hyps.iter().zip(&score) { println!("  {name:<22} {:>4} / {:>4} / {:>4}", s.0, s.1, s.2); }
         }
         Cmd::Walk { level, no_entities } => {
             use arx_physics::{CollisionWorld, Player, EYE_HEIGHT};
@@ -403,6 +550,18 @@ TOTAL: {ents} entities ({with_script} class scripts, {with_over} instance script
             }
         }
         Cmd::Ftl { path: None } => {
+            // How many models are not centred on their origin vertex (the engine shifts these)?
+            let mut off = Vec::new();
+            let mut total = 0;
+            for name in pak.list("").into_iter().filter(|n| n.ends_with(".ftl")) {
+                if let Ok(m) = arx_formats::ftl::Ftl::parse(&pak.read(name)?) {
+                    total += 1;
+                    let o = m.vertices[m.origin as usize].pos;
+                    if o != [0.0; 3] { off.push((name.to_string(), o)); }
+                }
+            }
+            println!("{} of {total} models have a non-zero origin vertex", off.len());
+            for (n, o) in off.iter().take(12) { println!("  {n}: origin vertex at {o:?}"); }
             let (mut ok, mut bad, mut missing_tex) = (0, 0, 0);
             let mut missing = BTreeMap::<String, usize>::new();
             for name in pak.list("").into_iter().filter(|n| n.ends_with(".ftl")) {

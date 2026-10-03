@@ -31,6 +31,9 @@ cargo run -p arx-viewer -- level 1                # walk around level 1 (levels 
 cargo run -p arx-viewer -- level 1 --fly          # start in free flight (F toggles)
 cargo run -p arx-viewer -- level 1 --no-npcs     # hide NPCs
 cargo run -p arx-viewer -- level 1 --mute        # no sound
+cargo run -p arx-viewer -- level 1 --focus light_door_0075   # camera in front of an entity (add :back or :side)
+ARX_FULLBRIGHT=1 cargo run -p arx-viewer -- level 1          # ignore baked lighting, to inspect geometry
+cargo run --release -p arx-cli -- orient-panel   # check door/portcullis placement against the level
 cargo run -p arx-viewer -- models goblin_base --anim goblin_normal_wait   # play an animation; , and . cycle
 cargo run --release -p arx-cli -- script 1 -d  # run every entity script of level 1, list what they did to entities
 cargo run -p arx-viewer -- level 1 --use-entity light_door_0074:open   # headless: send an event, then --shot
@@ -50,7 +53,8 @@ Model/texture controls: Left/Right = prev/next, PgUp/PgDn = +-25, Home = first, 
 ## Coordinates
 
 Arx is +Y down, +Z forward. Bevy is +Y up, -Z forward. The conversion `(x, y, z) -> (x, -y, -z)` is a
-proper rotation, so triangle winding is unchanged.
+proper rotation, so triangle winding is unchanged. Entity yaw is remapped like the original engine does
+(`270 - yaw` for objects, `180 - yaw` for NPCs) before it is turned into a rotation; see `arx-level`.
 
 ## Roadmap
 

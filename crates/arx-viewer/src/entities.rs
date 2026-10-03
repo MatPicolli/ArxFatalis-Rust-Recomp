@@ -132,6 +132,7 @@ pub fn spawn_entities(
     images: &mut Assets<Image>,
 ) -> EntityStats {
     let mut stats = EntityStats::default();
+    let fullbright = std::env::var_os("ARX_FULLBRIGHT").is_some();
     for (index, e) in dlf.entities.iter().enumerate() {
         let script_id = scripting.ids[index];
         // What the entity's scripts did to it during start-up.
@@ -158,7 +159,7 @@ pub fn spawn_entities(
         let scale = st.scale;
         let world_arx = [e.pos[0] + scene_pos.x, e.pos[1] + scene_pos.y, e.pos[2] + scene_pos.z];
         let translation = Vec3::from(to_bevy(world_arx));
-        let rotation = entity_rotation(e.angle);
+        let rotation = entity_rotation(e.angle, e.class.contains("/npc/"));
         let ambient = if e.class.contains("/npc/") || e.class.contains("/items/") {
             NPC_ITEMS_AMBIENT_255
         } else {
@@ -187,7 +188,7 @@ pub fn spawn_entities(
                 let stored = Vec3::from(to_bevy(v.norm));
                 let n_local = if stored.length_squared() > 0.25 { stored.normalize() } else { flat };
                 let world_pos = translation + rotation * (local[k] * scale);
-                let lit = light_vertex(&near, ambient, world_pos, rotation * n_local);
+                let lit = if fullbright { Vec3::splat(255.0) } else { light_vertex(&near, ambient, world_pos, rotation * n_local) };
                 b.src.push(f.vid[k] as u32);
                 b.positions.push(local[k].to_array());
                 b.uvs.push([f.u[k], f.v[k]]);

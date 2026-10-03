@@ -80,6 +80,8 @@ pub fn spawn_level(
         eprintln!("level {level}: no baked lighting, using flat grey");
     }
 
+    // Debug aid: ignore the baked lighting so geometry can be inspected in dark levels.
+    let fullbright = std::env::var_os("ARX_FULLBRIGHT").is_some();
     let lut: Vec<f32> = (0..=255).map(srgb_to_linear).collect();
     let mut chunks: HashMap<(i32, Kind, bool, u16, u16), Builder> = HashMap::new();
     let mut ci = 0usize; // index of the next baked vertex colour; advances for every polygon
@@ -104,7 +106,7 @@ pub fn spawn_level(
 
         let mut col = [[0.7, 0.7, 0.7, alpha]; 4];
         for (k, c) in col.iter_mut().enumerate().take(n) {
-            if p.flags & poly::GLOW != 0 {
+            if p.flags & poly::GLOW != 0 || fullbright {
                 *c = [1.0, 1.0, 1.0, alpha];
             } else if let Some(rgb) = llf.as_ref().and_then(|l| l.colors.get(base + k)) {
                 *c = [lut[rgb[0] as usize], lut[rgb[1] as usize], lut[rgb[2] as usize], alpha];
