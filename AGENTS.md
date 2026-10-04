@@ -150,6 +150,20 @@ sets the screenshot frame (large levels need ~60 frames before everything appear
   left. Item icons are `<class>[icon].bmp` next to the model; an item's slot size is its icon size / 32, rounded up, 1 to 3
   (`StdHost::item_slots`). The player grid (`PlayerState::slots`) is 16x3 per bag filled column by column; gold items
   (`.../gold_coin/gold_coin`) go to `PlayerState::gold`. The HUD is rebuilt as plain UI image nodes every frame.
+- **Animations of fixtures**: a door swings by bone rotation, but a portcullis or trapdoor has a *static* bone and moves by
+  the keyframe's whole-object translation (`KeyFrame::translate`). The original (`Cedric_ConcatenateTM`) adds it to the root
+  bone for everything that is not an NPC; NPCs would double-count it, because their entity moves by it instead.
+  `Skeleton::pose_object` does this. A dropped item that never had a scene object (loot from a chest) is spawned on demand
+  by `entities::spawn_dropped`; `StdHost::take_dropped` is the queue.
+- **Stats**: ported from `Player.cpp` into `PlayerState` (`full_skills`, `misc`, `add_xp`, `xp_for_level`): skills = spent
+  points + attribute formulas (e.g. stealth = 2 x dexterity, mecanism = dexterity + mind), life = constitution x (level + 2),
+  mana = mind x (level + 1), a level is 15 skill + 1 attribute point. Scripts read them as `^player_skill_*`,
+  `^player_attribute_*`, `^player_life` and so on, which the host publishes into `ScriptWorld::sys` every frame. The book
+  (`hud_book.rs` holds all its coordinates, tested; `hud_ui.rs` draws it) uses the game's own font `misc/arx*.ttf` at 18 px
+  x `smallTextScale`; text is wrapped and paged by an estimate of character width, since Bevy cannot measure text up front.
+- **Never commit the original source code** ("Arx Fatalis original source code/" in the repo folder, supplied by the owner
+  for reference): it is in `.gitignore`. It holds the 2002 DANAE engine (`DANAE/ARX_Cedric.cpp` for skinning,
+  `DANAE/ARX_Script.cpp`, `EERIE/`); prefer it, then ArxLibertatis, when a behaviour is unclear.
 - Level 9 does not exist. Many levels' saved start is not on a real floor; the viewer starts at the nearest entity
   when the saved start is more than 250 units off its floor.
 
@@ -165,7 +179,8 @@ unlock doors and chests (`combine`), original-faithful player movement (run/snea
 fixture collision, chests and corpses as containers, readable notices (`note`) and `rotate`.
 
 Missing: the spell book / character sheet / map (the book icon only says so), equipment slots and weapons in the HUD,
-the hit-strength gauge and combat cursors, active-spell and hunger icons, the HUD sliding away in free look,
+the spell and map pages of the book (only the character sheet and quest log exist), the hit-strength gauge and combat
+cursors, active-spell and hunger icons, the HUD sliding away in free look,
 cinematic cameras for `speak -c`, NPC behaviour (`behavior`, `settarget`), combat, spells, equipment and weapons, inventory grid/weight limits,
 `replaceme`, level changes (`teleport -l`, `worldfade`, needs state transfer), ladders, leaning, XP/levels/skills and character creation, footsteps/music/ambiance zones, fog and dynamic/flickering lights, menus and save games. About 60 script
 commands are skipped (the interpreter ignores a command it does not know, line by line, and counts it in
