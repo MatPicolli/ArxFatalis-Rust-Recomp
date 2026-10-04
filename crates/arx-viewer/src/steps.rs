@@ -177,3 +177,24 @@ pub fn footsteps(
         }
     }
 }
+
+/// The noises of blows: weapons on armour and flesh (`snd_armor.ini`, `snd_weapon.ini`).
+pub fn combat_sounds(
+    mut commands: Commands,
+    arx: Res<Arx>,
+    sounds: Res<Sounds>,
+    mut steps: ResMut<StepSounds>,
+    mut assets: ResMut<Assets<AudioSource>>,
+    mut npcs: ResMut<crate::npcs::Npcs>,
+) {
+    let Some(world) = npcs.0.as_mut() else { return };
+    for snd in world.take_sounds() {
+        if sounds.muted {
+            continue;
+        }
+        let played = steps.play(&mut commands, &arx, &mut assets, &snd.hitter, &snd.surface, snd.volume);
+        if std::env::var_os("ARX_LOG_SOUND").is_some() {
+            eprintln!("blow: {} on {}: {played:?}", snd.hitter, snd.surface);
+        }
+    }
+}

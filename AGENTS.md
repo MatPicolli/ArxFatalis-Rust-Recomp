@@ -29,7 +29,7 @@ Format and behaviour knowledge comes from the GPLv3 project **ArxLibertatis**
 | `arx-formats` | PAK archives + PKWare DCL decompression, `.ftl` models, `.fts` level geometry, `.llf` baked lighting, `.dlf` scenes, `.tea` animations + skeletons, `.wav` (MS-ADPCM/PCM), localisation text (`locale`) |
 | `arx-physics` | level collision (spatial hash), switchable entity obstacles (doors), NPC cylinders, first-person player body ported from the engine (movement, jump, crouch, ceilings, fall damage) |
 | `arx-script` | `.asl` interpreter (events, variables, goto/gosub, timers, event queue) and `StdHost` for visual/sound commands |
-| `arx-level` | glue: runs a level's scripts, builds entity obstacles, `entity_rotation`, `inventory` (pick up / use / combine / drop) |
+| `arx-level` | glue: runs a level's scripts, builds entity obstacles, `entity_rotation`, `inventory` (pick up / use / combine / drop), `anchors` (the path-finding graph), `npc` (character AI + `npc/combat.rs`: damage formula, hits, deaths, characters' blows) and `player_combat` (the hero's draw / wind-up / strike stages) |
 | `arx-cli` (`arx`) | inspection/verification tools (see below) |
 | `arx-viewer` | Bevy app: model/texture browser and the walkable level viewer; `hud.rs` is the interface state and keys, `hud_ui.rs` draws the original HUD |
 
@@ -91,6 +91,7 @@ cargo run --release -p arx-cli -- walk 11                  # headless collision 
 cargo run --release -p arx-cli -- polys-at 11 8144 7467    # level polygons covering an Arx (x, z) point
 cargo run --release -p arx-cli -- orient-panel             # door/portcullis placement vs. level geometry
 cargo run --release -p arx-cli -- orient-wall lever        # wall-mounted objects: back to wall vs. facing into it
+cargo run --release -p arx-cli -- npc 1 40                 # run a level's characters for 40 s; -f <id> prints a character's route
 cargo run --release -p arx-cli -- audio                    # decode every game sound
 cargo run --release -p arx-cli -- locale                   # do entity names / speak keys resolve to text and voices?
 cargo run --release -p arx-cli -- player-speeds            # original movement speeds from the hero animations
@@ -113,7 +114,11 @@ cargo run -p arx-viewer -- level 1 --focus chest_metal_0051 --open-chest chest_m
 cargo run -p arx-viewer -- level 1 --focus goblin_base_0051 --say goblin_base_0051:goblinlord_forbidden --mute --shot shots/d.png   # subtitle test
 ```
 
-Environment: `ARX_FULLBRIGHT=1` ignores baked lighting (dark levels hide misalignment), `ARX_SHOT_FRAME=n`
+```bash
+cargo run -p arx-viewer -- level 1 --cam 9543,2945,5800 --look 180,-5 --equip short_sword_0005 --draw-weapon --attack-test --shot shots/fight.png   # hero's weapon, scripted swings
+```
+
+Environment: `ARX_LOG_NPC=<id text>` logs the commands scripts give those characters and their state once a second, `ARX_LOG_BODY=1` the hero's body/blow windows, `ARX_FULLBRIGHT=1` ignores baked lighting (dark levels hide misalignment), `ARX_SHOT_FRAME=n`
 sets the screenshot frame (large levels need ~60 frames before everything appears), `ARX_LOG_SOUND=1` logs sounds, `ARX_LOG_SPEECH=1` logs dialogue and `herosay` messages.
 
 ## Lessons (do not repeat these)
@@ -164,6 +169,10 @@ sets the screenshot frame (large levels need ~60 frames before everything appear
 - **Never commit the original source code** ("Arx Fatalis original source code/" in the repo folder, supplied by the owner
   for reference): it is in `.gitignore`. It holds the 2002 DANAE engine (`DANAE/ARX_Cedric.cpp` for skinning,
   `DANAE/ARX_Script.cpp`, `EERIE/`); prefer it, then ArxLibertatis, when a behaviour is unclear.
+- **Characters face and walk by the engine's formula, not by what "looks right"**: walking animations move a model along its object-space -Z (root translation of the last keyframe), and the engine rotates that by `VRotateY(180 - yaw)`; so stored NPC yaw 0 walks toward +Z (Arx), 90 toward -X, 180 toward -Z, 270 toward +X (`arx_level::npc::facing` / `yaw_toward`). Rendering with `entity_rotation(.., true)` agrees. An earlier guess (+Z forward in model space) made characters walk backwards.
+- Characters only fall and collide while *moving*: an NPC with behaviour NONE (the default) or playing a script animation (`playanim -l wait`, as hanging corpses do) keeps the height the level gave it; the engine returns before applying gravity.
+- NPC behaviour is entirely script-driven through commands the host queues as `NpcRequest`s (arx-script never decides anything); `NpcWorld::update` applies them in order, then simulates only characters within 5000 units of the player. Scripts react to `reachedtarget`, `lostTarget`, `pathfinder_failure`, `detectplayer`, `hear`, `collide_door` (a door told by a character that bumps it opens for it), `strike`, `hit` (a script that does not ACCEPT cancels the damage), `ouch`, `die`, `target_death`.
+- The hero is the full `human_base` model with the faces touching the "1st" selection left out, placed where the player stands (rotation `yaw + PI` about Y); the legs play `wait/walk/run/...` and the arms a second animation layer on top (`Skeleton::pose_layers`: a bone that a higher layer animates takes nothing from the lower ones). The hero's own animations drive 44 groups against the model's 39: extra groups are ignored. The weapon is attached with the bone rotation of the hand vertex (`primary_attach`) and the weapon's own `primary_attach` vertex; blows test the weapon's `hit_<radius>` vertices against the characters' cylinders.
 - Level 9 does not exist. Many levels' saved start is not on a real floor; the viewer starts at the nearest entity
   when the saved start is more than 250 units off its floor.
 
@@ -178,11 +187,11 @@ cursors), item pickup with stacking, eating/healing, and keys that
 unlock doors and chests (`combine`), original-faithful player movement (run/sneak/crouch/jump, ceilings, fall damage), NPC and
 fixture collision, chests and corpses as containers, readable notices (`note`) and `rotate`.
 
-Missing: the spell book / character sheet / map (the book icon only says so), equipment slots and weapons in the HUD,
-the spell and map pages of the book (only the character sheet and quest log exist), the hit-strength gauge and combat
-cursors, active-spell and hunger icons, the HUD sliding away in free look,
-cinematic cameras for `speak -c`, NPC behaviour (`behavior`, `settarget`), combat, spells, equipment and weapons, inventory grid/weight limits,
-`replaceme`, level changes (`teleport -l`, `worldfade`, needs state transfer), ladders, leaning, XP/levels/skills and character creation, footsteps/music/ambiance zones, fog and dynamic/flickering lights, menus and save games. About 60 script
+Done since: footsteps from the engine's material tables (`SoundMap`), dragging items in the 3D world and throwing them, NPC path-finding / walking / patrolling / perception / melee, equipment (slots, `setequip` modifiers, `equip`), the hero's first-person body and weapon animations, the hit-strength gauge, blows and damage, characters that die and give experience.
+
+Missing: the map and spell pages of the book, combat cursors, active-spell and hunger icons, the HUD sliding away in free look,
+cinematic cameras for `speak -c`, spells, bows and arrows, shields and armour drawn on the hero, NPC weapons drawn in hand, NPC footsteps, `usepath`, inventory weight limits,
+`replaceme`, level changes (`teleport -l`, `worldfade`, needs state transfer), ladders, leaning, music/ambiance zones, fog and dynamic/flickering lights, menus and save games. About 60 script
 commands are skipped (the interpreter ignores a command it does not know, line by line, and counts it in
 `Stats::unknown_commands`; `arx script` prints the most frequent ones). With jumping off, `arx walk N --no-jump` has no
 rescues in 21 of 23 levels; levels 10 and 20 have genuine drops where the player falls out of the world and is put back on

@@ -2,7 +2,7 @@
 //! and `gui/Note.cpp`. Everything is in the original's 640x480 pixels; callers multiply by the interface scale.
 //! Nothing here draws or touches the game: drawing is in [`crate::hud_ui`].
 
-use arx_script::{Attribute, Skill};
+use arx_script::{Attribute, EquipSlot, Skill};
 use bevy::prelude::*;
 
 /// The book occupies this part of the 640x480 screen when it is open.
@@ -12,6 +12,21 @@ pub const BOOK_SIZE: Vec2 = Vec2::new(513.0, 313.0);
 pub enum BookPage {
     Stats,
     Quests,
+}
+
+/// Where an equipped item shows on the character sheet (book-local pixels): the original's rectangles for armour,
+/// leggings, helmet and rings (`StatsPage::manageNewQuest`... `Book.cpp`), and beside the hero for what is held.
+pub fn equipment_area(slot: EquipSlot) -> Rect {
+    let (min, max) = match slot {
+        EquipSlot::Helmet => (Vec2::new(115.0, 20.0), Vec2::new(153.0, 51.0)),
+        EquipSlot::Armor => (Vec2::new(90.0, 52.0), Vec2::new(170.0, 118.0)),
+        EquipSlot::Leggings => (Vec2::new(110.0, 119.0), Vec2::new(170.0, 265.0)),
+        EquipSlot::RingLeft => (Vec2::new(50.0, 246.0), Vec2::new(82.0, 278.0)),
+        EquipSlot::RingRight => (Vec2::new(200.0, 246.0), Vec2::new(232.0, 278.0)),
+        EquipSlot::Weapon => (Vec2::new(174.0, 60.0), Vec2::new(206.0, 214.0)),
+        EquipSlot::Shield => (Vec2::new(92.0, 268.0), Vec2::new(164.0, 311.0)),
+    };
+    Rect::from_corners(min, max)
 }
 
 /// Where the book is on a `w` x `h` window at interface scale `s`: centred, but kept clear of the gauges and the

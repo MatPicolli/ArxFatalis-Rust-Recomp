@@ -4,6 +4,7 @@
 pub mod anchors;
 pub mod inventory;
 pub mod npc;
+pub mod player_combat;
 
 use arx_formats::{PakSet, dlf::Dlf, ftl::Ftl};
 use arx_physics::{CollisionWorld, CylinderId, ObstacleId};

@@ -14,6 +14,7 @@ mod entities;
 mod drag;
 mod hud;
 mod npcs;
+mod player_body;
 mod hud_book;
 mod hud_ui;
 mod level;
@@ -122,6 +123,15 @@ struct Args {
     /// Level mode: start with the inventory panel open
     #[arg(long)]
     show_inventory: bool,
+    /// Level mode: give the player these items and use them (equip them), for headless testing of equipment
+    #[arg(long, value_delimiter = ',')]
+    equip: Vec<String>,
+    /// Level mode: start with the weapon drawn, for headless testing of combat
+    #[arg(long)]
+    draw_weapon: bool,
+    /// Level mode: swing the weapon by itself (wind up, let go, repeat), for headless testing of combat
+    #[arg(long)]
+    attack_test: bool,
     /// Level mode: start with this much gold in the purse, for headless testing
     #[arg(long, default_value_t = 0)]
     gold: u64,
@@ -320,7 +330,7 @@ fn load_current(
                 bounds = Some(m.bounds);
                 commands.spawn((
                     Shown,
-                    animated::Animated { skeleton, anim, meshes: m.meshes, elapsed_us: 0, looping: true, root_motion: false },
+                    animated::Animated { skeleton, anim, meshes: m.meshes, elapsed_us: 0, looping: true, root_motion: false, overlay: None, keep_pose: false, pose: None },
                 ));
             }
             bounds
@@ -441,6 +451,9 @@ struct LevelArgs {
     xp: i64,
     walk_forward: bool,
     throw_test: Option<String>,
+    equip: Vec<String>,
+    draw_weapon: bool,
+    attack_test: bool,
 }
 
 #[derive(Resource)]
@@ -498,6 +511,9 @@ fn run_level(args: Args, pak: PakSet) {
         xp: args.xp,
         walk_forward: args.walk_forward,
         throw_test: args.throw_test.clone(),
+        equip: args.equip.clone(),
+        draw_weapon: args.draw_weapon,
+        attack_test: args.attack_test,
     })
     .insert_resource(entities::EntityCache::default())
     .insert_resource(entities::SpawnedEntities::default())
@@ -517,6 +533,8 @@ fn run_level(args: Args, pak: PakSet) {
     .insert_resource(scripting::Pickables::default())
     .insert_resource(scripting::Obstacles::default())
     .insert_resource(npcs::Npcs::default())
+    .insert_resource(player_body::PlayerBody::default())
+    .insert_resource(player_body::Combat::default())
     .insert_resource(audio::Sounds::new(args.mute))
     .insert_resource(speech::Speech::new(locale, args.language.clone(), !args.no_subtitles, args.mute))
     .add_systems(Startup, (hud_ui::load_font, speech::spawn_ui).chain())
@@ -546,14 +564,18 @@ fn run_level(args: Args, pak: PakSet) {
             fly_camera,
             steps::footsteps,
             steps::ui_sounds,
+            steps::combat_sounds,
             hud::debug_pickup,
+            player_body::debug_equip,
             hud::input,
             scripting::interact,
             hud_ui::mouse,
             drag::debug_throw,
             drag::step_bodies,
+            player_body::drive,
             hud_ui::draw,
             animated::animate,
+            player_body::attach,
             level_hud,
         )
             .chain())
@@ -577,6 +599,7 @@ fn setup_level(
     mut spawned: ResMut<entities::SpawnedEntities>,
     mut obstacles: ResMut<scripting::Obstacles>,
     mut npcs: ResMut<npcs::Npcs>,
+    mut body: ResMut<player_body::PlayerBody>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
@@ -704,6 +727,10 @@ fn setup_level(
                         &mut ecache, &mut cache, &mut meshes, &mut materials, &mut images,
                     );
                     eprintln!("entities: {stats:?} with {} static lights, built in {:.1?}", lights.len(), t.elapsed());
+                    player_body::spawn(
+                        &mut commands, &arx.0, &lights, &mut scripting, &mut pickables.0, &mut ecache, &mut cache,
+                        &mut meshes, &mut materials, &mut images, fly.player.feet, &mut body,
+                    );
                     commands.insert_resource(entities::LevelLights(lights));
                 }
                 Ok(_) => {}

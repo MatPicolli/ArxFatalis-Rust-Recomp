@@ -453,6 +453,21 @@ fn book_click(ui: &mut Ui, s: &mut Scripting, bk: Rect, pos: Vec2, right: bool) 
     if ui.book != Some(BookPage::Stats) {
         return;
     }
+    // A click on something worn or wielded takes it off, back into the pack.
+    for slot in arx_script::EquipSlot::ALL {
+        let area = hud_book::equipment_area(slot);
+        let at = Rect::from_corners(bk.min + area.min * sc, bk.min + area.max * sc);
+        if let Some(item) = s.host.player.equipped_in(slot)
+            && at.contains(pos)
+            && !right
+        {
+            let player = s.player;
+            let _ = player;
+            s.host.unequip(&mut s.world, item, false);
+            ui.sfx.push("interface_invstd");
+            return;
+        }
+    }
     let player = &mut s.host.player;
     for a in Attribute::ALL {
         if local(hud_book::attribute_icon(a)).contains(pos) {
@@ -720,6 +735,7 @@ pub fn draw(
     shot: Option<Res<crate::Shot>>,
     font: Res<UiFont>,
     buttons: Res<ButtonInput<MouseButton>>,
+    combat: Res<crate::player_body::Combat>,
 ) {
     for e in &old {
         commands.entity(e).despawn();
@@ -756,6 +772,16 @@ pub fn draw(
             c.image(&empty, at);
         }
     };
+    // --- the strength of the blow being wound up, at the bottom of the screen while a weapon is drawn.
+    if combat.state.is_fighting()
+        && let (Some(full), Some(empty)) = (assets.get(&arx, &mut images, "bars/aim_maxi"), assets.get(&arx, &mut images, "bars/aim_empty"))
+    {
+        let k = ui.scale;
+        let at = Rect::new(w * 0.5 - 61.0 * k, h - 72.0 * k, w * 0.5 + 61.0 * k, h - 2.0 * k);
+        let i = combat.state.gauge(&s.host);
+        c.items.push(Item::Image { tex: full.handle, at, part: None, tint: Color::srgb(i, i, i) });
+        c.image(&empty, at);
+    }
     // The red gauge texture is grey: the engine tints it red.
     gauge(&mut c, &mut assets, &mut images, "red", g.health, p.life.fraction(), Color::srgb(1.0, 0.0, 0.0));
     gauge(&mut c, &mut assets, &mut images, "blue", g.mana, p.mana.fraction(), Color::WHITE);
@@ -887,7 +913,14 @@ pub fn draw(
                 text(&mut c, Vec2::new(413.0, 10.0), 120.0, format!("{xp} {:>8}", p.xp));
                 let full = p.full_skills();
                 for a in Attribute::ALL {
-                    text(&mut c, hud_book::attribute_value(a), 60.0, format!("{:>3}", p.attribute(a)));
+                    let full_attr = p.attributes_full();
+                    let value = match a {
+                        Attribute::Strength => full_attr.strength,
+                        Attribute::Mind => full_attr.mind,
+                        Attribute::Dexterity => full_attr.dexterity,
+                        Attribute::Constitution => full_attr.constitution,
+                    };
+                    text(&mut c, hud_book::attribute_value(a), 60.0, format!("{:>3.0}", value));
                     let icon = local_rect(hud_book::attribute_icon(a), Vec2::splat(32.0));
                     if hover(icon) {
                         flyover = speech.locale.get(hud_book::attribute_help_key(a)).map(str::to_owned);
@@ -908,6 +941,22 @@ pub fn draw(
                         {
                             c.image(&t, icon);
                         }
+                    }
+                }
+                // What is worn and wielded, in the places of the original's paper doll; click to take it off.
+                for slot in arx_script::EquipSlot::ALL {
+                    let Some(item) = p.equipped_in(slot) else { continue };
+                    let area = local_rect(hud_book::equipment_area(slot).min, hud_book::equipment_area(slot).size());
+                    let class = s.world.entity(item).class.clone();
+                    if let Some(icon) = assets.icon(&arx, &mut images, &class, 1) {
+                        // Fit the icon in the area without stretching it.
+                        let fit = (area.width() / icon.size.x).min(area.height() / icon.size.y).min(g.s * 2.0);
+                        let size = icon.size * fit;
+                        let at = Rect::from_center_size(area.center(), size);
+                        c.tinted(&icon, at, if hover(area) { bright() } else { Color::WHITE });
+                    }
+                    if hover(area) {
+                        tooltip.get_or_insert((display_name(&s, &speech, item), area.center()));
                     }
                 }
                 let misc = p.misc();

@@ -123,6 +123,17 @@ pub struct SpawnedEntities(pub std::collections::HashSet<arx_script::EntityId>);
 #[derive(Resource, Default)]
 pub struct LevelLights(pub Vec<StaticLight>);
 
+/// How [`spawn_entity`] should treat the entity.
+#[derive(Default)]
+pub struct SpawnOpts {
+    /// Leave out the faces that touch this vertex selection (the hero's head and shoulders, which the camera is in).
+    pub hide_selection: Option<&'static str>,
+    /// Do not make it clickable.
+    pub not_pickable: bool,
+    /// Accept animations that drive more bones than the model has (the hero's own do); the extra ones are ignored.
+    pub lenient_skeleton: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_entities(
     commands: &mut Commands,
@@ -147,8 +158,10 @@ pub fn spawn_entities(
         let (class, angle, instance) = (e.class.as_str(), e.angle, e.instance);
         if spawn_entity(
             commands, pak, lights, scripting, pickables, ecache, tcache, meshes, materials, images,
-            class, world_arx, angle, instance, script_id, include_npcs, &mut stats,
-        ) {
+            class, world_arx, angle, instance, script_id, include_npcs, &mut stats, &SpawnOpts::default(),
+        )
+        .is_some()
+        {
             spawned.0.insert(script_id);
         }
     }
@@ -184,7 +197,10 @@ pub fn spawn_dropped(
         if spawn_entity(
             &mut commands, &arx.0, &lights.0, &mut scripting, &mut pickables.0, &mut ecache, &mut tcache,
             &mut meshes, &mut materials, &mut images, &class, at, [0.0; 3], instance, id, true, &mut stats,
-        ) {
+            &SpawnOpts::default(),
+        )
+        .is_some()
+        {
             spawned.0.insert(id);
         }
     }
@@ -211,13 +227,14 @@ pub fn spawn_entity(
     script_id: arx_script::EntityId,
     include_npcs: bool,
     stats: &mut EntityStats,
-) -> bool {
+    opts: &SpawnOpts,
+) -> Option<Entity> {
     let fullbright = std::env::var_os("ARX_FULLBRIGHT").is_some();
     // What the entity's scripts did to it during start-up.
     let st = scripting.host.state(script_id).cloned().unwrap_or_default();
     if is_hidden(class) || st.destroyed || (!include_npcs && class.contains("/npc/")) {
         stats.hidden += 1;
-        return false;
+        return None;
     }
     let model_class = st.mesh.as_deref().unwrap_or(class);
     let model_path = format!("game/{model_class}.ftl");
@@ -231,8 +248,14 @@ pub fn spawn_entity(
         .clone();
     let Some(ftl) = model else {
         stats.no_model += 1;
-        return false;
+        return None;
     };
+    // Vertices of the selection to leave out (the faces that touch any of them are not drawn).
+    let hidden_vertices: std::collections::HashSet<u32> = opts
+        .hide_selection
+        .and_then(|name| ftl.selections.iter().find(|s| s.name.eq_ignore_ascii_case(name)))
+        .map(|s| s.vertices.iter().copied().collect())
+        .unwrap_or_default();
 
     let scale = st.scale;
     let translation = Vec3::from(to_bevy(world_arx));
@@ -246,6 +269,9 @@ pub fn spawn_entity(
 
     let mut groups: HashMap<(Option<u16>, Kind, bool), Builder> = HashMap::new();
     for f in &ftl.faces {
+        if f.vid.iter().any(|v| hidden_vertices.contains(&u32::from(*v))) {
+            continue;
+        }
         let material = if f.facetype == 0 { None } else { f.material };
         let ftype = f.facetype as u32;
         let kind = if ftype & poly::TRANS != 0 {
@@ -288,7 +314,7 @@ pub fn spawn_entity(
     let probe = anim.clone().or_else(|| st.anims.values().next().and_then(|p| scripting.anim(pak, p)));
     let skeleton = probe.and_then(|a| {
         let sk = ecache.skeletons.entry(model_path.clone()).or_insert_with(|| Arc::new(Skeleton::from_ftl(&ftl)));
-        (sk.bones.len() == a.group_count).then(|| sk.clone())
+        (sk.bones.len() == a.group_count || (opts.lenient_skeleton && sk.bones.len() < a.group_count)).then(|| sk.clone())
     });
     let animated = skeleton.is_some();
     let mut mesh_srcs = Vec::new();
@@ -350,22 +376,34 @@ pub fn spawn_entity(
     if let Some(skeleton) = skeleton {
         // Desynchronise identical NPCs.
         let offset = anim.as_ref().map_or(0, |a| (instance as i64).wrapping_mul(7_919_000).rem_euclid(a.duration_us));
-        parent.insert(Animated { skeleton, anim, meshes: mesh_srcs, elapsed_us: offset, looping, root_motion: !class.contains("/npc/") });
+        parent.insert(Animated {
+            skeleton,
+            anim,
+            meshes: mesh_srcs,
+            elapsed_us: offset,
+            looping,
+            root_motion: !class.contains("/npc/"),
+            overlay: None,
+            keep_pose: false,
+            pose: None,
+        });
         stats.animated += 1;
     }
 
     // Bounding sphere for picking.
-    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-    for v in &ftl.vertices {
-        let p = Vec3::from(to_bevy(v.pos));
-        lo = lo.min(p);
-        hi = hi.max(p);
+    if !opts.not_pickable {
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for v in &ftl.vertices {
+            let p = Vec3::from(to_bevy(v.pos));
+            lo = lo.min(p);
+            hi = hi.max(p);
+        }
+        pickables.push(Pickable {
+            id: script_id,
+            offset: rotation * ((lo + hi) * 0.5 * scale),
+            radius: ((hi - lo).length() * 0.5 * scale).max(20.0),
+        });
     }
-    pickables.push(Pickable {
-        id: script_id,
-        offset: rotation * ((lo + hi) * 0.5 * scale),
-        radius: ((hi - lo).length() * 0.5 * scale).max(20.0),
-    });
     stats.spawned += 1;
-    true
+    Some(parent.id())
 }

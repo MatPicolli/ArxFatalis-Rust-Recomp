@@ -91,6 +91,8 @@ pub struct EntityState {
     pub max_durability: f32,
     /// Worn or wielded by the hero (and so in neither the world nor the grid).
     pub equipped: bool,
+    /// What the hero shouts when a weapon's blow is well aimed (`setstrikespeech`).
+    pub strike_speech: String,
 }
 
 impl Default for EntityState {
@@ -128,6 +130,7 @@ impl Default for EntityState {
             durability: 0.0,
             max_durability: 0.0,
             equipped: false,
+            strike_speech: String::new(),
         }
     }
 }
@@ -486,6 +489,17 @@ impl StdHost {
     /// the animation ends).
     pub fn set_anim_duration(&mut self, f: AnimDuration) {
         self.anim_duration = Some(f);
+    }
+
+    /// How long, in milliseconds, the animation in an entity's slot lasts (if it is loaded and measurable).
+    pub fn slot_duration_ms(&self, entity: EntityId, slot: &str) -> Option<f64> {
+        let path = self.state(entity)?.anims.get(slot)?;
+        self.anim_duration.as_ref()?(path)
+    }
+
+    /// Does the entity have an animation in this slot?
+    pub fn has_slot(&self, entity: EntityId, slot: &str) -> bool {
+        self.state(entity).is_some_and(|s| s.anims.contains_key(slot))
     }
 
     /// Speech requests made since the last call.
@@ -956,6 +970,11 @@ impl Host for StdHost {
                 let e = a.world.entity_mut(me);
                 e.props.insert("^durability".to_owned(), crate::Value::Float(d));
                 e.props.insert("^maxdurability".to_owned(), crate::Value::Float(m));
+                CmdResult::Success
+            }
+            "setstrikespeech" => {
+                let w = a.get_word();
+                self.state_mut(me).strike_speech = w;
                 CmdResult::Success
             }
             "setweaponmaterial" => {
