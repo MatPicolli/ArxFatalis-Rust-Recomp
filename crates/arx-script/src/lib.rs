@@ -13,9 +13,9 @@ mod text;
 mod vars;
 mod world;
 
-pub use host::{AnimDuration, Carry, IconSize, is_gold_class, NoteKind, NoteRequest, ScriptLoader, EntityState, Mood, PlayAnim, SoundRequest, SpeechEvent, SpeechFlags, SpeechRequest, StdHost};
+pub use host::{AnimDuration, Carry, EquipValue, object_type, NpcRequest, TargetSpec, IconSize, is_gold_class, NoteKind, NoteRequest, ScriptLoader, EntityState, Mood, PlayAnim, SoundRequest, SpeechEvent, SpeechFlags, SpeechRequest, StdHost};
 pub use interp::{Args, CmdResult, Context, Host, ScriptResult, has_flag};
-pub use player::{Attribute, Attributes, BAG_HEIGHT, BAG_WIDTH, MAX_BAGS, Misc, PlayerState, Pool, Skill, Skills, Slot, xp_for_level};
+pub use player::{Attribute, Attributes, EquipMods, EquipSlot, FullAttributes, BAG_HEIGHT, BAG_WIDTH, MAX_BAGS, Misc, PlayerState, Pool, Skill, Skills, Slot, xp_for_level};
 pub use text::Script;
 pub use vars::{Value, Vars};
 pub use world::{EntityId, EntityKind, QueuedEvent, ScriptEntity, ScriptWorld, Stats};

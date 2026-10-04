@@ -133,6 +133,8 @@ pub fn footsteps(
     mut steps: ResMut<StepSounds>,
     mut assets: ResMut<Assets<AudioSource>>,
     mut script: ResMut<crate::scripting::Scripting>,
+    mut npcs: ResMut<crate::npcs::Npcs>,
+    keys: Res<ButtonInput<KeyCode>>,
 ) {
     if !fly.walk {
         return;
@@ -148,6 +150,16 @@ pub fn footsteps(
         }));
     }
     let n = fly.player.take_steps();
+    if n > 0
+        && let Some(npcs) = npcs.0.as_mut()
+    {
+        // Characters nearby hear every step; sneaking with some stealth skill carries less far.
+        let feet = fly.player.feet;
+        let stealth = script.host.player.skills.get(arx_script::Skill::Stealth) / 100.0;
+        let factor = if keys.pressed(KeyCode::ShiftLeft) { 1.0 + 3.5 * stealth } else { 1.0 };
+        let (player, sc) = (script.player, &mut *script);
+        npcs.hear(&mut sc.world, &mut sc.host, player, Vec3::new(feet.x, -feet.y, -feet.z), arx_level::npc::HEAR_STEP_DISTANCE / factor);
+    }
     if n == 0 || sounds.muted {
         return;
     }

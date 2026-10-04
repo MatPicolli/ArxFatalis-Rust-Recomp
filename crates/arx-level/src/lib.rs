@@ -1,7 +1,9 @@
 //! Glue between the file formats, the script interpreter and the collision world: everything needed
 //! to bring a level's entities to life that does not depend on a renderer.
 
+pub mod anchors;
 pub mod inventory;
+pub mod npc;
 
 use arx_formats::{PakSet, dlf::Dlf, ftl::Ftl};
 use arx_physics::{CollisionWorld, CylinderId, ObstacleId};
@@ -79,9 +81,10 @@ impl Scripts {
             let pak = pak.clone();
             host.set_script_loader(Box::new(move |class| pak.read(&format!("{class}.asl")).ok().map(|b| Arc::new(Script::new(&b)))));
         }
-        let player = world.add_entity(EntityKind::Player, "graph/obj3d/interactive/npc/player/player", 1, None, None);
-
         let load = |path: &str| pak.read(path).ok().map(|b| Arc::new(Script::new(&b)));
+        // The hero has a script too: the animations its body plays, what it says when hurt, and so on.
+        let player_script = load("graph/obj3d/interactive/player/player.asl");
+        let player = world.add_entity(EntityKind::Player, "graph/obj3d/interactive/player/player", 1, player_script, None);
         let mut ids = Vec::with_capacity(dlf.entities.len());
         for e in &dlf.entities {
             let (dir, name) = e.class.rsplit_once('/').unwrap_or(("", &e.class));
@@ -93,13 +96,14 @@ impl Scripts {
         }
 
         host.publish_player(&mut world);
-        for &id in &ids {
+        let everyone: Vec<EntityId> = std::iter::once(player).chain(ids.iter().copied()).collect();
+        for &id in &everyone {
             world.send_event(&mut host, None, id, "load", Vec::new());
         }
-        for &id in &ids {
+        for &id in &everyone {
             world.send_init(&mut host, id);
         }
-        for &id in &ids {
+        for &id in &everyone {
             world.send_event(&mut host, None, id, "game_ready", Vec::new());
         }
         world.update(&mut host, 0.0);
@@ -181,6 +185,9 @@ impl EntityObstacles {
             if kind == EntityKind::Npc {
                 let points: Vec<[f32; 3]> = ftl.vertices.iter().map(|v| v.pos).collect();
                 if let Some((radius, height)) = character_cylinder(&points, ftl.origin as usize, st.scale) {
+                    // `physical radius` / `physical height` in the script replace the model's own size.
+                    let radius = st.radius.map_or(radius, |r| (r * st.scale).clamp(25.0, 60.0));
+                    let height = st.height.map_or(height, |h| (h * st.scale).clamp(45.0, 165.0));
                     out.characters.insert(id, collision.add_cylinder(origin, radius, height));
                 }
                 continue;

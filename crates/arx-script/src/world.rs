@@ -276,6 +276,11 @@ impl ScriptWorld {
         self.timers.push(t);
     }
 
+    /// Drop every timer of an entity (it died).
+    pub fn clear_timers_for(&mut self, entity: EntityId) {
+        self.timers.retain(|t| t.entity != entity);
+    }
+
     pub(crate) fn clear_timer(&mut self, entity: EntityId, name: &str) {
         self.timers.retain(|o| !(o.entity == entity && o.name == name));
     }

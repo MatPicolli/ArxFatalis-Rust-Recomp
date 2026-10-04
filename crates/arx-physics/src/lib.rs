@@ -475,7 +475,11 @@ impl CollisionWorld {
 
     /// Highest floor under the cylinder footprint (centre plus four points on its rim).
     fn footprint_floor(&self, pos: Vec3, max_y: f32) -> Option<f32> {
-        let r = PLAYER_RADIUS * 0.7;
+        self.footprint_floor_r(pos, max_y, PLAYER_RADIUS)
+    }
+
+    fn footprint_floor_r(&self, pos: Vec3, max_y: f32, radius: f32) -> Option<f32> {
+        let r = radius * 0.7;
         [(0.0, 0.0), (r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r)]
             .iter()
             .filter_map(|(dx, dz)| self.floor_height(pos.x + dx, pos.z + dz, max_y))
@@ -528,7 +532,13 @@ impl CollisionWorld {
     /// wall the player belongs on, so a wall can never push them through itself. Obstacles whose top
     /// is below `pos.y + step` are low enough to step over (and are left to the floor pass).
     fn push_out_of_walls(&self, pos: &mut Vec3, prev: Vec3, step: f32, height: f32) {
-        let r = PLAYER_RADIUS;
+        self.push_out_of_walls_ex(pos, prev, step, height, PLAYER_RADIUS, None, &[]);
+    }
+
+    /// [`CollisionWorld::push_out_of_walls`] for a body of any radius. `skip` is a character's own cylinder (it
+    /// must not push itself) and `extra` further circles (centre in x/z, radius) to keep out of, such as the player.
+    #[allow(clippy::too_many_arguments)]
+    fn push_out_of_walls_ex(&self, pos: &mut Vec3, prev: Vec3, step: f32, height: f32, r: f32, skip: Option<CylinderId>, extra: &[(Vec2, f32)]) {
         for _ in 0..8 {
             let (lo, hi) = (pos.y + step, pos.y + height);
             let center = Vec2::new(pos.x, pos.z);
@@ -585,19 +595,25 @@ impl CollisionWorld {
             }
 
             // Characters: circles around their cylinders, whichever side the player is on.
-            for c in self.cylinders.read().expect("cylinder lock").iter() {
-                if !c.enabled || c.base.y + c.height < lo || c.base.y > hi {
-                    continue;
-                }
-                let d = center - Vec2::new(c.base.x, c.base.z);
-                let (len, reach) = (d.length(), r + c.radius);
+            let mut circle = |centre: Vec2, radius: f32| {
+                let d = center - centre;
+                let (len, reach) = (d.length(), r + radius);
                 if len < reach {
-                    let away = if len > 1e-4 { d / len } else { (Vec2::new(prev.x, prev.z) - Vec2::new(c.base.x, c.base.z)).normalize_or(Vec2::X) };
+                    let away = if len > 1e-4 { d / len } else { (Vec2::new(prev.x, prev.z) - centre).normalize_or(Vec2::X) };
                     let amount = reach - len + 0.01;
                     if push.is_none_or(|p| amount > p.length()) {
                         push = Some(away * amount);
                     }
                 }
+            };
+            for (i, c) in self.cylinders.read().expect("cylinder lock").iter().enumerate() {
+                if skip.is_some_and(|s| s.0 == i) || !c.enabled || c.base.y + c.height < lo || c.base.y > hi {
+                    continue;
+                }
+                circle(Vec2::new(c.base.x, c.base.z), c.radius);
+            }
+            for &(centre, radius) in extra {
+                circle(centre, radius);
             }
 
             match push {
@@ -608,6 +624,79 @@ impl CollisionWorld {
                 None => break,
             }
         }
+    }
+}
+
+/// The outcome of [`CollisionWorld::move_character`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct CharacterMove {
+    /// Where the feet ended up (y-up).
+    pub pos: Vec3,
+    /// A wall or another body stopped most of the requested movement.
+    pub blocked: bool,
+    /// There is floor under the feet (within the step height).
+    pub on_ground: bool,
+    /// The solid entities (doors, ...) the body is touching.
+    pub touched: Vec<ObstacleId>,
+}
+
+/// Fall speed of a character that has walked off an edge, units per second (the engine adds 1.5 per ms).
+const CHARACTER_FALL_SPEED: f32 = 1500.0;
+
+impl CollisionWorld {
+    /// Move a walking character (an NPC) by the horizontal displacement `disp`: walls and other bodies push it out,
+    /// it climbs steps of up to [`STEP_HEIGHT`], follows the floor down, and falls when there is none.
+    #[allow(clippy::too_many_arguments)]
+    pub fn move_character(&self, feet: Vec3, disp: Vec2, radius: f32, height: f32, dt: f32, skip: Option<CylinderId>, extra: &[(Vec2, f32)]) -> CharacterMove {
+        let wanted = feet + Vec3::new(disp.x, 0.0, disp.y);
+        let mut pos = wanted;
+        self.push_out_of_walls_ex(&mut pos, feet, STEP_HEIGHT, height, radius, skip, extra);
+        let done = Vec2::new(pos.x - feet.x, pos.z - feet.z);
+        let blocked = disp.length() > 0.05 && done.dot(disp) < 0.5 * disp.length_squared();
+        let floor = self.footprint_floor_r(pos, pos.y + STEP_HEIGHT, radius);
+        let on_ground = match floor {
+            Some(f) if f >= pos.y - STEP_HEIGHT => {
+                pos.y = f;
+                true
+            }
+            Some(f) => {
+                pos.y = (pos.y - CHARACTER_FALL_SPEED * dt).max(f);
+                pos.y <= f
+            }
+            None => false,
+        };
+        let touched = self.obstacles_touching(pos, radius, height, 15.0);
+        CharacterMove { pos, blocked, on_ground, touched }
+    }
+
+    /// The enabled solid entities within `margin` of a body standing at `pos`.
+    pub fn obstacles_touching(&self, pos: Vec3, radius: f32, height: f32, margin: f32) -> Vec<ObstacleId> {
+        let reach = radius + margin;
+        let centre = Vec2::new(pos.x, pos.z);
+        let mut out = Vec::new();
+        for (i, (o, enabled)) in self.obstacles.iter().zip(&self.obstacle_enabled).enumerate() {
+            if !enabled.load(Ordering::Relaxed)
+                || o.max.x < pos.x - reach
+                || o.min.x > pos.x + reach
+                || o.max.z < pos.z - reach
+                || o.min.z > pos.z + reach
+                || o.max.y < pos.y + STEP_HEIGHT
+                || o.min.y > pos.y + height
+            {
+                continue;
+            }
+            let near = o.tris.iter().any(|t| {
+                if t.max_y < pos.y + STEP_HEIGHT || t.min_y > pos.y + height {
+                    return false;
+                }
+                let (q, inside) = closest_on_tri_2d(centre, Vec2::new(t.a.x, t.a.z), Vec2::new(t.b.x, t.b.z), Vec2::new(t.c.x, t.c.z));
+                inside || q.distance(centre) < reach
+            });
+            if near {
+                out.push(ObstacleId(i));
+            }
+        }
+        out
     }
 }
 
@@ -1083,6 +1172,45 @@ mod tests {
 
     fn settle(w: &CollisionWorld, p: &mut Player, secs: f32) {
         run(w, p, MoveInput::default(), secs);
+    }
+
+    #[test]
+    fn walking_characters_follow_floors_stop_at_walls_and_notice_doors() {
+        let mut w = room();
+        // A door: a thin solid slab at x = 300, from z = -100 to 100.
+        let door = w.add_obstacle(quad(Vec3::new(300.0, 0.0, -100.0), Vec3::new(300.0, 0.0, 100.0), Vec3::new(300.0, 200.0, 100.0), Vec3::new(300.0, 200.0, -100.0))).unwrap();
+        // Walk toward the wall at z = 500: stops short of it by about the radius.
+        let mut feet = Vec3::new(0.0, 0.0, 400.0);
+        let mut last = None;
+        for _ in 0..120 {
+            let m = w.move_character(feet, Vec2::new(0.0, 2.0), 30.0, 170.0, 1.0 / 60.0, None, &[]);
+            feet = m.pos;
+            last = Some(m);
+        }
+        assert!(feet.z > 440.0 && feet.z < 475.0, "stopped at the wall: {feet:?}");
+        assert!(last.as_ref().unwrap().blocked && last.unwrap().on_ground);
+        // Walking into the door touches it; walking past it does not.
+        let mut feet = Vec3::new(200.0, 0.0, 0.0);
+        let mut touched = false;
+        for _ in 0..120 {
+            let m = w.move_character(feet, Vec2::new(2.0, 0.0), 30.0, 170.0, 1.0 / 60.0, None, &[]);
+            feet = m.pos;
+            touched |= m.touched.contains(&door);
+        }
+        assert!(touched && feet.x < 300.0, "stopped by the door: {feet:?}");
+        assert!(w.move_character(Vec3::new(0.0, 0.0, -400.0), Vec2::ZERO, 30.0, 170.0, 1.0 / 60.0, None, &[]).touched.is_empty());
+        // Another body in the way is walked around, not through: a circle at (0, 450) blocks a walk along z.
+        let blockers = [(Vec2::new(0.0, 250.0), 30.0)];
+        let mut feet = Vec3::new(0.0, 0.0, 0.0);
+        for _ in 0..180 {
+            feet = w.move_character(feet, Vec2::new(0.0, 2.0), 30.0, 170.0, 1.0 / 60.0, None, &blockers).pos;
+        }
+        assert!(feet.z < 200.0, "kept out of the other body: {feet:?}");
+        // Standing still on the floor keeps the character on it.
+        let mut feet = Vec3::new(0.0, 0.0, 0.0);
+        let m = w.move_character(feet, Vec2::new(0.0, 0.0), 30.0, 170.0, 1.0 / 60.0, None, &[]);
+        feet = m.pos;
+        assert!(m.on_ground && feet.y.abs() < 1e-3);
     }
 
     fn forward() -> MoveInput {

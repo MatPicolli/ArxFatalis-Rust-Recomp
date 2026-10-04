@@ -13,6 +13,7 @@ mod convert;
 mod entities;
 mod drag;
 mod hud;
+mod npcs;
 mod hud_book;
 mod hud_ui;
 mod level;
@@ -515,6 +516,7 @@ fn run_level(args: Args, pak: PakSet) {
     .insert_resource(scripting::Scripting::default())
     .insert_resource(scripting::Pickables::default())
     .insert_resource(scripting::Obstacles::default())
+    .insert_resource(npcs::Npcs::default())
     .insert_resource(audio::Sounds::new(args.mute))
     .insert_resource(speech::Speech::new(locale, args.language.clone(), !args.no_subtitles, args.mute))
     .add_systems(Startup, (hud_ui::load_font, speech::spawn_ui).chain())
@@ -526,15 +528,21 @@ fn run_level(args: Args, pak: PakSet) {
     .insert_resource(hud_ui::UiAssets::default())
     .add_systems(
         Update,
-        (
+        ((
             scripting::tick,
+            npcs::update,
             speech::debug_say,
             speech::update,
             entities::spawn_dropped,
             scripting::apply_state,
+            npcs::apply,
+            npcs::log,
             scripting::auto_use,
             scripting::sync_obstacles,
             audio::play_sounds,
+        )
+            .chain(),
+        (
             fly_camera,
             steps::footsteps,
             steps::ui_sounds,
@@ -548,6 +556,7 @@ fn run_level(args: Args, pak: PakSet) {
             animated::animate,
             level_hud,
         )
+            .chain())
             .chain(),
     );
     if let Some(path) = args.shot {
@@ -567,6 +576,7 @@ fn setup_level(
     mut pickables: ResMut<scripting::Pickables>,
     mut spawned: ResMut<entities::SpawnedEntities>,
     mut obstacles: ResMut<scripting::Obstacles>,
+    mut npcs: ResMut<npcs::Npcs>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
@@ -640,6 +650,12 @@ fn setup_level(
                     &mut collision, &arx.0, d, info.scene_pos, &scripting.world, &scripting.host, &scripting.ids,
                 );
                 eprintln!("entity obstacles: {}", obstacles.entities.by_entity.len());
+                npcs.0 = Some(arx_level::npc::build_npcs(
+                    &arx.0, &info.anchors, info.scene_pos, d, &scripting.ids, &scripting.world, &obstacles.entities, &collision,
+                ));
+                if let Some(n) = npcs.0.as_mut() {
+                    n.log = std::env::var("ARX_LOG_NPC").ok();
+                }
             }
             let collision = std::sync::Arc::new(collision);
             obstacles.world = Some(collision.clone());

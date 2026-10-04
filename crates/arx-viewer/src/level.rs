@@ -16,6 +16,8 @@ pub struct LevelInfo {
     pub poly_count: usize,
     pub mesh_count: usize,
     pub collision: arx_physics::CollisionWorld,
+    /// The graph characters path-find on.
+    pub anchors: Vec<arx_formats::fts::Anchor>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -164,5 +166,6 @@ pub fn spawn_level(
         poly_count: fts.polys.len(),
         mesh_count,
         collision: arx_physics::CollisionWorld::from_fts(&fts),
+        anchors: fts.anchors.clone(),
     })
 }

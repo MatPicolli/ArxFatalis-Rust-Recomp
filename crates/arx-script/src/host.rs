@@ -3,10 +3,33 @@
 //! by the interpreter (the rest of their line is ignored), so gameplay-only commands cost nothing.
 
 use crate::interp::{Args, CmdResult, Host, has_flag};
-use crate::player::{MAX_BAGS, PlayerState};
+use crate::player::{EquipSlot, MAX_BAGS, PlayerState};
 use crate::text::Script;
 use crate::world::{EntityId, EntityKind, ScriptWorld, Timer};
 use std::{collections::HashMap, sync::Arc};
+
+/// What an item is (`setobjecttype`), as flags.
+pub mod object_type {
+    pub const WEAPON: u32 = 1 << 0;
+    pub const DAGGER: u32 = 1 << 1;
+    pub const ONE_HANDED: u32 = 1 << 2;
+    pub const TWO_HANDED: u32 = 1 << 3;
+    pub const BOW: u32 = 1 << 4;
+    pub const SHIELD: u32 = 1 << 5;
+    pub const RING: u32 = 1 << 6;
+    pub const ARMOR: u32 = 1 << 7;
+    pub const HELMET: u32 = 1 << 8;
+    pub const LEGGINGS: u32 = 1 << 9;
+    /// Weapons the hero holds in the hand.
+    pub const HELD: u32 = DAGGER | ONE_HANDED | TWO_HANDED | BOW;
+}
+
+/// A number an item adds to the hero (`setequip`): an amount, or a percentage of the value it modifies.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EquipValue {
+    pub value: f32,
+    pub percent: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct PlayAnim {
@@ -48,6 +71,26 @@ pub struct EntityState {
     pub rotation: [f32; 3],
     /// Moved by the game (dropped by the player), in Arx coordinates; the renderer places the entity here.
     pub moved_to: Option<[f32; 3]>,
+    /// `physical off`: the entity does not fall, walk or collide (a hanging corpse).
+    pub physical_off: bool,
+    /// `physical radius` / `physical height`: the collision cylinder the script asked for (before scaling).
+    pub radius: Option<f32>,
+    pub height: Option<f32>,
+    /// Items: what it is (see [`object_type`]).
+    pub type_flags: u32,
+    /// Items: what it adds to whoever wears it (`setequip`), by modifier name.
+    pub equip: HashMap<String, EquipValue>,
+    /// Items: special effects (`setequip -s paralyse 500`).
+    pub specials: Vec<(String, f32)>,
+    /// What a weapon or a creature's attack is made of (`setweaponmaterial`), what armour or hide is (`setarmormaterial`)
+    /// and what feet wear (`setstepmaterial`).
+    pub weapon_material: String,
+    pub armor_material: String,
+    pub step_material: String,
+    pub durability: f32,
+    pub max_durability: f32,
+    /// Worn or wielded by the hero (and so in neither the world nor the grid).
+    pub equipped: bool,
 }
 
 impl Default for EntityState {
@@ -73,6 +116,18 @@ impl Default for EntityState {
             inventory_skin: String::new(),
             rotation: [0.0; 3],
             moved_to: None,
+            physical_off: false,
+            radius: None,
+            height: None,
+            type_flags: 0,
+            equip: HashMap::new(),
+            specials: Vec::new(),
+            weapon_material: String::new(),
+            armor_material: String::new(),
+            step_material: String::new(),
+            durability: 0.0,
+            max_durability: 0.0,
+            equipped: false,
         }
     }
 }
@@ -156,6 +211,38 @@ pub struct NoteRequest {
     pub text: String,
 }
 
+/// What `settarget` points an entity at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetSpec {
+    None,
+    /// The entity's patrol path (`settarget path`).
+    Path,
+    Entity(EntityId),
+}
+
+/// Commands that steer or configure a character, kept in the order scripts gave them for the NPC runtime
+/// (`arx_level::npc`) to carry out; this crate only reads them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NpcRequest {
+    /// `behavior [-lsdmfa] <command> [param]`: `flags` is the letters given, `command` the word after them.
+    Behavior { entity: EntityId, flags: String, command: String, param: f32 },
+    /// `settarget [-san] <target>`
+    SetTarget { entity: EntityId, flags: String, target: TargetSpec },
+    /// `setmovemode walk|run|sneak|none`
+    MoveMode { entity: EntityId, mode: String },
+    /// `setnpcstat <name> <value>`
+    Stat { entity: EntityId, name: String, value: f32 },
+    /// `setdetect <0..100|off>` (-1 for off)
+    Detect { entity: EntityId, value: i32 },
+    Speed { entity: EntityId, value: f32 },
+    XpValue { entity: EntityId, value: f32 },
+    Life { entity: EntityId, value: f32 },
+    Revive { entity: EntityId, init: bool },
+    ForceDeath { target: EntityId, killer: EntityId },
+    /// `pathfind <target>`
+    Pathfind { entity: EntityId, target: Option<EntityId> },
+}
+
 /// Loads the script of an entity class (a virtual path without extension), for items that scripts create
 /// (`inventory add`).
 pub type ScriptLoader = Box<dyn Fn(&str) -> Option<Arc<Script>> + Send + Sync>;
@@ -202,6 +289,9 @@ pub struct StdHost {
     notes: Vec<NoteRequest>,
     /// Items the player put back into the world, for the renderer to give a model (see `take_dropped`).
     dropped: Vec<EntityId>,
+    npc_requests: Vec<NpcRequest>,
+    /// The weapon item each character wields (`setweapon`).
+    pub npc_weapons: HashMap<EntityId, EntityId>,
 }
 
 impl StdHost {
@@ -413,6 +503,127 @@ impl StdHost {
         std::mem::take(&mut self.dropped)
     }
 
+    /// Put `item` on the hero: it goes to the slot its type says, and whatever was there comes off and returns to the
+    /// pack (or the floor). A two-handed weapon or a bow takes the shield off, and a shield a two-handed weapon.
+    pub fn equip(&mut self, world: &mut ScriptWorld, item: EntityId) {
+        use object_type as t;
+        let Some(player) = world.player else { return };
+        let flags = self.state(item).map_or(0, |s| s.type_flags);
+        if flags & (t::HELD | t::SHIELD | t::RING | t::ARMOR | t::LEGGINGS | t::HELMET) == 0 || self.player.is_equipped(item) {
+            return;
+        }
+        // It leaves the pack and the world.
+        self.player.remove_item(item);
+        self.modify(item, |s| {
+            s.in_inventory = false;
+            s.hidden = true;
+            s.collision = false;
+            s.equipped = true;
+        });
+        if flags & t::HELD != 0 {
+            self.release_slot(world, EquipSlot::Weapon);
+            self.player.equipped[EquipSlot::Weapon as usize] = Some(item);
+            if flags & (t::TWO_HANDED | t::BOW) != 0 {
+                self.release_slot(world, EquipSlot::Shield);
+            }
+        } else if flags & t::SHIELD != 0 {
+            self.release_slot(world, EquipSlot::Shield);
+            self.player.equipped[EquipSlot::Shield as usize] = Some(item);
+            let weapon_flags = self.player.equipped_in(EquipSlot::Weapon).and_then(|w| self.state(w)).map_or(0, |s| s.type_flags);
+            if weapon_flags & (t::TWO_HANDED | t::BOW) != 0 {
+                self.release_slot(world, EquipSlot::Weapon);
+            }
+        } else if flags & t::RING != 0 {
+            let slot = match (self.player.equipped_in(EquipSlot::RingLeft), self.player.equipped_in(EquipSlot::RingRight)) {
+                (None, _) => EquipSlot::RingLeft,
+                (_, None) => EquipSlot::RingRight,
+                _ => {
+                    self.release_slot(world, EquipSlot::RingLeft);
+                    EquipSlot::RingLeft
+                }
+            };
+            self.player.equipped[slot as usize] = Some(item);
+        } else {
+            let slot = if flags & t::ARMOR != 0 {
+                EquipSlot::Armor
+            } else if flags & t::LEGGINGS != 0 {
+                EquipSlot::Leggings
+            } else {
+                EquipSlot::Helmet
+            };
+            self.release_slot(world, slot);
+            self.player.equipped[slot as usize] = Some(item);
+        }
+        self.recompute_equipment();
+        let _ = player;
+    }
+
+    /// Take `item` off the hero. It returns to the pack, or to the floor at the hero's feet if there is no room
+    /// (`destroyed` items are just gone). Both it and the hero's script hear `equipout`.
+    pub fn unequip(&mut self, world: &mut ScriptWorld, item: EntityId, destroyed: bool) {
+        let Some(player) = world.player else { return };
+        let Some(i) = self.player.equipped.iter().position(|&e| e == Some(item)) else { return };
+        self.player.equipped[i] = None;
+        self.modify(item, |s| s.equipped = false);
+        if destroyed {
+            self.modify(item, |s| s.destroyed = true);
+        } else if self.carry(world, item) == Carry::Full {
+            let at = world.entity(player).pos;
+            self.modify(item, |s| {
+                s.hidden = false;
+                s.in_inventory = false;
+                s.collision = true;
+                s.moved_to = Some(at);
+            });
+            world.entity_mut(item).pos = at;
+            self.note_dropped(item);
+            self.push_message("Your inventory is full".to_owned());
+        }
+        world.queue_event(Some(player), item, "equipout", Vec::new());
+        world.queue_event(Some(item), player, "equipout", Vec::new());
+        self.recompute_equipment();
+    }
+
+    fn release_slot(&mut self, world: &mut ScriptWorld, slot: EquipSlot) {
+        if let Some(old) = self.player.equipped_in(slot) {
+            self.unequip(world, old, false);
+        }
+    }
+
+    /// Add up what the worn items give (their `setequip` values) into the hero's modifiers, then bring life and mana
+    /// maximums in line.
+    pub fn recompute_equipment(&mut self) {
+        let mut mods = crate::player::EquipMods::default();
+        for slot in EquipSlot::ALL {
+            let Some(item) = self.player.equipped_in(slot) else { continue };
+            let Some(st) = self.state(item) else { continue };
+            for (name, v) in &st.equip {
+                if v.percent {
+                    *mods.rel.entry(name.clone()).or_default() += v.value * 0.01;
+                } else {
+                    *mods.abs.entry(name.clone()).or_default() += v.value;
+                }
+            }
+        }
+        self.player.mods = mods;
+        self.player.recompute();
+    }
+
+    /// The weapon the hero holds, if any.
+    pub fn player_weapon(&self) -> Option<EntityId> {
+        self.player.equipped_in(EquipSlot::Weapon)
+    }
+
+    /// Character commands scripts gave since the last call, in order.
+    pub fn take_npc_requests(&mut self) -> Vec<NpcRequest> {
+        std::mem::take(&mut self.npc_requests)
+    }
+
+    /// Queue a character command as a script would (used by the game itself, and in tests).
+    pub fn push_npc_request(&mut self, r: NpcRequest) {
+        self.npc_requests.push(r);
+    }
+
     /// Things scripts asked the player to read since the last call.
     pub fn take_notes(&mut self) -> Vec<NoteRequest> {
         std::mem::take(&mut self.notes)
@@ -621,7 +832,7 @@ impl Host for StdHost {
                 let name = a.string_var(&w).to_ascii_lowercase();
                 let name = name.strip_suffix(".wav").unwrap_or(&name).replace('\\', "/");
                 // Inventory-use sounds are played at the player, whatever the flags say.
-                let positional = !has_flag(&flags, 'o') && a.ctx.event != "inventoryuse";
+                let positional = !has_flag(&flags, 'o') && a.ctx.event != "inventoryuse" && a.ctx.event != "equipin";
                 self.sounds.push(SoundRequest {
                     entity: me,
                     name,
@@ -687,6 +898,208 @@ impl Host for StdHost {
                 CmdResult::Success
             }
             "inventory" => self.inventory_command(a),
+            "setobjecttype" => {
+                let flags = a.get_flags();
+                let name = a.get_word();
+                let flag = match name.chars().next() {
+                    Some('w') => object_type::WEAPON,
+                    Some('d') => object_type::DAGGER,
+                    Some('1') => object_type::ONE_HANDED,
+                    Some('2') => object_type::TWO_HANDED,
+                    Some('b') => object_type::BOW,
+                    Some('s') => object_type::SHIELD,
+                    Some('r') => object_type::RING,
+                    Some('a') => object_type::ARMOR,
+                    Some('h') => object_type::HELMET,
+                    Some('l') => object_type::LEGGINGS,
+                    _ => {
+                        a.warn(&format!("unknown object type: {name}"));
+                        return Some(CmdResult::Failed);
+                    }
+                };
+                let st = self.state_mut(me);
+                if has_flag(&flags, 'r') {
+                    st.type_flags &= !flag;
+                } else {
+                    st.type_flags |= flag;
+                }
+                CmdResult::Success
+            }
+            "setequip" => {
+                let flags = a.get_flags();
+                if has_flag(&flags, 'r') {
+                    self.state_mut(me).specials.clear();
+                }
+                let name = a.get_word();
+                let value = a.get_word();
+                let percent = value.ends_with('%');
+                let number = a.float_var(value.trim_end_matches('%'));
+                let st = self.state_mut(me);
+                if has_flag(&flags, 's') {
+                    if st.specials.len() < 4 {
+                        st.specials.push((name, number));
+                    }
+                } else {
+                    st.equip.insert(name, EquipValue { value: number, percent });
+                }
+                CmdResult::Success
+            }
+            "setdurability" => {
+                let flags = a.get_flags();
+                let v = a.get_float();
+                let st = self.state_mut(me);
+                st.durability = v;
+                if !has_flag(&flags, 'c') {
+                    st.max_durability = v;
+                }
+                let (d, m) = (st.durability, st.max_durability);
+                let e = a.world.entity_mut(me);
+                e.props.insert("^durability".to_owned(), crate::Value::Float(d));
+                e.props.insert("^maxdurability".to_owned(), crate::Value::Float(m));
+                CmdResult::Success
+            }
+            "setweaponmaterial" => {
+                let w = a.get_word();
+                self.state_mut(me).weapon_material = w;
+                CmdResult::Success
+            }
+            "setarmormaterial" => {
+                let w = a.get_word();
+                self.state_mut(me).armor_material = w;
+                CmdResult::Success
+            }
+            "setstepmaterial" => {
+                let w = a.get_word();
+                self.state_mut(me).step_material = w;
+                CmdResult::Success
+            }
+            "equip" => {
+                let flags = a.get_flags();
+                let w = a.get_word();
+                let Some(target) = a.world.find(&w, me) else {
+                    a.warn(&format!("unknown target: {w}"));
+                    return Some(CmdResult::Failed);
+                };
+                if Some(target) != a.world.player {
+                    return Some(CmdResult::Success);
+                }
+                if has_flag(&flags, 'r') {
+                    self.unequip(a.world, me, false);
+                } else {
+                    a.world.queue_event(Some(target), me, "equipin", Vec::new());
+                    self.equip(a.world, me);
+                }
+                CmdResult::Success
+            }
+            "setweapon" => {
+                let _flags = a.get_flags();
+                let w = a.get_word();
+                let name = a.string_var(&w);
+                if let Some(item) = self.spawn_item(a, &name) {
+                    self.npc_weapons.insert(me, item);
+                    CmdResult::Success
+                } else {
+                    CmdResult::Failed
+                }
+            }
+            "physical" => {
+                let kind = a.get_word();
+                match kind.as_str() {
+                    "on" => self.state_mut(me).physical_off = false,
+                    "off" => self.state_mut(me).physical_off = true,
+                    "height" => {
+                        let v = a.get_float();
+                        self.state_mut(me).height = Some(v.clamp(30.0, 165.0));
+                    }
+                    "radius" => {
+                        let v = a.get_float();
+                        self.state_mut(me).radius = Some(v.clamp(10.0, 40.0));
+                    }
+                    other => {
+                        a.warn(&format!("unknown physical command: {other}"));
+                        return Some(CmdResult::Failed);
+                    }
+                }
+                CmdResult::Success
+            }
+            "behavior" => {
+                let flags = a.get_flags();
+                let command = a.get_word();
+                let param = if matches!(command.as_str(), "flee" | "look_for" | "hide" | "wander_around") { a.get_float() } else { 0.0 };
+                self.npc_requests.push(NpcRequest::Behavior { entity: me, flags, command, param });
+                CmdResult::Success
+            }
+            "settarget" => {
+                let flags = a.get_flags();
+                let mut word = a.get_word();
+                if word == "object" {
+                    word = a.get_word();
+                }
+                let word = a.string_var(&word);
+                let target = match word.as_str() {
+                    "none" => TargetSpec::None,
+                    "path" => TargetSpec::Path,
+                    other => match a.world.find(other, me) {
+                        Some(t) => TargetSpec::Entity(t),
+                        None => TargetSpec::None,
+                    },
+                };
+                self.npc_requests.push(NpcRequest::SetTarget { entity: me, flags, target });
+                CmdResult::Success
+            }
+            "setmovemode" => {
+                let mode = a.get_word();
+                self.npc_requests.push(NpcRequest::MoveMode { entity: me, mode });
+                CmdResult::Success
+            }
+            "setnpcstat" => {
+                let name = a.get_word();
+                let value = a.get_float();
+                self.npc_requests.push(NpcRequest::Stat { entity: me, name, value });
+                CmdResult::Success
+            }
+            "setdetect" => {
+                let w = a.get_word();
+                let value = if w == "off" { -1 } else { (a.float_var(&w) as i32).clamp(-1, 100) };
+                self.npc_requests.push(NpcRequest::Detect { entity: me, value });
+                CmdResult::Success
+            }
+            "setspeed" => {
+                let value = a.get_float().clamp(0.0, 10.0);
+                self.npc_requests.push(NpcRequest::Speed { entity: me, value });
+                CmdResult::Success
+            }
+            "setxpvalue" => {
+                let value = a.get_float().max(0.0);
+                self.npc_requests.push(NpcRequest::XpValue { entity: me, value });
+                CmdResult::Success
+            }
+            "setlife" => {
+                let value = a.get_float();
+                self.npc_requests.push(NpcRequest::Life { entity: me, value });
+                CmdResult::Success
+            }
+            "revive" => {
+                let flags = a.get_flags();
+                self.npc_requests.push(NpcRequest::Revive { entity: me, init: has_flag(&flags, 'i') });
+                CmdResult::Success
+            }
+            "forcedeath" => {
+                let w = a.get_word();
+                match a.world.find(&w, me) {
+                    Some(target) => {
+                        self.npc_requests.push(NpcRequest::ForceDeath { target, killer: me });
+                        CmdResult::Success
+                    }
+                    None => CmdResult::Failed,
+                }
+            }
+            "pathfind" => {
+                let w = a.get_word();
+                let target = a.world.find(&w, me);
+                self.npc_requests.push(NpcRequest::Pathfind { entity: me, target });
+                CmdResult::Success
+            }
             "addxp" => {
                 let points = a.get_float() as i64;
                 let gained = self.player.add_xp(points);
@@ -978,6 +1391,61 @@ on inventoryuse {
         h.player.inventory.push(id);
         h.prune_inventory();
         assert!(h.player.inventory.is_empty());
+    }
+
+    #[test]
+    fn equipping_fills_slots_swaps_what_was_there_and_changes_the_hero_numbers() {
+        let latin = |src: &str| Arc::new(Script::new(&src.chars().map(|c| c as u8).collect::<Vec<u8>>()));
+        let mut w = ScriptWorld::new();
+        let mut h = StdHost::new();
+        let player = w.add_entity(EntityKind::Player, "x/npc/player/player", 1, None, None);
+        let item = |w: &mut ScriptWorld, name: &str, setup: &str| {
+            let src = format!("on init {{\n {setup}\n accept\n}}\non inventoryuse {{\n equip player\n accept\n}}\non equipin {{\n set §worn 1\n accept\n}}\non equipout {{\n set §worn 0\n accept\n}}");
+            w.add_entity(EntityKind::Item, &format!("graph/obj3d/interactive/items/{name}"), 1, Some(latin(&src)), None)
+        };
+        let sword = item(&mut w, "weapons/sword/sword", "setobjecttype weapon\n setobjecttype 1h\n setequip damages 4\n setequip aim_time 700");
+        let dagger = item(&mut w, "weapons/dagger/dagger", "setobjecttype weapon\n setobjecttype dagger\n setequip damages 2");
+        let axe = item(&mut w, "weapons/axe2/axe2", "setobjecttype 2h");
+        let shield = item(&mut w, "armor/shield/shield", "setobjecttype shield\n setequip armor_class 3");
+        let mail = item(&mut w, "armor/mail/mail", "setobjecttype armor\n setequip armor_class 50%\n setequip strength 2");
+        for &i in &[sword, dagger, axe, shield, mail] {
+            w.send_init(&mut h, i);
+            assert_eq!(h.carry(&w, i), Carry::Added);
+        }
+        let base_damage = h.player.misc().damages;
+        // Use the sword: it leaves the pack and is wielded; its damage adds to the hero's.
+        w.send_event(&mut h, Some(player), sword, "inventoryuse", vec![]);
+        w.update(&mut h, 0.0);
+        assert_eq!(h.player_weapon(), Some(sword));
+        assert!(!h.player.inventory.contains(&sword) && h.state(sword).unwrap().equipped);
+        assert_eq!(w.entity(sword).vars.get_int("§worn"), 1, "equipin was sent");
+        assert!((h.player.misc().damages - (base_damage + 4.0)).abs() < 1e-4);
+        assert_eq!(h.player.aim_time_ms(), 1500.0, "never faster than a second and a half");
+        // The dagger replaces it; the sword goes back to the pack and hears equipout.
+        w.send_event(&mut h, Some(player), dagger, "inventoryuse", vec![]);
+        w.update(&mut h, 0.0);
+        assert_eq!(h.player_weapon(), Some(dagger));
+        assert!(h.player.inventory.contains(&sword) && !h.state(sword).unwrap().equipped);
+        assert_eq!(w.entity(sword).vars.get_int("§worn"), 0);
+        assert!((h.player.misc().damages - (base_damage + 2.0)).abs() < 1e-4);
+        // A shield, then a two-handed axe, which takes the shield off.
+        w.send_event(&mut h, Some(player), shield, "inventoryuse", vec![]);
+        assert_eq!(h.player.equipped_in(EquipSlot::Shield), Some(shield));
+        assert!(h.player.misc().armor_class >= 4.0);
+        w.send_event(&mut h, Some(player), axe, "inventoryuse", vec![]);
+        w.update(&mut h, 0.0);
+        assert_eq!(h.player_weapon(), Some(axe));
+        assert_eq!(h.player.equipped_in(EquipSlot::Shield), None, "two hands on the axe");
+        assert!(h.player.inventory.contains(&shield) && h.player.inventory.contains(&dagger));
+        // Armour with a percentage and an attribute bonus.
+        let before = h.player.misc().armor_class;
+        w.send_event(&mut h, Some(player), mail, "inventoryuse", vec![]);
+        assert_eq!(h.player.attributes_full().strength, 8.0);
+        assert!(h.player.misc().armor_class > before, "50% more armour class: {} -> {}", before, h.player.misc().armor_class);
+        // Taking it off restores the numbers.
+        h.unequip(&mut w, mail, false);
+        assert_eq!(h.player.attributes_full().strength, 6.0);
+        assert!(h.player.inventory.contains(&mail));
     }
 
     #[test]

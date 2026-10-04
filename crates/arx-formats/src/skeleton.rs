@@ -106,22 +106,55 @@ impl Skeleton {
     }
 
     fn pose_with_root(&self, anim: &Tea, frame: usize, t: f32, root: Vec3) -> Vec<Vec3> {
-        let animated = anim.frames.len() > 1;
+        let (rot, trans, scale) = self.locals(&[(anim, frame, t)]);
+        self.concatenate(&rot, &trans, &scale, root).vertices
+    }
 
-        // Local transform of each bone.
+    /// Local transform of every bone from the animation layers given from the topmost down, each as (animation, frame,
+    /// blend). A bone that a higher layer animates takes nothing from the lower ones (the engine's `Cedric_AnimateObject`),
+    /// which is how an arm's attack plays over the legs' walk.
+    fn locals(&self, layers: &[(&Tea, usize, f32)]) -> (Vec<Quat>, Vec<Vec3>, Vec<Vec3>) {
         let n = self.bones.len();
-        let mut init_rot = vec![Quat::IDENTITY; n];
-        let mut init_trans: Vec<Vec3> = self.bones.iter().map(|b| b.rest_offset).collect();
-        let mut init_scale = vec![Vec3::ZERO; n];
-        if animated {
+        let mut rot = vec![Quat::IDENTITY; n];
+        let mut trans: Vec<Vec3> = self.bones.iter().map(|b| b.rest_offset).collect();
+        let mut scale = vec![Vec3::ZERO; n];
+        let mut done = vec![false; n];
+        for &(anim, frame, t) in layers {
+            if anim.frames.len() <= 1 {
+                continue;
+            }
             for j in 0..n.min(anim.group_count) {
+                if done[j] {
+                    continue;
+                }
+                if !anim.void_groups.get(j).copied().unwrap_or(false) {
+                    done[j] = true;
+                }
                 let (s, e) = (anim.group(frame, j), anim.group(frame + 1, j));
-                init_rot[j] = slerp(s.rotate, e.rotate, t);
-                init_trans[j] = s.translate.lerp(e.translate, t) + self.bones[j].rest_offset;
-                init_scale[j] = s.zoom.lerp(e.zoom, t);
+                rot[j] = slerp(s.rotate, e.rotate, t);
+                trans[j] = s.translate.lerp(e.translate, t) + self.bones[j].rest_offset;
+                scale[j] = s.zoom.lerp(e.zoom, t);
             }
         }
+        (rot, trans, scale)
+    }
 
+    /// Pose from several layers at once (topmost first), each an animation and the time into it. `root` is added to the
+    /// root bone. Also gives each bone's final rotation and position, for attaching things to it.
+    pub fn pose_layers(&self, layers: &[(&Tea, i64)], root: Vec3) -> Pose {
+        let located: Vec<(&Tea, usize, f32)> = layers
+            .iter()
+            .map(|&(anim, time)| {
+                let (frame, t) = anim.locate(time);
+                (anim, frame, t)
+            })
+            .collect();
+        let (rot, trans, scale) = self.locals(&located);
+        self.concatenate(&rot, &trans, &scale, root)
+    }
+
+    fn concatenate(&self, init_rot: &[Quat], init_trans: &[Vec3], init_scale: &[Vec3], root: Vec3) -> Pose {
+        let n = self.bones.len();
         // Concatenate down the hierarchy (parents always precede children).
         let mut quat = vec![Quat::IDENTITY; n];
         let mut trans = vec![Vec3::ZERO; n];
@@ -142,12 +175,22 @@ impl Skeleton {
         }
 
         let matrices: Vec<Mat3> = (0..n).map(|j| Mat3::from_quat(quat[j]) * Mat3::from_diagonal(scale[j])).collect();
-        self.vertex_bone
+        let vertices = self
+            .vertex_bone
             .iter()
             .zip(&self.vertex_local)
             .map(|(&b, &local)| matrices[b] * local + trans[b])
-            .collect()
+            .collect();
+        Pose { vertices, bone_quat: quat, bone_trans: trans }
     }
+}
+
+/// A skeleton posed: where every vertex is (Arx coordinates, object space), and each bone's rotation and origin.
+#[derive(Debug, Clone)]
+pub struct Pose {
+    pub vertices: Vec<Vec3>,
+    pub bone_quat: Vec<Quat>,
+    pub bone_trans: Vec<Vec3>,
 }
 
 #[cfg(test)]

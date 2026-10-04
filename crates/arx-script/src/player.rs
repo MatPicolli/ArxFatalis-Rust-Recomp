@@ -117,6 +117,55 @@ impl Skills {
     }
 }
 
+/// Where equipment goes on the hero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EquipSlot {
+    Weapon,
+    Shield,
+    RingLeft,
+    RingRight,
+    Armor,
+    Leggings,
+    Helmet,
+}
+
+impl EquipSlot {
+    pub const ALL: [EquipSlot; 7] =
+        [EquipSlot::Weapon, EquipSlot::Shield, EquipSlot::RingLeft, EquipSlot::RingRight, EquipSlot::Armor, EquipSlot::Leggings, EquipSlot::Helmet];
+}
+
+/// What worn and wielded items add to the hero's numbers: absolute amounts and relative ones (a fraction of the
+/// value they modify), by modifier name (`strength`, `armor_class`, `close_combat`, ...).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EquipMods {
+    pub abs: HashMap<String, f32>,
+    pub rel: HashMap<String, f32>,
+}
+
+impl EquipMods {
+    /// The change to `base`: the absolute modifiers plus the relative ones applied to what is left
+    /// (`getEquipmentModifier`).
+    pub fn modifier(&self, name: &str, base: f32) -> f32 {
+        let abs = self.abs.get(name).copied().unwrap_or(0.0);
+        let rel = self.rel.get(name).copied().unwrap_or(0.0);
+        abs + rel * (base + abs).max(0.0)
+    }
+
+    /// Only the absolute part (`getEquipmentBaseModifier`).
+    pub fn absolute(&self, name: &str) -> f32 {
+        self.abs.get(name).copied().unwrap_or(0.0)
+    }
+}
+
+/// The attributes with what the equipment adds (fractions are possible).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FullAttributes {
+    pub strength: f32,
+    pub mind: f32,
+    pub dexterity: f32,
+    pub constitution: f32,
+}
+
 /// Values derived from attributes and skills (the right-hand numbers of the sheet's left page).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Misc {
@@ -167,6 +216,12 @@ pub struct PlayerState {
     /// Number of bags (each `BAG_WIDTH` x `BAG_HEIGHT`); `addbag` adds one.
     pub bags: usize,
     pub gold: u64,
+    /// What is worn and wielded, by slot (see [`EquipSlot`]).
+    pub equipped: [Option<EntityId>; 7],
+    /// What the equipment adds to the numbers (kept up to date by the host).
+    pub mods: EquipMods,
+    /// Weapon drawn and ready (combat mode).
+    pub fighting: bool,
 }
 
 impl Default for PlayerState {
@@ -190,6 +245,9 @@ impl Default for PlayerState {
             slots: HashMap::new(),
             bags: 1,
             gold: 0,
+            equipped: [None; 7],
+            mods: EquipMods::default(),
+            fighting: false,
         }
     }
 }
@@ -221,10 +279,31 @@ impl PlayerState {
         }
     }
 
-    /// Skills including what the attributes give (`getAttributeSkillModifiers`).
-    pub fn full_skills(&self) -> Skills {
+    pub fn equipped_in(&self, slot: EquipSlot) -> Option<EntityId> {
+        self.equipped[slot as usize]
+    }
+
+    /// Is this item worn or wielded?
+    pub fn is_equipped(&self, item: EntityId) -> bool {
+        self.equipped.contains(&Some(item))
+    }
+
+    /// The attributes plus what the equipment adds (`m_attributeFull`).
+    pub fn attributes_full(&self) -> FullAttributes {
         let a = &self.attributes;
-        let (st, mi, de, co) = (a.strength as f32, a.mind as f32, a.dexterity as f32, a.constitution as f32);
+        let full = |base: i32, name: &str| (base as f32 + self.mods.modifier(name, base as f32)).max(0.0);
+        FullAttributes {
+            strength: full(a.strength, "strength"),
+            mind: full(a.mind, "intelligence"),
+            dexterity: full(a.dexterity, "dexterity"),
+            constitution: full(a.constitution, "constitution"),
+        }
+    }
+
+    /// Skills including what the attributes and the equipment give (`getAttributeSkillModifiers`).
+    pub fn full_skills(&self) -> Skills {
+        let a = self.attributes_full();
+        let (st, mi, de, co) = (a.strength, a.mind, a.dexterity, a.constitution);
         let from_attributes = [
             de * 2.0,
             de + mi,
@@ -240,28 +319,52 @@ impl PlayerState {
         for (v, extra) in full.0.iter_mut().zip(from_attributes) {
             *v += extra;
         }
+        for s in Skill::ALL {
+            let base = full.get(s);
+            full.set(s, base + self.mods.modifier(s.script_name(), base));
+        }
         full
     }
 
-    /// Armour class, resistances, critical hit and damage (`getMiscStats`; no equipment yet).
+    /// Armour class, resistances, critical hit and damage (`getMiscStats` and the equipment's share).
     pub fn misc(&self) -> Misc {
-        let a = &self.attributes;
-        let (st, mi, de, co) = (a.strength as f32, a.mind as f32, a.dexterity as f32, a.constitution as f32);
+        let a = self.attributes_full();
+        let (st, mi, de, co) = (a.strength, a.mind, a.dexterity, a.constitution);
         let sk = self.full_skills();
-        Misc {
+        let base = Misc {
             armor_class: (sk.get(Skill::Defense) * 0.1 - 1.0).max(1.0).floor(),
             resist_magic: (mi * 2.0 * (1.0 + sk.get(Skill::Casting) * 0.005)).floor(),
             resist_poison: (co * 2.0 + sk.get(Skill::Defense) * 0.25).floor(),
             critical_hit: de * 2.0 + sk.get(Skill::CloseCombat) * 0.2 - 18.0,
-            damages: ((st * 0.5 - 5.0).max(1.0) + sk.get(Skill::CloseCombat) * 0.1).max(1.0),
+            damages: (st * 0.5 - 5.0).max(1.0),
+        };
+        let m = &self.mods;
+        Misc {
+            armor_class: (base.armor_class + m.modifier("armor_class", base.armor_class)).max(0.0),
+            resist_magic: (base.resist_magic + m.modifier("resist_magic", base.resist_magic)).max(0.0),
+            resist_poison: (base.resist_poison + m.modifier("resist_poison", base.resist_poison)).max(0.0),
+            critical_hit: (base.critical_hit + m.modifier("critical_hit", base.critical_hit)).max(0.0),
+            damages: (base.damages + m.modifier("damages", base.damages) + sk.get(Skill::CloseCombat) * 0.1).max(1.0),
         }
+    }
+
+    /// How long a blow takes to wind up fully, in milliseconds: the weapons' aim times, never faster than 1.5 s
+    /// less what dexterity above 10 saves (`Full_AimTime`).
+    pub fn aim_time_ms(&self) -> f32 {
+        let mut t = self.mods.absolute("aim_time");
+        if t <= 0.0 {
+            t = 1500.0;
+        }
+        t -= (self.attributes_full().dexterity - 10.0) * 20.0;
+        t.max(1500.0)
     }
 
     /// Bring the life and mana maximums in line with the attributes and level. While the hero is still being
     /// created (level 0) the pools are kept full.
     pub fn recompute(&mut self) {
-        self.life.max = Self::max_life(&self.attributes, self.level);
-        self.mana.max = Self::max_mana(&self.attributes, self.level);
+        let full = self.attributes_full();
+        self.life.max = (full.constitution * (self.level + 2) as f32).floor();
+        self.mana.max = (full.mind * (self.level + 1) as f32).floor();
         if self.level == 0 {
             self.life.current = self.life.max;
             self.mana.current = self.mana.max;
@@ -336,15 +439,16 @@ impl PlayerState {
     pub fn script_vars(&self) -> Vec<(String, f32)> {
         let mut v = vec![
             ("^player_life".to_owned(), self.life.current),
+            ("^fighting".to_owned(), if self.fighting { 1.0 } else { 0.0 }),
             ("^player_maxlife".to_owned(), self.life.max),
             ("^player_maxmana".to_owned(), self.mana.max),
             ("^player_gold".to_owned(), self.gold as f32),
             ("^player_hunger".to_owned(), self.hunger),
             ("^player_poison".to_owned(), 0.0),
-            ("^player_attribute_strength".to_owned(), self.attributes.strength as f32),
-            ("^player_attribute_dexterity".to_owned(), self.attributes.dexterity as f32),
-            ("^player_attribute_constitution".to_owned(), self.attributes.constitution as f32),
-            ("^player_attribute_mind".to_owned(), self.attributes.mind as f32),
+            ("^player_attribute_strength".to_owned(), self.attributes_full().strength),
+            ("^player_attribute_dexterity".to_owned(), self.attributes_full().dexterity),
+            ("^player_attribute_constitution".to_owned(), self.attributes_full().constitution),
+            ("^player_attribute_mind".to_owned(), self.attributes_full().mind),
         ];
         let full = self.full_skills();
         for s in Skill::ALL {

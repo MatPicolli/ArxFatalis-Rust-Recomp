@@ -68,6 +68,11 @@ enum Cmd {
         #[arg(long)] no_jump: bool },
     /// Parse a .tea animation (and with --model, pose that .ftl at several times); no path = parse all
     Tea { path: Option<String>, #[arg(long)] model: Option<String> },
+    /// Run a level's characters headlessly for some seconds (the player stands far away, nothing disturbs them) and
+    /// report what each did: behaviour, animation, distance walked, whether its route and anchors worked
+    Npc { level: u32, #[arg(default_value_t = 30.0)] secs: f32,
+        /// only characters whose id contains this text
+        #[arg(short, long, default_value = "")] filter: String },
     /// Parse level scene definitions (`graph/levels/levelN/levelN.dlf`); no argument = all levels
     Dlf { level: Option<u32>, /// print every entity
         #[arg(short, long)] entities: bool },
@@ -140,6 +145,9 @@ fn main() -> Result<()> {
                 println!("  texture {i}: {t:?} -> {:?}", pak.find_texture(t));
             }
             println!("{} groups, {} actions, {} selections", m.groups.len(), m.actions.len(), m.selections.len());
+            for a in &m.actions { println!("  action {:?} at vertex {}", a.name, a.vertex); }
+            for sel in &m.selections { println!("  selection {:?}: {} vertices", sel.name, sel.vertices.len()); }
+            println!("  groups: {}", m.groups.iter().enumerate().map(|(i, g)| format!("{i}:{} (origin {})", g.name, g.origin)).collect::<Vec<_>>().join(", "));
             let (mn, mx) = m.vertices.iter().fold(([f32::MAX; 3], [f32::MIN; 3]), |(mut a, mut b), v| {
                 for i in 0..3 { a[i] = a[i].min(v.pos[i]); b[i] = b[i].max(v.pos[i]); }
                 (a, b)
@@ -764,6 +772,7 @@ TOTAL: {ents} entities ({with_script} class scripts, {with_over} instance script
             let t = arx_formats::tea::Tea::parse(&pak.read(&path)?)?;
             println!("{:?}: {} keyframes, {} groups ({} static), {:.2}s", t.name, t.frames.len(), t.group_count,
                 t.void_groups.iter().filter(|v| **v).count(), t.duration_us as f64 / 1e6);
+            println!("root translation over the whole animation: {:?}", t.frames.last().map(|f| f.translate));
             if let Some(model) = model {
                 let ftl = arx_formats::ftl::Ftl::parse(&pak.read(&model)?)?;
                 let sk = arx_formats::skeleton::Skeleton::from_ftl(&ftl);
@@ -782,6 +791,70 @@ TOTAL: {ents} entities ({with_script} class scripts, {with_over} instance script
                     println!("t={:.2}s bounds {:?} ({bad} non-finite)", tm as f64 / 1e6, b);
                 }
             }
+        }
+        Cmd::Npc { level, secs, filter } => {
+            use arx_level::npc::{Env, build_npcs};
+            let dlf = pak.load_dlf(level).map_err(anyhow::Error::msg)?;
+            let fts = arx_formats::fts::Fts::parse(&pak.read(&format!("game/graph/levels/level{level}/fast.fts"))?)?;
+            let pak = std::sync::Arc::new(pak);
+            let scene_pos = glam::Vec3::from(fts.scene_pos);
+            let mut collision = arx_physics::CollisionWorld::from_fts(&fts);
+            let mut s = arx_level::Scripts::build(&pak, &dlf, scene_pos);
+            let obstacles = arx_level::EntityObstacles::build(&mut collision, &pak, &dlf, scene_pos, &s.world, &s.host, &s.ids);
+            let mut npcs = build_npcs(&pak, &fts.anchors, scene_pos, &dlf, &s.ids, &s.world, &obstacles, &collision);
+            npcs.active_range = f32::MAX;
+            let g = npcs.graph();
+            let usable = g.anchors.iter().filter(|a| !a.links.is_empty() && !a.blocked).count();
+            println!("level {level}: {} anchors ({usable} linked and open), {} characters", g.anchors.len(), npcs.iter().count());
+            if !g.anchors.is_empty() {
+                let mut h: Vec<f32> = g.anchors.iter().map(|a| a.height).collect();
+                let mut r: Vec<f32> = g.anchors.iter().map(|a| a.radius).collect();
+                h.sort_by(f32::total_cmp);
+                r.sort_by(f32::total_cmp);
+                let q = |v: &[f32], f: f32| v[((v.len() - 1) as f32 * f) as usize];
+                println!("  anchor height min/median/max {:.0}/{:.0}/{:.0}, radius {:.0}/{:.0}/{:.0}", h[0], q(&h, 0.5), h[h.len() - 1], r[0], q(&r, 0.5), r[r.len() - 1]);
+            }
+            let start: Vec<(u32, glam::Vec3)> = npcs.iter().map(|n| (n.id, n.pos)).collect();
+            let mut events = std::collections::BTreeMap::<String, usize>::new();
+            let frames = (secs * 30.0) as usize;
+            let far = glam::Vec3::new(1.0e7, 0.0, 1.0e7);
+            s.world.entity_mut(s.player).pos = far.to_array();
+            for _ in 0..frames {
+                let env = Env { collision: &collision, player_pos: far, player_alive: true, player_stealth: 15.0, player_light: 255.0, player_torch: false };
+                npcs.update(&mut s.world, &mut s.host, &env, 1000.0 / 30.0);
+                s.world.update(&mut s.host, 1000.0 / 30.0);
+                let _ = &mut events;
+            }
+            let mut by_behavior = std::collections::BTreeMap::<u32, usize>::new();
+            let mut moving = 0;
+            for (id, p0) in &start {
+                let n = npcs.npc(*id).expect("registered");
+                *by_behavior.entry(n.behavior).or_default() += 1;
+                let e = s.world.entity(*id);
+                if !e.id_string.contains(&filter) { continue; }
+                let walked = (n.pos - *p0).length();
+                if walked > 20.0 { moving += 1; }
+                if n.behavior != arx_level::npc::behavior::NONE || !filter.is_empty() {
+                    if !filter.is_empty() {
+                        if let Some((pts, at, target)) = npcs.route_of(*id) {
+                            println!("    target {:.0},{:.0},{:.0}; at {:.0},{:.0},{:.0}; route node {at} of {}: {:?}", target.x, target.y, target.z, n.pos.x, n.pos.y, n.pos.z, pts.len(),
+                                pts.iter().map(|p| format!("{:.0},{:.0},{:.0}", p.x, p.y, p.z)).collect::<Vec<_>>());
+                        }
+                    }
+                    println!("  {:<28} behavior {:>5} {:<9} anim {:<14} moved {:>6.0}  life {:>4.0}  route {}",
+                        e.id_string, n.behavior, format!("{:?}", n.move_mode), n.animation().unwrap_or("-"), walked, n.life,
+                        if n.is_traveling() { "yes" } else { "no" });
+                }
+            }
+            println!("{} of {} characters moved more than 20 units in {secs} s", moving, start.len());
+            let fell: Vec<String> = start.iter().filter_map(|(id, p0)| {
+                let n = npcs.npc(*id)?;
+                ((n.pos.y - p0.y).abs() > 150.0 || !n.on_ground()).then(|| format!("{} (y {:.0} -> {:.0}, ground {})", s.world.entity(*id).id_string, p0.y, n.pos.y, n.on_ground()))
+            }).collect();
+            if !fell.is_empty() { println!("  off the floor or fallen: {fell:?}"); }
+            println!("behaviour flags in use: {by_behavior:?}");
+            let w = &s.world.stats.warnings;
+            for (k, n) in w.iter().filter(|(k, _)| k.contains("pathfind") || k.contains("anim")).take(8) { println!("  warning x{n}: {k}"); }
         }
         Cmd::Dlf { level, entities } => {
             let levels: Vec<u32> = (0..=30).filter(|l| level.is_none_or(|x| x == *l) && pak.contains(&format!("graph/levels/level{l}/level{l}.dlf"))).collect();
