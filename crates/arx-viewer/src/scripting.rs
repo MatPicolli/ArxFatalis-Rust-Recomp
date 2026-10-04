@@ -167,6 +167,7 @@ pub fn interact(
     pickables: Res<Pickables>,
     mut ui: ResMut<crate::hud::Ui>,
     speech: Res<Speech>,
+    npcs: Res<crate::npcs::Npcs>,
     mut s: ResMut<Scripting>,
 ) {
     let s = &mut *s;
@@ -203,6 +204,16 @@ pub fn interact(
         inventory::combine(&mut s.world, &mut s.host, player, held, target);
         if !s.host.player.inventory.contains(&held) {
             ui.held = None;
+        }
+        return;
+    }
+    // A dead character is searched like a chest.
+    let dead = npcs.0.as_ref().and_then(|n| n.npc(target)).is_some_and(|n| n.dead);
+    if dead && s.host.containers.contains_key(&target) {
+        if s.host.open_container == Some(target) {
+            inventory::close_container(&mut s.world, &mut s.host, player);
+        } else {
+            inventory::open_container(&mut s.world, &mut s.host, player, target);
         }
         return;
     }
