@@ -102,6 +102,8 @@ pub struct EntityState {
     pub cam_translate: [f32; 3],
     /// Cannot be hurt (`invulnerability on`).
     pub invulnerable: bool,
+    /// Casts a shadow on the floor (`setshadow off` removes it).
+    pub shadow: bool,
 }
 
 impl Default for EntityState {
@@ -145,6 +147,7 @@ impl Default for EntityState {
             cam_smoothing: 0.0,
             cam_translate: [0.0; 3],
             invulnerable: false,
+            shadow: true,
         }
     }
 }
@@ -1138,6 +1141,11 @@ impl Host for StdHost {
                 } else if name == "preload" {
                     a.skip_word();
                 }
+                CmdResult::Success
+            }
+            "setshadow" => {
+                let on = a.get_bool();
+                self.state_mut(me).shadow = on;
                 CmdResult::Success
             }
             "setcontrolledzone" => {

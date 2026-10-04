@@ -379,6 +379,9 @@ pub fn spawn_entity(
         ScriptRef(script_id),
         BaseAngle { angle: angle, npc: class.contains("/npc/") },
     ));
+    if st.shadow {
+        parent.insert(crate::shadows::Shadow::from_model(&ftl, scale));
+    }
     parent.with_children(|p| {
         for bundle in parent_children {
             if animated {
@@ -399,7 +402,8 @@ pub fn spawn_entity(
             looping,
             root_motion: !class.contains("/npc/"),
             overlay: None,
-            keep_pose: false,
+            // Jointed models keep their pose so their shadows can follow their limbs.
+            keep_pose: ftl.groups.len() > 1,
             pose: None,
         });
         stats.animated += 1;

@@ -22,6 +22,7 @@ mod hud_ui;
 mod level;
 mod lighting;
 mod scripting;
+mod shadows;
 mod speech;
 mod steps;
 
@@ -551,12 +552,13 @@ fn run_level(args: Args, pak: PakSet) {
     .insert_resource(cutscene::Stage(Default::default(), args.no_cutscenes))
     .insert_resource(lighting::LevelLighting::default())
     .insert_resource(particles::Particles::default())
+    .insert_resource(shadows::Shadows::default())
     .insert_resource(player_body::PlayerBody::default())
     .insert_resource(player_body::Combat::default())
     .insert_resource(audio::Sounds::new(args.mute))
     .insert_resource(speech::Speech::new(locale, args.language.clone(), !args.no_subtitles, args.mute))
     .add_systems(Startup, (hud_ui::load_font, speech::spawn_ui).chain())
-    .add_systems(Startup, (steps::load, cutscene::spawn_ui, particles::setup))
+    .add_systems(Startup, (steps::load, cutscene::spawn_ui, particles::setup, shadows::setup))
     .insert_resource(steps::StepSounds::default())
     .insert_resource(drag::ItemBodies::default())
     .insert_resource(hud_ui::UiFont::default())
@@ -602,6 +604,7 @@ fn run_level(args: Args, pak: PakSet) {
             player_body::drive,
             hud_ui::draw,
             animated::animate,
+            shadows::update,
             player_body::attach,
             cutscene::camera,
             cutscene::overlay,

@@ -152,7 +152,7 @@ fn main() -> Result<()> {
                 for &v in &sel.vertices { for k in 0..3 { lo[k] = lo[k].min(m.vertices[v as usize].pos[k]); hi[k] = hi[k].max(m.vertices[v as usize].pos[k]); } }
                 println!("  selection {:?}: {} vertices, bounds {lo:.0?} .. {hi:.0?}", sel.name, sel.vertices.len());
             }
-            println!("  groups: {}", m.groups.iter().enumerate().map(|(i, g)| format!("{i}:{} (origin {})", g.name, g.origin)).collect::<Vec<_>>().join(", "));
+            println!("  groups: {}", m.groups.iter().enumerate().map(|(i, g)| format!("{i}:{} (origin {}, shadow {})", g.name, g.origin, g.blob_shadow_size)).collect::<Vec<_>>().join(", "));
             let (mn, mx) = m.vertices.iter().fold(([f32::MAX; 3], [f32::MIN; 3]), |(mut a, mut b), v| {
                 for i in 0..3 { a[i] = a[i].min(v.pos[i]); b[i] = b[i].max(v.pos[i]); }
                 (a, b)
