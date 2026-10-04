@@ -46,6 +46,8 @@ cargo run --release -p arx-cli -- fixtures       # trigger every fixture (doors,
 cargo run -p arx-viewer -- level 1 --start dlf   # start at the level file's editor camera instead
 cargo run -p arx-viewer -- level 1 --cam 8650,-6000,8550 --look 0,-89   # Arx coords, yaw,pitch degrees
 cargo run --release -p arx-cli -- npc 1 40              # run level 1's characters for 40 s headlessly: who walks, patrols, fights (-f <id> shows a route)
+cargo run --release -p arx-cli -- tweaks                # build every model the scripts changed (heads, clothes, skins) and report what failed
+ARX_LOG_FPS=1 cargo run --release -p arx-viewer -- level 1 --no-menu   # print the frame rate and what each system costs
 ARX_LOG_NPC=goblin_base_0049 cargo run -p arx-viewer -- level 1 --focus goblin_base_0049   # log a character's commands and state once a second
 cargo run -p arx-viewer -- level 1 --cam 9543,2945,5800 --look 180,-5 --equip short_sword_0005 --draw-weapon --attack-test --shot shots/fight.png   # first-person combat, scripted
 ```

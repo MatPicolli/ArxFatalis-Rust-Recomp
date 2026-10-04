@@ -54,6 +54,8 @@ pub struct ScriptEntity {
     pub disabled_events: HashSet<String>,
     pub timer_slots: [Option<f64>; 4],
     pub main_event: Option<String>,
+    /// A character that has died: it hears nothing any more but `dead`, `die` and being searched.
+    pub dead: bool,
     pub groups: HashSet<String>,
     /// World position (Arx coordinates), for distance queries.
     pub pos: [f32; 3],
@@ -158,6 +160,7 @@ impl ScriptWorld {
             disabled_events: HashSet::new(),
             timer_slots: [None; 4],
             main_event: None,
+            dead: false,
             groups: HashSet::new(),
             pos: [0.0; 3],
         });
@@ -210,6 +213,11 @@ impl ScriptWorld {
         params: Vec<String>,
     ) -> ScriptResult {
         let event = event.to_ascii_lowercase();
+        // The dead do not react (the engine drops every other event for a character without life), or a corpse
+        // would stand up as soon as a script told its group to do something.
+        if self.entity(target).dead && !matches!(event.as_str(), "dead" | "die" | "executeline" | "reload" | "inventory2_open" | "inventory2_close") {
+            return ScriptResult::Accept;
+        }
         let over = self.entity(target).over_script.clone();
         if let Some(s) = over {
             let r = run_event(self, host, &s, sender, target, &event, params.clone(), 0, false);

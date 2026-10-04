@@ -63,7 +63,7 @@ pub fn setup(mut commands: Commands, mut shadows: ResMut<Shadows>, mut meshes: R
 
 /// Lay a blob on the floor under every spot of every visible thing near the camera.
 pub fn update(
-    cam: Single<&Transform, With<Camera3d>>,
+    cam: Single<&Transform, (With<Camera3d>, Without<crate::book_hero::BookCamera>)>,
     fly: Res<Fly>,
     shadows: Res<Shadows>,
     casters: Query<(&Shadow, &Transform, &InheritedVisibility, Option<&Animated>)>,

@@ -128,7 +128,7 @@ pub fn debug_pickup(
     mut frames: Local<u32>,
     args: Res<crate::LevelArgs>,
     fly: Res<Fly>,
-    cam: Single<&Transform, With<Camera3d>>,
+    cam: Single<&Transform, (With<Camera3d>, Without<crate::book_hero::BookCamera>)>,
     mut s: ResMut<Scripting>,
     mut ui: ResMut<Ui>,
 ) {
@@ -187,7 +187,7 @@ pub fn debug_pickup(
 pub fn input(
     keys: Res<ButtonInput<KeyCode>>,
     fly: Res<Fly>,
-    cam: Single<&Transform, With<Camera3d>>,
+    cam: Single<&Transform, (With<Camera3d>, Without<crate::book_hero::BookCamera>)>,
     mut ui: ResMut<Ui>,
     mut s: ResMut<Scripting>,
     speech: Res<Speech>,

@@ -500,7 +500,7 @@ pub fn mouse(
     buttons: Res<ButtonInput<MouseButton>>,
     shot: Option<Res<crate::Shot>>,
     fly: Res<Fly>,
-    camera: Single<(&Camera, &GlobalTransform), With<Camera3d>>,
+    camera: Single<(&Camera, &GlobalTransform), (With<Camera3d>, Without<crate::book_hero::BookCamera>)>,
     pickables: Res<crate::scripting::Pickables>,
     mut bodies: ResMut<crate::drag::ItemBodies>,
     speech: Res<Speech>,
@@ -736,6 +736,7 @@ pub fn draw(
     font: Res<UiFont>,
     buttons: Res<ButtonInput<MouseButton>>,
     combat: Res<crate::player_body::Combat>,
+    hero: Res<crate::book_hero::BookHero>,
 ) {
     for e in &old {
         commands.entity(e).despawn();
@@ -898,6 +899,10 @@ pub fn draw(
         };
         if let Some(tex) = assets.get(&arx, &mut images, bg) {
             c.image(&tex, bk);
+        }
+        // The hero, standing on the left page.
+        if let (BookPage::Stats, Some((part, area))) = (page, hero.shown) {
+            c.items.push(Item::Image { tex: hero.image.clone(), at: local_rect(area.min, area.size()), part: Some(part), tint: Color::WHITE });
         }
         // Bookmarks to the other pages.
         for (slot, name, target) in [(0, "book/bookmark_char", BookPage::Stats), (3, "book/bookmark_quest", BookPage::Quests)] {

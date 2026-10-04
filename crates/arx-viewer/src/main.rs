@@ -9,6 +9,7 @@
 mod anims;
 mod animated;
 mod audio;
+mod book_hero;
 mod convert;
 mod cutscene;
 mod entities;
@@ -403,7 +404,7 @@ fn orbit_camera(
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
     mut orbit: ResMut<Orbit>,
-    mut cam: Single<&mut Transform, With<Camera3d>>,
+    mut cam: Single<&mut Transform, (With<Camera3d>, Without<crate::book_hero::BookCamera>)>,
 ) {
     if mouse.pressed(MouseButton::Left) {
         orbit.yaw -= motion.delta.x * 0.005;
@@ -500,6 +501,8 @@ struct Fly {
     /// Radians turned per pixel of mouse movement, and whether up is down (the options menu).
     mouse_speed: f32,
     invert_mouse: bool,
+    /// A script's animation is moving the hero (being dragged): the body's own physics is off meanwhile.
+    posed: bool,
 }
 
 /// A system followed by the mark that charges its time to `name` (see `perf`).
@@ -596,6 +599,7 @@ fn run_level(args: Args, pak: PakSet) {
         crouch_toggle: false,
         mouse_speed: 0.003,
         invert_mouse: false,
+        posed: false,
     })
     .add_systems(Startup, setup_level)
     .insert_resource(scripting::Scripting::default())
@@ -607,6 +611,7 @@ fn run_level(args: Args, pak: PakSet) {
     .insert_resource(menu::Menu::new(start_screen, options, persistent, args.menu_do.iter().filter_map(|n| menu::Action::from_name(n)).collect()))
     .insert_resource(lighting::LevelLighting::default())
     .insert_resource(perf::Perf::default())
+    .insert_resource(book_hero::BookHero::default())
     .insert_resource(particles::Particles::default())
     .insert_resource(shadows::Shadows::default())
     .insert_resource(player_body::PlayerBody::default())
@@ -614,7 +619,7 @@ fn run_level(args: Args, pak: PakSet) {
     .insert_resource(audio::Sounds::new(args.mute))
     .insert_resource(speech::Speech::new(locale, args.language.clone(), !args.no_subtitles, args.mute))
     .add_systems(Startup, (hud_ui::load_font, speech::spawn_ui).chain())
-    .add_systems(Startup, (steps::load, cutscene::spawn_ui, particles::setup, shadows::setup))
+    .add_systems(Startup, (steps::load, cutscene::spawn_ui, particles::setup, shadows::setup, book_hero::setup))
     .insert_resource(steps::StepSounds::default())
     .insert_resource(drag::ItemBodies::default())
     .insert_resource(hud_ui::UiFont::default())
@@ -622,7 +627,7 @@ fn run_level(args: Args, pak: PakSet) {
     .insert_resource(hud_ui::UiAssets::default())
     .add_systems(
         Update,
-        (perf::begin, timed!(menu::update, "menu::update"), (hud_ui::mouse, hud_ui::draw).chain().run_if(menu::creating), ((
+        (perf::begin, timed!(menu::update, "menu::update"), (hud_ui::mouse, book_hero::update, hud_ui::draw, animated::animate).chain().run_if(menu::creating), ((
             timed!(scripting::tick, "scripting::tick"),
             timed!(npcs::zones, "npcs::zones"),
             timed!(npcs::update, "npcs::update"),
@@ -631,6 +636,7 @@ fn run_level(args: Args, pak: PakSet) {
             timed!(speech::debug_say, "speech::debug_say"),
             timed!(speech::update, "speech::update"),
             timed!(entities::spawn_dropped, "entities::spawn_dropped"),
+            timed!(entities::respawn, "entities::respawn"),
             timed!(scripting::apply_state, "scripting::apply_state"),
             timed!(npcs::apply, "npcs::apply"),
             timed!(npcs::log, "npcs::log"),
@@ -658,6 +664,7 @@ fn run_level(args: Args, pak: PakSet) {
             timed!(lighting::update, "lighting::update"),
             timed!(particles::update, "particles::update"),
             timed!(player_body::drive, "player_body::drive"),
+            timed!(book_hero::update, "book_hero::update"),
             timed!(hud_ui::draw, "hud_ui::draw"),
             timed!(animated::animate, "animated::animate"),
             timed!(shadows::update, "shadows::update"),
@@ -873,7 +880,7 @@ fn fly_camera(
     scroll: Res<AccumulatedMouseScroll>,
     mut fly: ResMut<Fly>,
     mut cursor: Single<&mut CursorOptions, With<Window>>,
-    mut cam: Single<&mut Transform, With<Camera3d>>,
+    mut cam: Single<&mut Transform, (With<Camera3d>, Without<crate::book_hero::BookCamera>)>,
     shot: Option<Res<Shot>>,
     mut script: ResMut<scripting::Scripting>,
     mut ui: ResMut<hud::Ui>,
@@ -945,7 +952,9 @@ fn fly_camera(
         input.crouch = !dead && (keys.pressed(KeyCode::KeyX) || fly.crouch_toggle);
         input.jump = !dead && keys.pressed(KeyCode::Space);
         let world = fly.world.clone().unwrap();
-        fly.player.step(&world, dt, input);
+        if !fly.posed {
+            fly.player.step(&world, dt, input);
+        }
         // A long fall hurts: (height - 400) / 15 life.
         if let Some(height) = fly.player.take_landing() {
             let damage = arx_physics::fall_damage(height);

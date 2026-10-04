@@ -57,7 +57,7 @@ const FAR: f32 = 3500.0;
 
 pub fn animate(
     time: Res<Time>,
-    cam: Single<&Transform, With<Camera3d>>,
+    cam: Single<&Transform, (With<Camera3d>, Without<crate::book_hero::BookCamera>)>,
     mut query: Query<(Entity, &mut Animated, Option<&GlobalTransform>)>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut frame: Local<u32>,

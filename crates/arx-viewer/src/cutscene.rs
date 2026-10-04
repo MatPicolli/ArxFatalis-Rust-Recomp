@@ -78,7 +78,8 @@ pub fn update(time: Res<Time>, mut stage: ResMut<Stage>, mut npcs: ResMut<Npcs>,
                 fly.player = arx_physics::Player::new(feet);
                 fly.pos = fly.player.eye();
                 if let Some(yaw) = yaw {
-                    fly.yaw = std::f32::consts::PI - yaw.to_radians();
+                    // The engine's player yaw turns the same way as ours: forward is (-sin, cos) in Arx x/z.
+                    fly.yaw = yaw.to_radians();
                 }
                 let player = s.player;
                 s.world.entity_mut(player).pos = pos.to_array();
@@ -139,7 +140,7 @@ pub fn overlay(
 }
 
 /// See the scene through the scripts' camera while one is active; otherwise leave the hero's eyes alone.
-pub fn camera(time: Res<Time>, mut stage: ResMut<Stage>, s: Res<Scripting>, mut cam: Single<(&mut Transform, &mut Projection), With<Camera3d>>) {
+pub fn camera(time: Res<Time>, mut stage: ResMut<Stage>, s: Res<Scripting>, mut cam: Single<(&mut Transform, &mut Projection), (With<Camera3d>, Without<crate::book_hero::BookCamera>)>) {
     let dt_ms = time.delta_secs().min(0.1) * 1000.0;
     let view = stage.0.camera_view(&s.world, &s.host, dt_ms);
     let (tf, projection) = &mut *cam;

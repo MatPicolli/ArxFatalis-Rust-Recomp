@@ -79,7 +79,7 @@ pub fn setup(mut commands: Commands, arx: Res<Arx>, mut particles: ResMut<Partic
 }
 
 /// Spawn flames at the lit fires near the camera, move every particle on, and rebuild the two meshes.
-pub fn update(time: Res<Time>, cam: Single<&Transform, With<Camera3d>>, lighting: Res<LevelLighting>, mut particles: ResMut<Particles>, mut meshes: ResMut<Assets<Mesh>>) {
+pub fn update(time: Res<Time>, cam: Single<&Transform, (With<Camera3d>, Without<crate::book_hero::BookCamera>)>, lighting: Res<LevelLighting>, mut particles: ResMut<Particles>, mut meshes: ResMut<Assets<Mesh>>) {
     if crate::perf::skip("particles") {
         return;
     }

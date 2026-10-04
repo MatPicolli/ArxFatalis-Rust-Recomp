@@ -5,9 +5,7 @@
 //! systems do not run at all, so nothing moves and no script advances.
 
 use crate::audio::Sounds;
-use crate::convert::{TextureCache, load_texture};
 use crate::cutscene::Stage;
-use crate::entities::EntityCache;
 use crate::hud::Ui;
 use crate::hud_book::{self, BookPage};
 use crate::hud_ui::{UiAssets, UiFont, interface_scale};
@@ -461,9 +459,6 @@ pub struct Gfx<'w> {
     assets: ResMut<'w, UiAssets>,
     images: ResMut<'w, Assets<Image>>,
     font: Res<'w, UiFont>,
-    materials: ResMut<'w, Assets<StandardMaterial>>,
-    ecache: Res<'w, EntityCache>,
-    tcache: ResMut<'w, TextureCache>,
     audio: ResMut<'w, Assets<AudioSource>>,
 }
 
@@ -484,22 +479,6 @@ fn apply(o: &Options, game: &mut Game, window: &mut Window) {
     let present = if o.on(Opt::Vsync) { PresentMode::AutoVsync } else { PresentMode::AutoNoVsync };
     if window.present_mode != present {
         window.present_mode = present;
-    }
-}
-
-/// The hero's face: the head texture of the body is swapped for the chosen one (`ARX_PLAYER_Restore_Skin`).
-fn apply_skin(skin: u8, gfx: &mut Gfx) {
-    let name = match skin {
-        0 => "graph/obj3d/textures/npc_human_base_hero_head",
-        1 => "graph/obj3d/textures/npc_human_base_hero2_head",
-        2 => "graph/obj3d/textures/npc_human_base_hero3_head",
-        _ => "graph/obj3d/textures/npc_human_base_hero4_head",
-    };
-    let Some(tex) = load_texture(&gfx.arx.0, name, &mut gfx.tcache, &mut gfx.images) else { return };
-    for handle in gfx.ecache.materials_with("hero_head") {
-        if let Some(mut m) = gfx.materials.get_mut(&handle) {
-            m.base_color_texture = Some(tex.handle.clone());
-        }
     }
 }
 
@@ -731,9 +710,11 @@ pub fn update(
             game.s.host.player.skin = skin;
         }
         Action::Skin => {
-            let skin = (game.s.host.player.skin + 1) % 4;
-            game.s.host.player.skin = skin;
-            apply_skin(skin, &mut gfx);
+            let player = game.s.player;
+            let host = &mut game.s.host;
+            host.player.skin = (host.player.skin + 1) % 4;
+            host.player_entity = Some(player);
+            host.refresh_player_model();
         }
         Action::Done => {
             if can_finish {

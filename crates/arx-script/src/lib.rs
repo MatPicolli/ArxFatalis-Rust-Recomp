@@ -13,7 +13,7 @@ mod text;
 mod vars;
 mod world;
 
-pub use host::{AnimDuration, Carry, EquipValue, Fade, Stage, StageRequest, object_type, NpcRequest, TargetSpec, IconSize, is_gold_class, NoteKind, NoteRequest, ScriptLoader, EntityState, Mood, PlayAnim, SoundRequest, SpeechEvent, SpeechFlags, SpeechRequest, StdHost};
+pub use host::{Tweak, body_part, AnimDuration, Carry, EquipValue, Fade, Stage, StageRequest, object_type, NpcRequest, TargetSpec, IconSize, is_gold_class, NoteKind, NoteRequest, ScriptLoader, EntityState, Mood, PlayAnim, SoundRequest, SpeechEvent, SpeechFlags, SpeechRequest, StdHost};
 pub use interp::{Args, CmdResult, Context, Host, ScriptResult, has_flag};
 pub use player::{Attribute, Attributes, EquipMods, EquipSlot, FullAttributes, BAG_HEIGHT, BAG_WIDTH, MAX_BAGS, Misc, PlayerState, Pool, Skill, Skills, Slot, xp_for_level};
 pub use text::Script;

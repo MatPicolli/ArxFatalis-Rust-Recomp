@@ -168,7 +168,7 @@ pub fn pick_ray(pickables: &Pickables, s: &Scripting, origin: Vec3, dir: Vec3, r
 /// otherwise pick up items, talk to people, and send `action` to everything else.
 pub fn interact(
     keys: Res<ButtonInput<KeyCode>>,
-    cam: Single<&Transform, With<Camera3d>>,
+    cam: Single<&Transform, (With<Camera3d>, Without<crate::book_hero::BookCamera>)>,
     pickables: Res<Pickables>,
     mut ui: ResMut<crate::hud::Ui>,
     speech: Res<Speech>,

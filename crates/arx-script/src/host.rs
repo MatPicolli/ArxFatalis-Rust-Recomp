@@ -31,6 +31,26 @@ pub struct EquipValue {
     pub percent: bool,
 }
 
+/// Body parts a mesh tweak replaces (bits of [`Tweak::Part::parts`]).
+pub mod body_part {
+    pub const HEAD: u8 = 1;
+    pub const TORSO: u8 = 2;
+    pub const LEGS: u8 = 4;
+    pub const ALL: u8 = 7;
+}
+
+/// A change scripts made to how an entity's model looks (`tweak`), applied in order when the model is built.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Tweak {
+    /// Draw the texture `to` wherever the model uses `from` (file names without folder or extension).
+    Skin { from: String, to: String },
+    /// Take the head, torso and/or legs from another model (a virtual path without extension); all three together
+    /// replace the model.
+    Part { parts: u8, mesh: String },
+    /// Back to the untouched model.
+    Remove,
+}
+
 #[derive(Debug, Clone)]
 pub struct PlayAnim {
     /// Slot name (`wait`, `action1`, `die`, ...).
@@ -104,6 +124,13 @@ pub struct EntityState {
     pub invulnerable: bool,
     /// Casts a shadow on the floor (`setshadow off` removes it).
     pub shadow: bool,
+    /// What scripts changed about the model's looks, in order (`tweak`).
+    pub tweaks: Vec<Tweak>,
+    /// Bumped whenever the model itself changes (`usemesh`, `tweak`), so the renderer can build it again.
+    pub model_serial: u32,
+    /// Armour: what wearing it does to the hero's model (`setplayertweak mesh` / `skin`).
+    pub player_tweak_mesh: Option<String>,
+    pub player_tweak_skin: Option<(String, String)>,
 }
 
 impl Default for EntityState {
@@ -148,6 +175,10 @@ impl Default for EntityState {
             cam_translate: [0.0; 3],
             invulnerable: false,
             shadow: true,
+            tweaks: Vec::new(),
+            model_serial: 0,
+            player_tweak_mesh: None,
+            player_tweak_skin: None,
         }
     }
 }
@@ -345,6 +376,8 @@ pub type AnimDuration = Box<dyn Fn(&str) -> Option<f64> + Send + Sync>;
 
 #[derive(Default)]
 pub struct StdHost {
+    /// The hero's entity, once known (the host is told by whoever has the world).
+    pub player_entity: Option<EntityId>,
     states: Vec<EntityState>,
     anim_duration: Option<AnimDuration>,
     sounds: Vec<SoundRequest>,
@@ -596,6 +629,7 @@ impl StdHost {
     pub fn equip(&mut self, world: &mut ScriptWorld, item: EntityId) {
         use object_type as t;
         let Some(player) = world.player else { return };
+        self.player_entity = Some(player);
         let flags = self.state(item).map_or(0, |s| s.type_flags);
         if flags & (t::HELD | t::SHIELD | t::RING | t::ARMOR | t::LEGGINGS | t::HELMET) == 0 || self.player.is_equipped(item) {
             return;
@@ -650,6 +684,7 @@ impl StdHost {
     /// (`destroyed` items are just gone). Both it and the hero's script hear `equipout`.
     pub fn unequip(&mut self, world: &mut ScriptWorld, item: EntityId, destroyed: bool) {
         let Some(player) = world.player else { return };
+        self.player_entity = Some(player);
         let Some(i) = self.player.equipped.iter().position(|&e| e == Some(item)) else { return };
         self.player.equipped[i] = None;
         self.modify(item, |s| s.equipped = false);
@@ -695,6 +730,34 @@ impl StdHost {
         }
         self.player.mods = mods;
         self.player.recompute();
+        self.refresh_player_model();
+    }
+
+    /// The hero's model follows what is worn and the face chosen (`ARX_EQUIPMENT_RecreatePlayerMesh`,
+    /// `ARX_PLAYER_Restore_Skin`): a helmet replaces the head, armour the torso, leggings the legs.
+    pub fn refresh_player_model(&mut self) {
+        let Some(player) = self.player_entity else { return };
+        let mut tweaks = Vec::new();
+        for (slot, parts) in [(EquipSlot::Helmet, body_part::HEAD), (EquipSlot::Armor, body_part::TORSO), (EquipSlot::Leggings, body_part::LEGS)] {
+            let Some(st) = self.player.equipped_in(slot).and_then(|i| self.state(i)) else { continue };
+            if let Some(mesh) = &st.player_tweak_mesh {
+                tweaks.push(Tweak::Part { parts, mesh: format!("graph/obj3d/interactive/npc/human_base/tweaks/{mesh}") });
+            }
+            if let Some((from, to)) = &st.player_tweak_skin {
+                tweaks.push(Tweak::Skin { from: from.clone(), to: to.clone() });
+            }
+        }
+        if (1..=3).contains(&self.player.skin) {
+            let n = self.player.skin + 1;
+            for kind in ["base", "chainmail", "chainmail_mithril", "leather"] {
+                tweaks.push(Tweak::Skin { from: format!("npc_human_{kind}_hero_head"), to: format!("npc_human_{kind}_hero{n}_head") });
+            }
+        }
+        if self.state(player).is_none_or(|s| s.tweaks != tweaks) {
+            let st = self.state_mut(player);
+            st.tweaks = tweaks;
+            st.model_serial += 1;
+        }
     }
 
     /// The weapon the hero holds, if any.
@@ -723,7 +786,8 @@ impl StdHost {
     }
 
     /// Let scripts read the player's stats (`^player_life`, `^player_skill_mecanism`, ...).
-    pub fn publish_player(&self, world: &mut ScriptWorld) {
+    pub fn publish_player(&mut self, world: &mut ScriptWorld) {
+        self.player_entity = world.player;
         for (name, v) in self.player.script_vars() {
             world.sys.insert(name, crate::Value::Float(v));
         }
@@ -800,6 +864,22 @@ fn mesh_dir(kind: EntityKind) -> Option<&'static str> {
     }
 }
 
+/// A model name as scripts write it (`"Door_L2\\Door_L2.teo"`): lowercase, forward slashes, no extension.
+fn model_name(raw: &str) -> String {
+    let path = raw.to_ascii_lowercase().replace('\\', "/");
+    match path.strip_suffix(".teo").or_else(|| path.strip_suffix(".ftl")) {
+        Some(stem) => stem.to_owned(),
+        None => path,
+    }
+}
+
+/// A texture name as scripts write it: lowercase, no folder, no extension.
+fn texture_name(raw: &str) -> String {
+    let path = raw.to_ascii_lowercase().replace('\\', "/");
+    let file = path.rsplit('/').next().unwrap_or("");
+    file.rsplit_once('.').map_or(file, |(stem, _)| stem).to_owned()
+}
+
 fn anim_dir(kind: EntityKind) -> &'static str {
     if matches!(kind, EntityKind::Npc | EntityKind::Player) {
         "graph/obj3d/anims/npc"
@@ -814,12 +894,67 @@ impl Host for StdHost {
         Some(match name {
             "usemesh" => {
                 let raw = a.get_word();
-                let mut path = raw.to_ascii_lowercase().replace('\\', "/");
-                if let Some(stem) = path.strip_suffix(".teo").or_else(|| path.strip_suffix(".ftl")) {
-                    path = stem.to_owned();
-                }
+                let path = model_name(&raw);
                 if let Some(dir) = mesh_dir(a.world.entity(me).kind) {
-                    self.state_mut(me).mesh = Some(format!("{dir}/{path}"));
+                    let st = self.state_mut(me);
+                    st.mesh = Some(format!("{dir}/{path}"));
+                    st.model_serial += 1;
+                }
+                CmdResult::Success
+            }
+            "tweak" => {
+                let kind = a.get_word().to_ascii_lowercase();
+                let tweak = match kind.as_str() {
+                    "skin" => {
+                        let (from, to) = (texture_name(&a.get_word()), texture_name(&a.get_word()));
+                        if from.is_empty() || to.is_empty() {
+                            return Some(CmdResult::Failed);
+                        }
+                        Tweak::Skin { from, to }
+                    }
+                    "icon" => {
+                        a.skip_word();
+                        return Some(CmdResult::Success);
+                    }
+                    "remove" => Tweak::Remove,
+                    _ => {
+                        let parts = match kind.as_str() {
+                            "head" => body_part::HEAD,
+                            "torso" => body_part::TORSO,
+                            "legs" => body_part::LEGS,
+                            "all" => body_part::ALL,
+                            "upper" => body_part::HEAD | body_part::TORSO,
+                            "lower" => body_part::TORSO | body_part::LEGS,
+                            "up_lo" => body_part::HEAD | body_part::LEGS,
+                            _ => {
+                                a.warn(&format!("unknown tweak type: {kind}"));
+                                return Some(CmdResult::Failed);
+                            }
+                        };
+                        let name = model_name(&a.get_word());
+                        // Tweak models live next to the entity's own model (or the one `usemesh` gave it).
+                        let model = self.state(me).and_then(|s| s.mesh.clone()).unwrap_or_else(|| a.world.entity(me).class.clone());
+                        let dir = model.rsplit_once('/').map_or("", |(dir, _)| dir);
+                        Tweak::Part { parts, mesh: format!("{dir}/tweaks/{name}") }
+                    }
+                };
+                let st = self.state_mut(me);
+                if tweak == Tweak::Remove {
+                    st.tweaks.retain(|t| matches!(t, Tweak::Skin { .. }));
+                } else {
+                    st.tweaks.push(tweak);
+                }
+                st.model_serial += 1;
+                CmdResult::Success
+            }
+            "setplayertweak" => {
+                let kind = a.get_word().to_ascii_lowercase();
+                if kind == "skin" {
+                    let (from, to) = (texture_name(&a.get_word()), texture_name(&a.get_word()));
+                    self.state_mut(me).player_tweak_skin = Some((from, to));
+                } else {
+                    let mesh = model_name(&a.get_word());
+                    self.state_mut(me).player_tweak_mesh = Some(mesh);
                 }
                 CmdResult::Success
             }
@@ -872,11 +1007,20 @@ impl Host for StdHost {
                 CmdResult::Success
             }
             "loadanim" => {
+                // `-p` loads it for the hero instead (cutscenes make the hero lie, sit or be dragged).
+                let flags = a.get_flags();
+                let mut entity = me;
+                if has_flag(&flags, 'p') {
+                    match a.world.player {
+                        Some(p) => entity = p,
+                        None => return Some(CmdResult::Failed),
+                    }
+                }
                 let slot = a.get_word();
                 let file = a.get_word().to_ascii_lowercase();
                 let slot = slot.to_ascii_lowercase();
-                let dir = anim_dir(a.world.entity(me).kind);
-                let st = self.state_mut(me);
+                let dir = anim_dir(a.world.entity(entity).kind);
+                let st = self.state_mut(entity);
                 if file == "none" {
                     st.anims.remove(&slot);
                 } else {
@@ -1523,6 +1667,56 @@ mod tests {
         let mut w = ScriptWorld::new();
         let id = w.add_entity(kind, class, 1, Some(Arc::new(Script::new(src.as_bytes()))), None);
         (w, StdHost::new(), id)
+    }
+
+    #[test]
+    fn scripts_change_a_models_looks_and_pose_the_hero() {
+        let mut w = ScriptWorld::new();
+        let mut h = StdHost::new();
+        let player = w.add_entity(EntityKind::Player, "graph/obj3d/interactive/player/player", 1, None, None);
+        w.player = Some(player);
+        let src = "on init {\n tweak head \"Human_Kultar\"\n tweak skin \"NPC_HUMAN_BASE_HERO_HEAD\" \"npc_human_base_kultar_head.bmp\"\n tweak icon \"x[icon]\"\n tweak lower \"human_chainmail\"\n loadanim -p action3 \"Human_normal_lay_cycle\"\n playanim -pl action3\n accept\n}\non custom {\n inc \u{a7}heard 1\n accept\n}";
+        let old = w.add_entity(
+            EntityKind::Npc,
+            "graph/obj3d/interactive/npc/human_base/human_base",
+            25,
+            Some(Arc::new(Script::new(&src.chars().map(|c| c as u8).collect::<Vec<u8>>()))),
+            None,
+        );
+        w.send_init(&mut h, old);
+        let st = h.state(old).unwrap();
+        let dir = "graph/obj3d/interactive/npc/human_base/tweaks";
+        assert_eq!(
+            st.tweaks,
+            [
+                Tweak::Part { parts: body_part::HEAD, mesh: format!("{dir}/human_kultar") },
+                Tweak::Skin { from: "npc_human_base_hero_head".into(), to: "npc_human_base_kultar_head".into() },
+                Tweak::Part { parts: body_part::TORSO | body_part::LEGS, mesh: format!("{dir}/human_chainmail") },
+            ]
+        );
+        assert_eq!(st.model_serial, 3);
+        // The animation went to the hero, not to the one whose script it is.
+        assert!(st.anims.is_empty() && st.playing.is_none());
+        let hero = h.state(player).unwrap();
+        assert_eq!(hero.anims["action3"], "graph/obj3d/anims/npc/human_normal_lay_cycle.tea");
+        assert_eq!(hero.playing.as_ref().map(|p| (p.slot.as_str(), p.looping)), Some(("action3", true)));
+        // A dead character hears nothing but its death.
+        w.send_event(&mut h, None, old, "custom", vec![]);
+        assert_eq!(w.entity(old).vars.get_int("\u{a7}heard"), 1);
+        w.entity_mut(old).dead = true;
+        w.send_event(&mut h, None, old, "custom", vec![]);
+        assert_eq!(w.entity(old).vars.get_int("\u{a7}heard"), 1, "not heard a second time");
+
+        // The hero's own model: the face chosen, and what armour does to it.
+        h.player_entity = Some(player);
+        h.player.skin = 2;
+        h.refresh_player_model();
+        let hero = h.state(player).unwrap();
+        assert_eq!(hero.tweaks.len(), 4);
+        assert_eq!(hero.tweaks[0], Tweak::Skin { from: "npc_human_base_hero_head".into(), to: "npc_human_base_hero3_head".into() });
+        let serial = hero.model_serial;
+        h.refresh_player_model();
+        assert_eq!(h.state(player).unwrap().model_serial, serial, "nothing changed: no rebuild");
     }
 
     #[test]

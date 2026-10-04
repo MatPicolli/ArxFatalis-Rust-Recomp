@@ -6,7 +6,7 @@
 
 use crate::animated::{Animated, Overlay};
 use crate::convert::to_bevy;
-use crate::entities::{EntityCache, EntityStats, LevelLights, SpawnOpts, SpawnedEntities, spawn_entity};
+use crate::entities::{EntityCache, EntityStats, LevelLights, SpawnOpts, SpawnedEntities, resolve_model, spawn_entity};
 use crate::hud::Ui;
 use crate::npcs::Npcs;
 use crate::scripting::{Pickables, Scripting};
@@ -21,12 +21,12 @@ use bevy::prelude::*;
 use std::sync::Arc;
 
 /// The model the hero is drawn with.
-const BODY_CLASS: &str = "graph/obj3d/interactive/npc/human_base/human_base";
+pub const BODY_CLASS: &str = "graph/obj3d/interactive/npc/human_base/human_base";
 
 /// The weapon in the hand: its model, where it is held, and where its blade is.
-struct WeaponVisual {
-    item: EntityId,
-    entity: Entity,
+pub struct WeaponVisual {
+    pub item: EntityId,
+    pub entity: Entity,
     /// The vertex of the weapon that goes in the hand (`primary_attach`), in the model's own coordinates (Arx).
     attach: Vec3,
     /// The places the blade can hurt: `hit_<radius>` vertices.
@@ -51,6 +51,14 @@ pub struct PlayerBody {
     shield_attach: Option<usize>,
     /// The vertex the eyes are at (`view_attach`): the camera sits there, as in the original.
     view_attach: Option<usize>,
+    /// The model serial the bodies were built at (armour and the chosen face change the model).
+    serial: u32,
+    /// What scripts last played on the hero, to notice when they play something else.
+    script_key: Option<(u32, Option<String>)>,
+    /// A pose scripts gave the hero (lying in the cell, being dragged, sitting at the council): the slot, whether it
+    /// loops, how long it still has if it does not, and how the animation itself moves the body (Arx units per
+    /// millisecond, in the model's own axes).
+    scripted: Option<(String, bool, f32, Vec3)>,
 }
 
 #[derive(Resource, Default)]
@@ -63,13 +71,13 @@ pub struct Combat {
 /// What building a model needs.
 #[derive(SystemParam)]
 pub struct Caches<'w> {
-    pickables: ResMut<'w, Pickables>,
-    spawned: ResMut<'w, SpawnedEntities>,
-    ecache: ResMut<'w, EntityCache>,
-    tcache: ResMut<'w, crate::convert::TextureCache>,
-    meshes: ResMut<'w, Assets<Mesh>>,
-    materials: ResMut<'w, Assets<StandardMaterial>>,
-    images: ResMut<'w, Assets<Image>>,
+    pub pickables: ResMut<'w, Pickables>,
+    pub spawned: ResMut<'w, SpawnedEntities>,
+    pub ecache: ResMut<'w, EntityCache>,
+    pub tcache: ResMut<'w, crate::convert::TextureCache>,
+    pub meshes: ResMut<'w, Assets<Mesh>>,
+    pub materials: ResMut<'w, Assets<StandardMaterial>>,
+    pub images: ResMut<'w, Assets<Image>>,
 }
 
 /// Put the hero's body in the scene.
@@ -100,8 +108,10 @@ pub fn spawn(
     body.entity = e;
     let whole = SpawnOpts { hide_selection: None, not_pickable: true };
     body.outside = spawn_entity(commands, pak, lights, scripting, pickables, ecache, tcache, meshes, materials, images, BODY_CLASS, arx, [0.0; 3], 1, player, true, &mut stats, &whole);
-    // Which vertices carry the weapon.
-    if let Some(ftl) = pak.read("game/graph/obj3d/interactive/npc/human_base/human_base.ftl").ok().and_then(|b| Ftl::parse(&b).ok()) {
+    // Which vertices carry the weapon, on the model as it is now (armour changes it).
+    let st = scripting.host.state(player).cloned().unwrap_or_default();
+    body.serial = st.model_serial;
+    if let Some((ftl, _)) = resolve_model(ecache, pak, BODY_CLASS, &st) {
         let find = |name: &str| ftl.actions.iter().find(|a| a.name.eq_ignore_ascii_case(name)).map(|a| a.vertex as usize);
         body.primary_attach = find("primary_attach");
         body.left_attach = find("left_attach");
@@ -162,7 +172,7 @@ pub fn drive(
     motion: Res<AccumulatedMouseMotion>,
     shot: Option<Res<crate::Shot>>,
     args: Res<crate::LevelArgs>,
-    fly: Res<Fly>,
+    mut fly: ResMut<Fly>,
     ui: Res<Ui>,
     arx: Res<Arx>,
     mut body: ResMut<PlayerBody>,
@@ -202,10 +212,50 @@ pub fn drive(
 
     // Seen from outside (a cutscene camera), the whole body is shown instead of the one without head and chest.
     let from_outside = s.host.stage.camera.is_some();
-    let base_path = {
+    // A pose scripts gave the hero (`playanim -p`): it replaces the body's own animation until scripts play `wait` or
+    // `none`, or, if it does not loop, until it ends.
+    let key = s.host.state(player).map(|st| (st.anim_serial, st.playing.as_ref().map(|p| p.slot.clone())));
+    if key != body.script_key {
+        let playing = s.host.state(player).and_then(|st| st.playing.clone()).filter(|p| !matches!(p.slot.as_str(), "wait" | "none"));
+        // (The first look is the level's start, not a pose.)
+        body.scripted = if body.script_key.is_some() || playing.as_ref().is_some_and(|p| p.slot.starts_with("action")) {
+            playing.and_then(|p| {
+                let path = s.host.state(player).and_then(|st| st.anims.get(&p.slot)).cloned()?;
+                let tea = script_anim(s, &arx, &path)?;
+                let length_ms = (tea.duration_us as f32 / 1000.0).max(1.0);
+                let drift = tea.frames.last().map_or(Vec3::ZERO, |f| Vec3::from(f.translate)) / length_ms;
+                Some((p.slot, p.looping, length_ms, drift))
+            })
+        } else {
+            None
+        };
+        body.script_key = key;
+    }
+    if let Some((_, looping, left_ms, drift)) = &mut body.scripted {
+        // The pose carries the hero along (dragged across the floor), as the engine adds an animation's own movement
+        // to whoever plays it: no collision, no gravity.
+        let step = *drift * dt_ms;
+        if step != Vec3::ZERO {
+            let turned = Quat::from_rotation_y(fly.yaw + std::f32::consts::PI) * Vec3::new(step.x, -step.y, -step.z);
+            fly.player.feet += turned;
+        }
+        *left_ms -= dt_ms;
+        if !*looping && *left_ms <= 0.0 {
+            body.scripted = None;
+        }
+    }
+    fly.posed = body.scripted.as_ref().is_some_and(|s| s.3 != Vec3::ZERO);
+    if std::env::var_os("ARX_LOG_BODY").is_some() && body.scripted.is_some() {
+        eprintln!("[{:.1}s] hero posed {:?} at {:.0},{:.0},{:.0} (Arx) yaw {:.0}", s.world.now_ms / 1000.0, body.scripted.as_ref().map(|p| &p.0), fly.player.feet.x, -fly.player.feet.y, -fly.player.feet.z, fly.yaw.to_degrees());
+    }
+    // The animation of the whole body: what it is called here, its file, and whether it repeats.
+    let base_path: Option<(String, String, bool)> = {
         let pressed: &ButtonInput<KeyCode> = if live && s.host.stage.controls { &keys } else { &ButtonInput::default() };
-        let slot = legs_slot(&fly, pressed, combat.state.is_fighting(), args.walk_forward && s.host.stage.controls);
-        s.host.state(player).and_then(|st| st.anims.get(slot)).cloned().map(|p| (slot, p))
+        let (slot, looping) = match &body.scripted {
+            Some((slot, looping, ..)) => (slot.clone(), *looping),
+            None => (legs_slot(&fly, pressed, combat.state.is_fighting(), args.walk_forward && s.host.stage.controls).to_owned(), true),
+        };
+        s.host.state(player).and_then(|st| st.anims.get(&slot)).cloned().map(|p| (format!("{slot}|{p}"), p, looping))
     };
     if let Some(outside) = body.outside
         && let Ok((mut tf, mut vis, mut anim)) = q.get_mut(outside)
@@ -213,14 +263,14 @@ pub fn drive(
         tf.translation = fly.player.feet;
         tf.rotation = Quat::from_rotation_y(fly.yaw + std::f32::consts::PI);
         *vis = if fly.walk && from_outside { Visibility::Inherited } else { Visibility::Hidden };
-        if let Some((slot, path)) = &base_path
+        if let Some((slot, path, looping)) = &base_path
             && body.outside_slot.as_deref() != Some(slot)
             && let Some(tea) = script_anim(s, &arx, path)
         {
             anim.anim = Some(tea);
-            anim.looping = true;
+            anim.looping = *looping;
             anim.elapsed_us = 0;
-            body.outside_slot = Some((*slot).to_owned());
+            body.outside_slot = Some(slot.clone());
         }
     }
     let Ok((mut tf, mut vis, mut anim)) = q.get_mut(entity) else { return };
@@ -231,14 +281,14 @@ pub fn drive(
     *vis = if fly.walk && !dead && !from_outside { Visibility::Inherited } else { Visibility::Hidden };
 
     // Legs.
-    if let Some((slot, path)) = &base_path
+    if let Some((slot, path, looping)) = &base_path
         && body.base_slot.as_deref() != Some(slot)
         && let Some(tea) = script_anim(s, &arx, path)
     {
         anim.anim = Some(tea);
-        anim.looping = true;
+        anim.looping = *looping;
         anim.elapsed_us = 0;
-        body.base_slot = Some((*slot).to_owned());
+        body.base_slot = Some(slot.clone());
     }
 
     // Arms.
@@ -286,7 +336,7 @@ fn script_anim(s: &mut Scripting, arx: &Arx, path: &str) -> Option<Arc<arx_forma
 
 /// Build the model of something held (a weapon in the hand, a shield on the arm) and find where it is gripped.
 #[allow(clippy::too_many_arguments)]
-fn make_visual(
+pub fn make_visual(
     commands: &mut Commands,
     arx: &Arx,
     lights: &LevelLights,
@@ -351,7 +401,7 @@ fn follow_equipment(
 
 /// Where a held model goes so that its grip point sits at `vertex` of the posed body: the bone's rotation turns it,
 /// its own grip vertex is the pivot.
-fn held_transform(w: &WeaponVisual, vertex: usize, anim: &Animated, body_tf: &Transform) -> Option<Transform> {
+pub fn held_transform(w: &WeaponVisual, vertex: usize, anim: &Animated, body_tf: &Transform) -> Option<Transform> {
     let pose = anim.pose.as_ref()?;
     let flip = |v: Vec3| Vec3::from(to_bevy(v.to_array()));
     let bone = anim.skeleton.vertex_bone[vertex];
@@ -377,10 +427,22 @@ pub fn attach(
     mut caches: Caches,
     bodies: Query<(&Transform, &Animated), (Without<WeaponTag>, Without<Camera3d>)>,
     mut held: Query<(&mut Transform, &mut Visibility), (With<WeaponTag>, Without<Camera3d>)>,
-    mut camera: Single<&mut Transform, With<Camera3d>>,
+    mut camera: Single<&mut Transform, (With<Camera3d>, Without<crate::book_hero::BookCamera>)>,
 ) {
     let Some(body_entity) = body.entity else { return };
     let s = &mut *script;
+    // Armour put on or taken off, or another face: the model is another one, so the bodies are built again.
+    if s.host.state(s.player).is_some_and(|st| st.model_serial != body.serial) {
+        for e in [body.entity.take(), body.outside.take()].into_iter().flatten() {
+            commands.entity(e).despawn();
+        }
+        (body.base_slot, body.outside_slot, body.overlay_slot) = (None, None, None);
+        spawn(
+            &mut commands, &arx.0, &lights.0, s, &mut caches.pickables.0, &mut caches.ecache, &mut caches.tcache, &mut caches.meshes, &mut caches.materials, &mut caches.images,
+            fly.player.feet, &mut body,
+        );
+        return;
+    }
     let (weapon_item, shield_item) = (s.host.player_weapon(), s.host.player.equipped_in(arx_script::EquipSlot::Shield));
     let b = &mut *body;
     follow_equipment(&mut commands, &arx, &lights, s, &mut caches, &mut b.weapon, weapon_item, "primary_attach");

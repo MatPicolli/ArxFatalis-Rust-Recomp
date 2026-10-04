@@ -30,6 +30,11 @@ pub struct StaticLight {
 }
 
 impl StaticLight {
+    /// A light at `pos` (Bevy axes) of colour `rgb255`, full strength up to `fall_start` and gone at `fall_end`.
+    pub fn new(pos: Vec3, rgb255: Vec3, fall_start: f32, fall_end: f32, intensity: f32) -> Self {
+        StaticLight { pos, rgb255, fall_start, fall_end, intensity }
+    }
+
     /// Lights that illuminate objects: every one that is lit, the torches too (the engine adds those at run time).
     pub fn from_level(lights: &[Light], scene_pos: Vec3) -> Vec<StaticLight> {
         lights
@@ -112,10 +117,77 @@ pub struct EntityCache {
     skeletons: HashMap<String, Arc<Skeleton>>,
 }
 
-impl EntityCache {
-    /// The materials whose texture name contains `part`.
-    pub fn materials_with(&self, part: &str) -> Vec<Handle<StandardMaterial>> {
-        self.materials.iter().filter(|(key, _)| key.0.contains(part)).filter_map(|(_, m)| m.clone()).collect()
+/// The model serial (see `EntityState::model_serial`) an entity's model was built at.
+#[derive(Component)]
+pub struct ModelSerial(pub u32);
+
+fn load_model(models: &mut HashMap<String, Option<Arc<Ftl>>>, pak: &PakSet, path: &str) -> Option<Arc<Ftl>> {
+    models
+        .entry(path.to_owned())
+        .or_insert_with(|| {
+            let bytes = pak.read(path).ok()?;
+            Ftl::parse(&bytes).map_err(|err| eprintln!("{path}: {err}")).ok().map(Arc::new)
+        })
+        .clone()
+}
+
+/// The model an entity is drawn with: that of its class (or the one `usemesh` gave it), with the changes its scripts
+/// made (`tweak`). Returns the model and the name it is kept under.
+pub fn resolve_model(ecache: &mut EntityCache, pak: &PakSet, class: &str, st: &arx_script::EntityState) -> Option<(Arc<Ftl>, String)> {
+    let base_path = format!("game/{}.ftl", st.mesh.as_deref().unwrap_or(class));
+    let base = load_model(&mut ecache.models, pak, &base_path)?;
+    if st.tweaks.is_empty() {
+        return Some((base, base_path));
+    }
+    let key = format!("{base_path}|{:?}", st.tweaks);
+    if let Some(done) = ecache.models.get(&key) {
+        return done.clone().map(|m| (m, key));
+    }
+    let models = &mut ecache.models;
+    let made = arx_level::model::apply_tweaks(&base, &st.tweaks, &mut |path| load_model(models, pak, path));
+    if std::env::var_os("ARX_LOG_TWEAKS").is_some() {
+        eprintln!("tweaks: {base_path} {:?}: {} vertices, {} faces; failed: {:?}", st.tweaks, made.ftl.vertices.len(), made.ftl.faces.len(), made.failed);
+    }
+    let made = Arc::new(made.ftl);
+    ecache.models.insert(key.clone(), Some(made.clone()));
+    Some((made, key))
+}
+
+/// Build again the models of entities whose scripts changed their looks after they were placed (`usemesh` or
+/// `tweak` in a later event).
+#[allow(clippy::too_many_arguments)]
+pub fn respawn(
+    mut commands: Commands,
+    arx: Res<crate::Arx>,
+    lights: Res<LevelLights>,
+    mut scripting: ResMut<Scripting>,
+    mut pickables: ResMut<crate::scripting::Pickables>,
+    mut ecache: ResMut<EntityCache>,
+    mut tcache: ResMut<TextureCache>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    q: Query<(Entity, &ScriptRef, &BaseAngle, &ModelSerial, &Transform), Without<crate::player_body::WeaponTag>>,
+) {
+    let player = scripting.player;
+    // (The hero's bodies look after themselves.)
+    let changed: Vec<(Entity, arx_script::EntityId, [f32; 3], Vec3)> = q
+        .iter()
+        .filter(|(_, r, _, serial, _)| r.0 != player && scripting.host.state(r.0).is_some_and(|st| st.model_serial != serial.0 && !st.destroyed))
+        .map(|(e, r, b, _, tf)| (e, r.0, b.angle, tf.translation))
+        .collect();
+    for (entity, id, angle, at) in changed {
+        commands.entity(entity).despawn();
+        pickables.0.retain(|p| p.id != id);
+        let (class, instance) = {
+            let e = scripting.world.entity(id);
+            (e.class.clone(), e.instance)
+        };
+        let mut stats = EntityStats::default();
+        spawn_entity(
+            &mut commands, &arx.0, &lights.0, &mut scripting, &mut pickables.0, &mut ecache, &mut tcache, &mut meshes, &mut materials, &mut images,
+            &class, [at.x, -at.y, -at.z], angle, instance, id, true, &mut stats, &SpawnOpts::default(),
+        );
     }
 }
 
@@ -255,17 +327,7 @@ pub fn spawn_entity(
         stats.hidden += 1;
         return None;
     }
-    let model_class = st.mesh.as_deref().unwrap_or(class);
-    let model_path = format!("game/{model_class}.ftl");
-    let model = ecache
-        .models
-        .entry(model_path.clone())
-        .or_insert_with(|| {
-            let bytes = pak.read(&model_path).ok()?;
-            Ftl::parse(&bytes).map_err(|err| eprintln!("{model_path}: {err}")).ok().map(Arc::new)
-        })
-        .clone();
-    let Some(ftl) = model else {
+    let Some((ftl, model_path)) = resolve_model(ecache, pak, class, &st) else {
         stats.no_model += 1;
         return None;
     };
@@ -384,6 +446,7 @@ pub fn spawn_entity(
         Transform { translation, rotation, scale: Vec3::splat(scale) },
         visibility,
         ScriptRef(script_id),
+        ModelSerial(st.model_serial),
         BaseAngle { angle: angle, npc: class.contains("/npc/") },
     ));
     if st.shadow {

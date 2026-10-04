@@ -92,6 +92,7 @@ cargo run --release -p arx-cli -- polys-at 11 8144 7467    # level polygons cove
 cargo run --release -p arx-cli -- orient-panel             # door/portcullis placement vs. level geometry
 cargo run --release -p arx-cli -- orient-wall lever        # wall-mounted objects: back to wall vs. facing into it
 cargo run --release -p arx-cli -- npc 1 40                 # run a level's characters for 40 s; -f <id> prints a character's route
+cargo run --release -p arx-cli -- tweaks                   # build every model scripts changed (`tweak`); what could not be applied (-d lists them)
 cargo run --release -p arx-cli -- audio                    # decode every game sound
 cargo run --release -p arx-cli -- locale                   # do entity names / speak keys resolve to text and voices?
 cargo run --release -p arx-cli -- player-speeds            # original movement speeds from the hero animations
@@ -127,7 +128,7 @@ cargo run -p arx-viewer -- level 1 --no-cutscenes --focus goblin_base_0050 --sho
 A plain `level N` run starts on the main menu; `--shot` and `--no-menu` skip it, `--new-quest` starts on character creation.
 
 Environment: `ARX_LOG_NPC=<id text>` logs the commands scripts give those characters and their state once a second, `ARX_LOG_BODY=1` the hero's body/blow windows, `ARX_FULLBRIGHT=1` ignores baked lighting (dark levels hide misalignment), `ARX_SHOT_FRAME=n`
-sets the screenshot frame (large levels need ~60 frames before everything appears), `ARX_LOG_SOUND=1` logs sounds, `ARX_LOG_SPEECH=1` logs dialogue and `herosay` messages, `ARX_LOG_STAGE=1` cutscene state (camera, bars, fades, teleports), `ARX_LOG_ZONES=1` zone events, `ARX_LOG_ANIM=1` animations started, `ARX_LOG_LIGHTS=1` the level's lights, `ARX_PRESS_E=<frame>` (with `ARX_PRESS_E_ON=<id>`) presses `E` by itself.
+sets the screenshot frame (large levels need ~60 frames before everything appears), `ARX_LOG_SOUND=1` logs sounds, `ARX_LOG_SPEECH=1` logs dialogue and `herosay` messages, `ARX_LOG_FPS=1` frames per second and the milliseconds each system takes (VSync off; see `perf.rs`), `ARX_SKIP=lighting,shadows,particles` leaves systems out, `ARX_LOG_TWEAKS=1` models built from tweaks, `ARX_LOG_BODY=1` also the hero's scripted poses, `ARX_LOG_STAGE=1` cutscene state (camera, bars, fades, teleports), `ARX_LOG_ZONES=1` zone events, `ARX_LOG_ANIM=1` animations started, `ARX_LOG_LIGHTS=1` the level's lights, `ARX_PRESS_E=<frame>` (with `ARX_PRESS_E_ON=<id>`) presses `E` by itself.
 
 ## Lessons (do not repeat these)
 
@@ -196,6 +197,28 @@ sets the screenshot frame (large levels need ~60 frames before everything appear
   `arx_level::zones` (paths with a height are zones: `enterzone`/`leavezone`, `controlledzone_*`). Scripts depend on system
   variables being there: an unknown `^var` reads as 0, `^target`/`^speaking`/`^life` are published, the hero's id is `player`,
   and every entity gets a `main` heartbeat. A skeleton is made for every model with animations (no bone-count check).
+- **Frame rate: never rewrite a mesh that did not change.** Every `Assets<Mesh>::get_mut` uploads that mesh again and costs
+  0.01-0.02 ms inside Bevy, whatever its size; a level has ~3000 meshes. The torch light used to rewrite 1900 of them per
+  tick (13 ms). Now each torch's effect on each vertex is precomputed (`LitChunk::lit_by`), only torches within 2200 units
+  flicker, and at most `CHUNKS_PER_TICK` meshes are rewritten per tick; `animated::animate` skips poses that did not change
+  (`Animated::shown`) and rebuilds distant ones every 3rd/10th frame. Measure with `ARX_LOG_FPS=1` (level 1: ~8 ms). An
+  unfocused window is held to 60 updates/s by winit, which looks like VSync in measurements.
+- **Tweaks** (`arx-formats/src/tweak.rs`, `arx-level/src/model.rs`): `tweak head|torso|legs|all|upper|lower <name>` takes body
+  parts from `<model dir>/tweaks/<name>.ftl` (the `head`/`chest`/`leggings` selections, vertices matched by position, as
+  `CreateIntermediaryMesh`), `tweak skin a b` swaps a texture. They are kept in `EntityState::tweaks` and applied when the
+  model is built (`entities::resolve_model`, cached by tweak list); `model_serial` makes the viewer build a model again
+  (`entities::respawn`). The hero's model is `human_base` plus what armour says (`setplayertweak`) and the chosen face
+  (`StdHost::refresh_player_model`), so vertex indices such as `primary_attach` must come from the built model.
+- **The hero in the book** (`book_hero.rs`): a second copy of the hero's model on render layer 1, drawn by a second camera
+  into a picture the HUD puts on the page (position, turn, focal 520 and lights from `RenderBookPlayerCharacter`). Because of
+  that second camera every other system asks for `(With<Camera3d>, Without<BookCamera>)`. Equipping an item takes it out of
+  the backpack (the original does too): it is on the hero in the book, and a click on its slot there takes it off.
+- **The player's yaw is the engine's**: forward is `(-sin yaw, cos yaw)` in Arx x/z, the same as an NPC's stored yaw and as
+  `Fly::yaw` (an earlier `PI - yaw` in the cutscene teleport turned the hero round). `loadanim -p` / `playanim -p` act on the
+  hero (lying, dragged, sitting): `player_body::drive` plays that pose on the bodies, moves the hero by the animation's own
+  translation and switches the player's physics off meanwhile (`Fly::posed`).
+- A dead character hears no events but `dead`, `die`, `executeline`, `reload` and being searched (`ScriptEntity::dead`);
+  without that a corpse stands up when a script addresses its group.
 - Level 9 does not exist. Many levels' saved start is not on a real floor; the viewer starts at the nearest entity
   when the saved start is more than 250 units off its floor.
 
@@ -215,8 +238,8 @@ character creation.
 Done since: footsteps from the engine's material tables (`SoundMap`), dragging items in the 3D world and throwing them, NPC path-finding / walking / patrolling / perception / melee, equipment (slots, `setequip` modifiers, `equip`), the hero's first-person body and weapon animations, the hit-strength gauge, blows and damage, characters that die and give experience.
 
 Missing: the map and spell pages of the book, combat cursors, active-spell and hunger icons, the HUD sliding away in free look,
-cinematic cameras for `speak -c`, spells, bows and arrows, armour drawn on the hero (`tweak`), NPC weapons drawn in hand, NPC footsteps, `usepath`, inventory weight limits,
-`replaceme`, level changes (`teleport -l`, needs state transfer), the 2D `.cin` cinematics (skipped: `cine_end` is sent at once), the hero's scripted poses in the intro, ladders, leaning, music/ambiance zones, fog, light flares, save games, credits and key bindings. About 60 script
+cinematic cameras for `speak -c`, spells, bows and arrows, NPC weapons drawn in hand, NPC footsteps, `usepath`, inventory weight limits,
+`replaceme`, level changes (`teleport -l`, needs state transfer), the 2D `.cin` cinematics (skipped: `cine_end` is sent at once), ladders, leaning, music/ambiance zones, fog, light flares, save games, credits and key bindings. About 60 script
 commands are skipped (the interpreter ignores a command it does not know, line by line, and counts it in
 `Stats::unknown_commands`; `arx script` prints the most frequent ones). With jumping off, `arx walk N --no-jump` has no
 rescues in 21 of 23 levels; levels 10 and 20 have genuine drops where the player falls out of the world and is put back on

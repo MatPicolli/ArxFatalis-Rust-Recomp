@@ -302,6 +302,7 @@ impl NpcWorld {
         cx.send(killer, id, "die", Vec::new());
         // From now on its heartbeat is `dead`, not `main`.
         cx.world.entity_mut(id).main_event = Some("dead".to_owned());
+        cx.world.entity_mut(id).dead = true;
         if cx.host.state(id).is_none_or(|s| s.destroyed) {
             self.npcs[i].dead = true;
             return;

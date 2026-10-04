@@ -95,6 +95,7 @@ pub fn torch_factor(t: &Torch, pos: Vec3, normal: Vec3) -> f32 {
 }
 
 /// The light one torch adds to a vertex, 0..255 per channel.
+#[cfg(test)]
 pub fn torch_light(t: &Torch, pos: Vec3, normal: Vec3) -> Vec3 {
     t.now * torch_factor(t, pos, normal)
 }
@@ -179,7 +180,7 @@ impl LevelLighting {
 }
 
 /// Flicker the torches near the camera and colour again the level meshes they reach.
-pub fn update(time: Res<Time>, cam: Single<&Transform, With<Camera3d>>, mut lighting: ResMut<LevelLighting>, mut meshes: ResMut<Assets<Mesh>>) {
+pub fn update(time: Res<Time>, cam: Single<&Transform, (With<Camera3d>, Without<crate::book_hero::BookCamera>)>, mut lighting: ResMut<LevelLighting>, mut meshes: ResMut<Assets<Mesh>>) {
     let l = &mut *lighting;
     if l.torches.is_empty() || l.chunks.is_empty() {
         return;

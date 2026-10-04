@@ -729,6 +729,8 @@ impl NpcWorld {
         let n = &mut self.npcs[i];
         n.life = n.max_life;
         n.dead = false;
+        cx.world.entity_mut(id).dead = false;
+        cx.world.entity_mut(id).main_event = None;
         n.layer = Layer::default();
         n.behavior = behavior::NONE;
         n.route = Route::none();

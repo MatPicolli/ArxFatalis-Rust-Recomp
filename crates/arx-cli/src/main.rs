@@ -73,6 +73,10 @@ enum Cmd {
     Npc { level: u32, #[arg(default_value_t = 30.0)] secs: f32,
         /// only characters whose id contains this text
         #[arg(short, long, default_value = "")] filter: String },
+    /// Build the model of every entity whose scripts changed its looks (`tweak`: body parts from other models,
+    /// swapped textures) and report what could not be applied (no argument = all levels)
+    Tweaks { level: Option<u32>, /// list every tweaked entity
+        #[arg(short, long)] details: bool },
     /// Parse level scene definitions (`graph/levels/levelN/levelN.dlf`); no argument = all levels
     Dlf { level: Option<u32>, /// print every entity
         #[arg(short, long)] entities: bool },
@@ -417,6 +421,51 @@ fn main() -> Result<()> {
             println!("{uses} literal speak/herosay uses, {} distinct speak keys: {} keys without text, {} voice files missing", keys.len(), no_text.len(), no_voice.len());
             for k in no_text.iter().take(8) { println!("  no text: {k}"); }
             for k in no_voice.iter().take(8) { println!("  no voice: {k}"); }
+        }
+        Cmd::Tweaks { level, details } => {
+            use arx_formats::ftl::Ftl;
+            use std::collections::BTreeMap;
+            let pak = std::sync::Arc::new(pak);
+            let mut models: std::collections::HashMap<String, Option<std::sync::Arc<Ftl>>> = Default::default();
+            let (mut entities, mut applied, mut textures_missing) = (0, 0, 0);
+            let mut problems: BTreeMap<String, (usize, String)> = BTreeMap::new();
+            for l in (0..=30u32).filter(|l| level.is_none_or(|x| x == *l) && pak.contains(&format!("graph/levels/level{l}/level{l}.dlf"))) {
+                let Ok(dlf) = pak.load_dlf(l) else { continue };
+                let Ok(fts) = arx_formats::fts::Fts::parse(&pak.read(&format!("game/graph/levels/level{l}/fast.fts"))?) else { continue };
+                let s = arx_level::Scripts::build(&pak, &dlf, glam::Vec3::from(fts.scene_pos));
+                for &id in &s.ids {
+                    let Some(st) = s.host.state(id).filter(|st| !st.tweaks.is_empty() && !st.destroyed) else { continue };
+                    let e = s.world.entity(id);
+                    let mut load = |path: &str| models.entry(path.to_owned()).or_insert_with(|| pak.read(path).ok().and_then(|b| Ftl::parse(&b).ok()).map(std::sync::Arc::new)).clone();
+                    let base_path = format!("game/{}.ftl", st.mesh.as_deref().unwrap_or(&e.class));
+                    let Some(base) = load(&base_path) else { continue };
+                    entities += 1;
+                    let made = arx_level::model::apply_tweaks(&base, &st.tweaks, &mut load);
+                    applied += st.tweaks.len() - made.failed.len();
+                    for f in &made.failed {
+                        let row = problems.entry(f.clone()).or_insert((0, format!("level {l} {}", e.id_string)));
+                        row.0 += 1;
+                    }
+                    // Every face must still point at vertices and textures that exist, and the textures at files.
+                    let broken = made.ftl.faces.iter().any(|f| f.vid.iter().any(|&v| v as usize >= made.ftl.vertices.len()) || f.material.is_some_and(|m| m as usize >= made.ftl.textures.len()));
+                    if broken {
+                        problems.entry("a face points outside the model".to_owned()).or_insert((0, format!("level {l} {}", e.id_string))).0 += 1;
+                    }
+                    for t in made.ftl.textures.iter().filter(|t| !t.is_empty()) {
+                        if pak.find_texture(t).is_none() {
+                            textures_missing += 1;
+                            problems.entry(format!("texture file missing: {}", arx_level::model::texture_stem(t))).or_insert((0, format!("level {l} {}", e.id_string))).0 += 1;
+                        }
+                    }
+                    if details {
+                        println!("level {l} {:<28} {} -> {} vertices, {} -> {} faces, {} bones; {:?}", e.id_string, base.vertices.len(), made.ftl.vertices.len(), base.faces.len(), made.ftl.faces.len(), made.ftl.groups.len(), st.tweaks);
+                    }
+                }
+            }
+            println!("{entities} entities with tweaks, {applied} tweaks applied, {textures_missing} textures missing");
+            for (what, (n, example)) in &problems {
+                println!("  {n:>4} x {what}   (e.g. {example})");
+            }
         }
         Cmd::Game { level, steps } => {
             use arx_level::inventory::{self, PickUp};
