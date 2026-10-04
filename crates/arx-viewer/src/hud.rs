@@ -69,6 +69,8 @@ pub struct Ui {
     /// First page (always even) of the note or quest log shown.
     pub note_page: usize,
     pub quest_page: usize,
+    /// Character creation: only the book's character sheet is shown, and it stays open.
+    pub creating: bool,
 }
 
 impl Default for Ui {
@@ -96,6 +98,7 @@ impl Default for Ui {
             book: None,
             note_page: 0,
             quest_page: 0,
+            creating: false,
         }
     }
 }

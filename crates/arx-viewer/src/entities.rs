@@ -112,6 +112,13 @@ pub struct EntityCache {
     skeletons: HashMap<String, Arc<Skeleton>>,
 }
 
+impl EntityCache {
+    /// The materials whose texture name contains `part`.
+    pub fn materials_with(&self, part: &str) -> Vec<Handle<StandardMaterial>> {
+        self.materials.iter().filter(|(key, _)| key.0.contains(part)).filter_map(|(_, m)| m.clone()).collect()
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct EntityStats {
     pub spawned: usize,

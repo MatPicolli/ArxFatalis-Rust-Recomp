@@ -103,7 +103,7 @@ fn load(arx: &Arx, images: &mut Assets<Image>, path: &str) -> Option<UiTex> {
 }
 
 impl UiAssets {
-    fn get(&mut self, arx: &Arx, images: &mut Assets<Image>, name: &str) -> Option<UiTex> {
+    pub fn get(&mut self, arx: &Arx, images: &mut Assets<Image>, name: &str) -> Option<UiTex> {
         // Most interface bitmaps are .bmp; a few are .jpg.
         for ext in ["bmp", "jpg"] {
             let path = format!("graph/interface/{name}.{ext}");
@@ -559,7 +559,7 @@ pub fn mouse(
             }
         }
         // Clicking the book icon again (or the level-up icon) closes / keeps it.
-        if buttons.just_pressed(MouseButton::Left) && g.book.contains(pos) {
+        if buttons.just_pressed(MouseButton::Left) && g.book.contains(pos) && !ui.creating {
             ui.book = None;
             ui.sfx.push("book_close");
         }
@@ -744,7 +744,7 @@ pub fn draw(
     ui.scale = interface_scale(w, h, ui.hud_scale);
     let dt = time.delta_secs().min(0.1);
     let p = &s.host.player;
-    if p.is_dead() || s.host.stage.interface_hidden {
+    if (p.is_dead() || s.host.stage.interface_hidden) && !ui.creating {
         return;
     }
 
@@ -881,6 +881,11 @@ pub fn draw(
         tooltip.get_or_insert((display_name(&s, &speech, container), Vec2::new(g.panel.min.x + 4.0 * g.s, 0.0)));
     }
 
+    // Character creation shows the book and nothing else.
+    if ui.creating {
+        c.items.clear();
+        tooltip = None;
+    }
     // --- the player's book and notes.
     let mut flyover: Option<String> = None;
     if let Some(page) = ui.book {

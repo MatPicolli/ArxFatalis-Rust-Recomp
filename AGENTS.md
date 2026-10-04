@@ -31,7 +31,7 @@ Format and behaviour knowledge comes from the GPLv3 project **ArxLibertatis**
 | `arx-script` | `.asl` interpreter (events, variables, goto/gosub, timers, event queue) and `StdHost` for visual/sound commands |
 | `arx-level` | glue: runs a level's scripts, builds entity obstacles, `entity_rotation`, `inventory` (pick up / use / combine / drop), `anchors` (the path-finding graph), `npc` (character AI + `npc/combat.rs`: damage formula, hits, deaths, characters' blows) and `player_combat` (the hero's draw / wind-up / strike stages) |
 | `arx-cli` (`arx`) | inspection/verification tools (see below) |
-| `arx-viewer` | Bevy app: model/texture browser and the walkable level viewer; `hud.rs` is the interface state and keys, `hud_ui.rs` draws the original HUD |
+| `arx-viewer` | Bevy app: model/texture browser and the walkable level viewer; `hud.rs` is the interface state and keys, `hud_ui.rs` draws the original HUD, `menu.rs` the main/pause menu, options and character creation |
 
 Dependency direction: `formats` <- `physics`, `script` <- `level` <- `cli`, `viewer`.
 
@@ -118,8 +118,16 @@ cargo run -p arx-viewer -- level 1 --focus goblin_base_0051 --say goblin_base_00
 cargo run -p arx-viewer -- level 1 --cam 9543,2945,5800 --look 180,-5 --equip short_sword_0005 --draw-weapon --attack-test --shot shots/fight.png   # hero's weapon, scripted swings
 ```
 
+```bash
+cargo run -p arx-viewer -- level 1 --menu options --shot shots/g.png   # a menu screen (main, options, create, quit)
+cargo run -p arx-viewer -- level 1 --menu main --menu-do new,quickgen,skin,done --shot shots/h.png   # click through the menu
+cargo run -p arx-viewer -- level 1 --no-cutscenes --focus goblin_base_0050 --shot shots/i.png   # scripts run, view stays yours
+```
+
+A plain `level N` run starts on the main menu; `--shot` and `--no-menu` skip it, `--new-quest` starts on character creation.
+
 Environment: `ARX_LOG_NPC=<id text>` logs the commands scripts give those characters and their state once a second, `ARX_LOG_BODY=1` the hero's body/blow windows, `ARX_FULLBRIGHT=1` ignores baked lighting (dark levels hide misalignment), `ARX_SHOT_FRAME=n`
-sets the screenshot frame (large levels need ~60 frames before everything appears), `ARX_LOG_SOUND=1` logs sounds, `ARX_LOG_SPEECH=1` logs dialogue and `herosay` messages.
+sets the screenshot frame (large levels need ~60 frames before everything appears), `ARX_LOG_SOUND=1` logs sounds, `ARX_LOG_SPEECH=1` logs dialogue and `herosay` messages, `ARX_LOG_STAGE=1` cutscene state (camera, bars, fades, teleports), `ARX_LOG_ZONES=1` zone events, `ARX_LOG_ANIM=1` animations started, `ARX_LOG_LIGHTS=1` the level's lights, `ARX_PRESS_E=<frame>` (with `ARX_PRESS_E_ON=<id>`) presses `E` by itself.
 
 ## Lessons (do not repeat these)
 
@@ -173,6 +181,21 @@ sets the screenshot frame (large levels need ~60 frames before everything appear
 - Characters only fall and collide while *moving*: an NPC with behaviour NONE (the default) or playing a script animation (`playanim -l wait`, as hanging corpses do) keeps the height the level gave it; the engine returns before applying gravity.
 - NPC behaviour is entirely script-driven through commands the host queues as `NpcRequest`s (arx-script never decides anything); `NpcWorld::update` applies them in order, then simulates only characters within 5000 units of the player. Scripts react to `reachedtarget`, `lostTarget`, `pathfinder_failure`, `detectplayer`, `hear`, `collide_door` (a door told by a character that bumps it opens for it), `strike`, `hit` (a script that does not ACCEPT cancels the damage), `ouch`, `die`, `target_death`.
 - The hero is the full `human_base` model with the faces touching the "1st" selection left out, placed where the player stands (rotation `yaw + PI` about Y); the legs play `wait/walk/run/...` and the arms a second animation layer on top (`Skeleton::pose_layers`: a bone that a higher layer animates takes nothing from the lower ones). The hero's own animations drive 44 groups against the model's 39: extra groups are ignored. The weapon is attached with the bone rotation of the hand vertex (`primary_attach`) and the weapon's own `primary_attach` vertex; blows test the weapon's `hit_<radius>` vertices against the characters' cylinders.
+- **The menu** (`arx-viewer/src/menu.rs`, from `gui/MainMenu.cpp` and `gui/CharacterCreation.cpp`): `layout()` is the single
+  source of truth for a screen (tests pin it): entries at (370, 100 + 50n) of 640x480 stretched to the window, a page in the
+  window at (20, 25) 321x430. While `Menu::screen` is set, every game system is skipped (`run_if(menu::closed)`), so add new
+  level systems inside that group. Character creation runs only `hud_ui::mouse`/`draw` with `Ui::creating` (the book alone).
+  Options are ten 0..10 values saved outside the repository (`%APPDATA%/arx-fatalis-rust/options.cfg`); screenshot runs never
+  read or write them. "New quest" with a game running restarts the program with `--new-quest` (there is no level reload).
+- **Light**: lights with `extras & 1` (every torch) are *not* in the baked colours; `lighting.rs` adds them per vertex at 30 Hz
+  (`rgb x cos x falloff x intensity x 0.85 x 0.5`, in 0..255 display values, then to linear). Blob shadows (`shadows.rs`) and
+  particles (`particles.rs`) are single meshes rebuilt every frame; **a mesh must never be left with zero vertices** (Bevy's
+  allocator logs use-after-free errors), so they keep one zero-size triangle. Bevy blends in linear light: to darken the
+  picture by `s` as the engine does, use alpha `1 - (1 - s)^2.2`.
+- **Cutscenes and zones**: `arx_level::stage` (cameras on the level's paths, bars, fades, control lock, teleports) and
+  `arx_level::zones` (paths with a height are zones: `enterzone`/`leavezone`, `controlledzone_*`). Scripts depend on system
+  variables being there: an unknown `^var` reads as 0, `^target`/`^speaking`/`^life` are published, the hero's id is `player`,
+  and every entity gets a `main` heartbeat. A skeleton is made for every model with animations (no bone-count check).
 - Level 9 does not exist. Many levels' saved start is not on a real floor; the viewer starts at the nearest entity
   when the saved start is more than 250 units off its floor.
 
@@ -185,13 +208,15 @@ localised names, voiced dialogue with subtitles (`speak`, `playspeech`) and `her
 hunger, the original HUD (gauges, backpack/book/purse icons, grid inventory with item icons, chest panel, crosshair and
 cursors), item pickup with stacking, eating/healing, and keys that
 unlock doors and chests (`combine`), original-faithful player movement (run/sneak/crouch/jump, ceilings, fall damage), NPC and
-fixture collision, chests and corpses as containers, readable notices (`note`) and `rotate`.
+fixture collision, chests and corpses as containers, readable notices (`note`) and `rotate`, NPC behaviour and combat,
+equipment, zones, script cutscenes, torch light with flames and smoke, blob shadows, the main/pause menu with options and
+character creation.
 
 Done since: footsteps from the engine's material tables (`SoundMap`), dragging items in the 3D world and throwing them, NPC path-finding / walking / patrolling / perception / melee, equipment (slots, `setequip` modifiers, `equip`), the hero's first-person body and weapon animations, the hit-strength gauge, blows and damage, characters that die and give experience.
 
 Missing: the map and spell pages of the book, combat cursors, active-spell and hunger icons, the HUD sliding away in free look,
 cinematic cameras for `speak -c`, spells, bows and arrows, armour drawn on the hero (`tweak`), NPC weapons drawn in hand, NPC footsteps, `usepath`, inventory weight limits,
-`replaceme`, level changes (`teleport -l`, `worldfade`, needs state transfer), ladders, leaning, music/ambiance zones, fog and dynamic/flickering lights, menus and save games. About 60 script
+`replaceme`, level changes (`teleport -l`, needs state transfer), the 2D `.cin` cinematics (skipped: `cine_end` is sent at once), the hero's scripted poses in the intro, ladders, leaning, music/ambiance zones, fog, light flares, save games, credits and key bindings. About 60 script
 commands are skipped (the interpreter ignores a command it does not know, line by line, and counts it in
 `Stats::unknown_commands`; `arx script` prints the most frequent ones). With jumping off, `arx walk N --no-jump` has no
 rescues in 21 of 23 levels; levels 10 and 20 have genuine drops where the player falls out of the world and is put back on

@@ -38,6 +38,8 @@ pub struct Speech {
     pub language: String,
     pub subtitles: bool,
     pub muted: bool,
+    /// How loud voices are, 0 to 1 (the options menu).
+    pub volume: f32,
     /// Decoded voice files: handle and length in seconds (`None` if the file does not exist).
     cache: HashMap<String, Option<(Handle<AudioSource>, f32)>>,
     /// The variant of each key spoken last, so a repeated line is not repeated verbatim.
@@ -56,6 +58,7 @@ impl Speech {
             language,
             subtitles,
             muted,
+            volume: 1.0,
             cache: HashMap::new(),
             last_variant: HashMap::new(),
             lines: Vec::new(),
@@ -170,11 +173,11 @@ fn start_line(
     if let (Some((handle, _)), false) = (&sample, speech.muted) {
         let at_player = req.flags.off_voice || req.speaker == script.player;
         let entity = if at_player {
-            commands.spawn((AudioPlayer::new(handle.clone()), PlaybackSettings::DESPAWN)).id()
+            commands.spawn((AudioPlayer::new(handle.clone()), PlaybackSettings::DESPAWN.with_volume(bevy::audio::Volume::Linear(speech.volume)))).id()
         } else {
             let p = Vec3::from(to_bevy(script.world.entity(req.speaker).pos));
             commands
-                .spawn((AudioPlayer::new(handle.clone()), PlaybackSettings::DESPAWN.with_spatial(true), Transform::from_translation(p)))
+                .spawn((AudioPlayer::new(handle.clone()), PlaybackSettings::DESPAWN.with_volume(bevy::audio::Volume::Linear(speech.volume)).with_spatial(true), Transform::from_translation(p)))
                 .id()
         };
         audio = Some(entity);
@@ -265,7 +268,7 @@ pub fn update(
                 let s = &mut *speech;
                 if let (Some((handle, _)), false) = (voice(&mut s.cache, &arx, &mut assets, &file), s.muted) {
                     let p = Vec3::from(to_bevy(script.world.entity(entity).pos));
-                    commands.spawn((AudioPlayer::new(handle), PlaybackSettings::DESPAWN.with_spatial(true), Transform::from_translation(p)));
+                    commands.spawn((AudioPlayer::new(handle), PlaybackSettings::DESPAWN.with_volume(bevy::audio::Volume::Linear(s.volume)).with_spatial(true), Transform::from_translation(p)));
                 }
             }
         }

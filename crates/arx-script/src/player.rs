@@ -222,6 +222,8 @@ pub struct PlayerState {
     pub mods: EquipMods,
     /// Weapon drawn and ready (combat mode).
     pub fighting: bool,
+    /// Which of the four faces the hero has (chosen at character creation).
+    pub skin: u8,
 }
 
 impl Default for PlayerState {
@@ -248,6 +250,7 @@ impl Default for PlayerState {
             equipped: [None; 7],
             mods: EquipMods::default(),
             fighting: false,
+            skin: 0,
         }
     }
 }
@@ -371,6 +374,62 @@ impl PlayerState {
         }
         self.life.current = self.life.current.min(self.life.max);
         self.mana.current = self.mana.current.min(self.mana.max);
+    }
+
+    /// Character creation: back to every attribute at 6 and all the points to hand out (`ARX_PLAYER_MakeFreshHero`).
+    /// What the hero carries and looks like stays.
+    pub fn make_fresh(&mut self) {
+        self.attributes = Attributes { strength: 6, mind: 6, dexterity: 6, constitution: 6 };
+        self.skills = Skills::default();
+        self.skills_floor = Skills::default();
+        (self.attribute_points, self.skill_points) = (16, 18);
+        (self.level, self.xp, self.hunger) = (0, 0, 100.0);
+        self.recompute();
+        (self.life.current, self.mana.current) = (self.life.max, self.mana.max);
+    }
+
+    /// Character creation's first "quick generation": the points spread evenly (`ARX_PLAYER_MakeAverageHero`).
+    pub fn make_average(&mut self) {
+        self.make_fresh();
+        self.attributes = Attributes { strength: 10, mind: 10, dexterity: 10, constitution: 10 };
+        self.skills = Skills([2.0; 9]);
+        (self.attribute_points, self.skill_points) = (0, 0);
+        self.recompute();
+        (self.life.current, self.mana.current) = (self.life.max, self.mana.max);
+    }
+
+    /// Character creation's later "quick generation"s: the points handed out at random, nothing above 18
+    /// (`ARX_PLAYER_QuickGeneration`). `random` gives numbers in 0..1.
+    pub fn quick_generate(&mut self, mut random: impl FnMut() -> f32) {
+        self.make_fresh();
+        while self.attribute_points > 0 {
+            let a = Attribute::ALL[((random() * 4.0) as usize).min(3)];
+            if self.attribute(a) < 18 {
+                *self.attribute_mut(a) += 1;
+                self.attribute_points -= 1;
+            }
+        }
+        // The engine's order of its ten-percent bands; the last skill takes what is left of the range.
+        const BANDS: [Skill; 9] = [
+            Skill::Stealth,
+            Skill::Mecanism,
+            Skill::Intuition,
+            Skill::EtheralLink,
+            Skill::ObjectKnowledge,
+            Skill::Casting,
+            Skill::Projectile,
+            Skill::CloseCombat,
+            Skill::Defense,
+        ];
+        while self.skill_points > 0 {
+            let k = BANDS[((random() * 10.0) as usize).min(8)];
+            if self.skills.get(k) < 18.0 {
+                self.skills.set(k, self.skills.get(k) + 1.0);
+                self.skill_points -= 1;
+            }
+        }
+        self.recompute();
+        (self.life.current, self.mana.current) = (self.life.max, self.mana.max);
     }
 
     /// Spend a point on an attribute; false if there is none to spend.
@@ -548,6 +607,32 @@ mod tests {
         // Out of points.
         p.attribute_points = 0;
         assert!(!p.spend_attribute(Attribute::Mind));
+    }
+
+    #[test]
+    fn quick_generation_hands_out_every_point() {
+        let mut p = PlayerState::default();
+        p.make_average();
+        assert_eq!((p.attributes.strength, p.attributes.mind, p.attributes.dexterity, p.attributes.constitution), (10, 10, 10, 10));
+        assert_eq!((p.attribute_points, p.skill_points, p.skills.get(Skill::Casting)), (0, 0, 2.0));
+        assert_eq!((p.life.max, p.life.current, p.mana.max), (20.0, 20.0, 10.0), "level 0: constitution x 2, mind x 1");
+        // Random: all 16 + 18 points spent, whatever the dice say, and nothing above 18.
+        let mut seed = 7u32;
+        let mut random = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        for _ in 0..50 {
+            p.quick_generate(&mut random);
+            let a = p.attributes;
+            assert_eq!(a.strength + a.mind + a.dexterity + a.constitution, 24 + 16);
+            assert_eq!(p.skills.0.iter().sum::<f32>(), 18.0);
+            assert!(Attribute::ALL.iter().all(|&x| (6..=18).contains(&p.attribute(x))));
+            assert_eq!((p.attribute_points, p.skill_points), (0, 0));
+        }
+        // Starting over gives the points back.
+        p.make_fresh();
+        assert_eq!((p.attribute_points, p.skill_points, p.attributes.mind), (16, 18, 6));
     }
 
     #[test]

@@ -21,10 +21,12 @@ pub struct StepSounds {
     rng: u32,
     /// Footsteps played (for diagnostics).
     pub played: u32,
+    /// How loud effects are, 0 to 1 (the options menu).
+    pub volume: f32,
 }
 
 pub fn load(mut commands: Commands, arx: Res<Arx>) {
-    commands.insert_resource(StepSounds { map: arx.0.load_sound_map(), rng: 0x1234_5678, ..default() });
+    commands.insert_resource(StepSounds { map: arx.0.load_sound_map(), rng: 0x1234_5678, volume: 1.0, ..default() });
 }
 
 impl StepSounds {
@@ -72,7 +74,7 @@ impl StepSounds {
                 Some(assets.add(AudioSource { bytes: pcm.to_wav_bytes().into() }))
             })
             .clone()?;
-        let mut settings = PlaybackSettings::DESPAWN.with_volume(bevy::audio::Volume::Linear(volume));
+        let mut settings = PlaybackSettings::DESPAWN.with_volume(bevy::audio::Volume::Linear(volume * self.volume));
         settings.speed = 0.975 + 0.5 * self.random();
         commands.spawn((AudioPlayer::new(handle), settings));
         self.played += 1;
@@ -93,7 +95,7 @@ impl StepSounds {
             })
             .clone();
         if let Some(h) = handle {
-            commands.spawn((AudioPlayer::new(h), PlaybackSettings::DESPAWN));
+            commands.spawn((AudioPlayer::new(h), PlaybackSettings::DESPAWN.with_volume(bevy::audio::Volume::Linear(self.volume))));
         }
     }
 }

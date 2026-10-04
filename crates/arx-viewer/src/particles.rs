@@ -65,10 +65,12 @@ pub fn setup(mut commands: Commands, arx: Res<Arx>, mut particles: ResMut<Partic
         let tex = load_texture(&arx.0, texture, &mut cache, &mut images).map(|i| i.handle);
         let material = materials.add(StandardMaterial { base_color_texture: tex, unlit: true, alpha_mode: AlphaMode::Add, cull_mode: None, double_sided: true, ..default() });
         let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
-        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, Vec::<[f32; 3]>::new());
-        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, Vec::<[f32; 2]>::new());
-        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, Vec::<[f32; 4]>::new());
-        mesh.insert_indices(Indices::U32(Vec::new()));
+        // Never empty (the renderer cannot hold a mesh without vertices): one triangle with no size until there are
+        // particles.
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vec![[0.0f32; 3]; 3]);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0f32; 2]; 3]);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vec![[0.0f32; 4]; 3]);
+        mesh.insert_indices(Indices::U32(vec![0, 1, 2]));
         let handle = meshes.add(mesh);
         commands.spawn((Mesh3d(handle.clone()), MeshMaterial3d(material), NoFrustumCulling, Transform::default()));
         handle
@@ -208,6 +210,9 @@ pub fn update(time: Res<Time>, cam: Single<&Transform, With<Camera3d>>, lighting
                 colors.push([q.rgb.x * fade, q.rgb.y * fade, q.rgb.z * fade, 1.0]);
             }
             indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+        if positions.is_empty() {
+            (positions, uvs, colors, indices) = (vec![[0.0; 3]; 3], vec![[0.0; 2]; 3], vec![[0.0; 4]; 3], vec![0, 1, 2]);
         }
         if let Some(mut mesh) = meshes.get_mut(&handle) {
             mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);

@@ -52,9 +52,10 @@ pub fn setup(mut commands: Commands, mut shadows: ResMut<Shadows>, mut meshes: R
     // No texture: each blob is a small fan, dark in the middle and clear at the rim.
     let material = materials.add(StandardMaterial { base_color: Color::BLACK, unlit: true, alpha_mode: AlphaMode::Blend, cull_mode: None, double_sided: true, ..default() });
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, Vec::<[f32; 3]>::new());
-    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, Vec::<[f32; 4]>::new());
-    mesh.insert_indices(Indices::U32(Vec::new()));
+    // Never empty (the renderer cannot hold a mesh without vertices): one triangle with no size until there are blobs.
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vec![[0.0f32; 3]; 3]);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vec![[0.0f32; 4]; 3]);
+    mesh.insert_indices(Indices::U32(vec![0, 1, 2]));
     let handle = meshes.add(mesh);
     commands.spawn((Mesh3d(handle.clone()), MeshMaterial3d(material), NoFrustumCulling, Transform::default()));
     shadows.mesh = Some(handle);
@@ -110,6 +111,9 @@ pub fn update(
                 indices.extend([base, i0, i1, i0, o0, o1, i0, o1, i1]);
             }
         }
+    }
+    if positions.is_empty() {
+        (positions, colors, indices) = (vec![[0.0; 3]; 3], vec![[0.0; 4]; 3], vec![0, 1, 2]);
     }
     if let Some(mut mesh) = meshes.get_mut(handle) {
         mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);

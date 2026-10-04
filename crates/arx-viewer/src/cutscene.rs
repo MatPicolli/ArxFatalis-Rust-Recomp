@@ -15,7 +15,7 @@ pub const PLAYER_FOV: f32 = 75.0;
 const BAR_HEIGHT: f32 = 100.0;
 
 #[derive(Resource, Default)]
-pub struct Stage(pub StageWorld, /** `--no-cutscenes`: scripts still run, but the view, the controls and the hero stay the player's. */ pub bool);
+pub struct Stage(pub StageWorld, /** `--no-cutscenes`: scripts still run, but the view, the controls and the hero stay the player's. */ pub bool, /** The field of view of the hero's eyes, degrees (the options menu). */ pub f32);
 
 #[derive(Component)]
 pub struct Bar {
@@ -151,7 +151,7 @@ pub fn camera(time: Res<Time>, mut stage: ResMut<Stage>, s: Res<Scripting>, mut 
             }
             v.fov
         }
-        None => PLAYER_FOV.to_radians(),
+        None => stage.2.to_radians(),
     };
     if let Projection::Perspective(p) = &mut **projection
         && (p.fov - fov).abs() > 1e-4

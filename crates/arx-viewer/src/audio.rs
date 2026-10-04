@@ -19,6 +19,8 @@ pub struct Sounds {
     /// The sound each entity started with `play -i`, so it can be replaced or stopped.
     unique: HashMap<EntityId, Entity>,
     pub muted: bool,
+    /// How loud effects are, 0 to 1 (the options menu).
+    pub volume: f32,
     /// Number of sounds actually started (for diagnostics).
     pub started: u32,
     rng: u32,
@@ -26,7 +28,7 @@ pub struct Sounds {
 
 impl Sounds {
     pub fn new(muted: bool) -> Self {
-        Sounds { muted, rng: 0x9E37_79B9, ..default() }
+        Sounds { muted, volume: 1.0, rng: 0x9E37_79B9, ..default() }
     }
 
     fn random(&mut self) -> f32 {
@@ -83,7 +85,7 @@ pub fn play_sounds(
             script.world.stats.warnings.entry(format!("unable to load sound sfx/{}.wav", r.name)).and_modify(|n| *n += 1).or_insert(1);
             continue;
         };
-        let mut settings = if r.looping { PlaybackSettings::LOOP } else { PlaybackSettings::DESPAWN };
+        let mut settings = if r.looping { PlaybackSettings::LOOP } else { PlaybackSettings::DESPAWN }.with_volume(bevy::audio::Volume::Linear(sounds.volume));
         if r.random_pitch {
             settings.speed = 0.9 + 0.2 * sounds.random();
         }

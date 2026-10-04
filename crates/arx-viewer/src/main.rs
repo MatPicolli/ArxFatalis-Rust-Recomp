@@ -21,6 +21,7 @@ mod hud_book;
 mod hud_ui;
 mod level;
 mod lighting;
+mod menu;
 mod scripting;
 mod shadows;
 mod speech;
@@ -148,8 +149,8 @@ struct Args {
     gold: u64,
     /// Level mode: size of the interface as a fraction of the largest that fits (the original's default is 0.5,
     /// which is its 640x480 pixel size on most screens; 1.0, the default here, is the biggest that fits)
-    #[arg(long, default_value_t = 1.0)]
-    hud_scale: f32,
+    #[arg(long)]
+    hud_scale: Option<f32>,
     /// Level mode: start with this much life (the maximum is 12 for a new hero), to see healing
     #[arg(long)]
     life: Option<f32>,
@@ -162,6 +163,19 @@ struct Args {
     /// Level mode: hide NPCs (they are shown in bind pose until animations are implemented)
     #[arg(long)]
     no_npcs: bool,
+    /// Level mode: go straight into the level, without the main menu and character creation
+    #[arg(long)]
+    no_menu: bool,
+    /// Level mode: start on this menu screen (`main`, `options`, `create`, `quit`), also in a screenshot run
+    #[arg(long)]
+    menu: Option<String>,
+    /// Level mode: start on character creation (what "New quest" does when a game is already running)
+    #[arg(long)]
+    new_quest: bool,
+    /// Level mode: click these menu entries by themselves, one after another (`new`, `quickgen`, `skin`, `done`,
+    /// `options`, `back`, `quit`, `yes`, `no`, `resume`), for headless testing
+    #[arg(long, value_delimiter = ',')]
+    menu_do: Vec<String>,
     /// Save a screenshot to this file after a few frames, then exit
     #[arg(long)]
     shot: Option<PathBuf>,
@@ -482,6 +496,9 @@ struct Fly {
     world: Option<std::sync::Arc<arx_physics::CollisionWorld>>,
     /// Crouch toggled with `C` (holding `X` crouches too).
     crouch_toggle: bool,
+    /// Radians turned per pixel of mouse movement, and whether up is down (the options menu).
+    mouse_speed: f32,
+    invert_mouse: bool,
 }
 
 fn run_level(args: Args, pak: PakSet) {
@@ -490,6 +507,26 @@ fn run_level(args: Args, pak: PakSet) {
         eprintln!("no localisation for language {:?}; text will show its keys", args.language);
         Default::default()
     });
+    // The menu comes first, as in the game, unless this is a scripted run. Screenshot runs neither read nor write the
+    // saved options, so that they always look the same.
+    let persistent = args.shot.is_none();
+    let start_screen = if args.new_quest {
+        Some(menu::Screen::Create)
+    } else if let Some(name) = &args.menu {
+        Some(menu::Screen::from_name(name).unwrap_or(menu::Screen::Main))
+    } else if args.shot.is_some() || args.no_menu {
+        None
+    } else {
+        Some(menu::Screen::Main)
+    };
+    let mut options = if persistent { menu::load_options() } else { menu::Options::default() };
+    // What the command line asks for wins over what was saved.
+    if let Some(scale) = args.hud_scale {
+        options.set(menu::Opt::HudScale, ((scale - 0.5) / 0.05).round().clamp(0.0, 10.0) as u8);
+    }
+    if args.no_subtitles {
+        options.set(menu::Opt::Subtitles, 0);
+    }
     let mut app = App::new();
     app.add_plugins(
         DefaultPlugins
@@ -542,6 +579,8 @@ fn run_level(args: Args, pak: PakSet) {
         player: arx_physics::Player::new(Vec3::ZERO),
         world: None,
         crouch_toggle: false,
+        mouse_speed: 0.003,
+        invert_mouse: false,
     })
     .add_systems(Startup, setup_level)
     .insert_resource(scripting::Scripting::default())
@@ -549,7 +588,8 @@ fn run_level(args: Args, pak: PakSet) {
     .insert_resource(scripting::Obstacles::default())
     .insert_resource(npcs::Npcs::default())
     .insert_resource(npcs::LevelZones::default())
-    .insert_resource(cutscene::Stage(Default::default(), args.no_cutscenes))
+    .insert_resource(cutscene::Stage(Default::default(), args.no_cutscenes, cutscene::PLAYER_FOV))
+    .insert_resource(menu::Menu::new(start_screen, options, persistent, args.menu_do.iter().filter_map(|n| menu::Action::from_name(n)).collect()))
     .insert_resource(lighting::LevelLighting::default())
     .insert_resource(particles::Particles::default())
     .insert_resource(shadows::Shadows::default())
@@ -562,11 +602,11 @@ fn run_level(args: Args, pak: PakSet) {
     .insert_resource(steps::StepSounds::default())
     .insert_resource(drag::ItemBodies::default())
     .insert_resource(hud_ui::UiFont::default())
-    .insert_resource(hud::Ui { hud_scale: args.hud_scale, ..default() })
+    .insert_resource(hud::Ui { hud_scale: args.hud_scale.unwrap_or(1.0), ..default() })
     .insert_resource(hud_ui::UiAssets::default())
     .add_systems(
         Update,
-        ((
+        (menu::update, (hud_ui::mouse, hud_ui::draw).chain().run_if(menu::creating), ((
             scripting::tick,
             npcs::zones,
             npcs::update,
@@ -611,6 +651,8 @@ fn run_level(args: Args, pak: PakSet) {
             level_hud,
         )
             .chain())
+            .chain()
+            .run_if(menu::closed))
             .chain(),
     );
     if let Some(path) = args.shot {
@@ -839,17 +881,15 @@ fn fly_camera(
     if mouse.just_pressed(MouseButton::Left) && !wants_cursor && !ui.over_hud && ui.hover_item.is_none() {
         cursor.grab_mode = CursorGrabMode::Locked;
     }
-    if keys.just_pressed(KeyCode::Escape) {
-        cursor.grab_mode = CursorGrabMode::None;
-    }
     cursor.visible = false;
     let captured = cursor.grab_mode != CursorGrabMode::None;
     ui.cursor_mode = !captured;
     if captured || mouse.pressed(MouseButton::Right) && !wants_cursor {
-        fly.yaw -= motion.x * 0.003;
+        fly.yaw -= motion.x * fly.mouse_speed;
         // Walking, the original lets you look 74.9 degrees down and 59 up; flying has no body to look into.
         let (down, up) = if fly.walk { (-74.9f32.to_radians(), 59f32.to_radians()) } else { (-1.55, 1.55) };
-        fly.pitch = (fly.pitch - motion.y * 0.003).clamp(down, up);
+        let dy = if fly.invert_mouse { -motion.y } else { motion.y };
+        fly.pitch = (fly.pitch - dy * fly.mouse_speed).clamp(down, up);
     }
 
     if keys.just_pressed(KeyCode::KeyF) {
@@ -939,9 +979,9 @@ fn level_hud(
     // Report the position in Arx coordinates so it can be fed back through --cam.
     let mode = if fly.walk { "walking" } else { "flying" };
     let help = if fly.walk {
-        "WASD move  Shift sneak  X crouch (C toggle)  Space jump  E use/take  I inventory  click: capture mouse  Esc: release  F: fly"
+        "WASD move  Shift sneak  X crouch (C toggle)  Space jump  E use/take  I inventory  click: capture mouse  Esc: menu  F: fly"
     } else {
-        "WASD move  Q/E down/up  Shift fast  scroll speed  click: capture mouse  Esc: release  F: walk"
+        "WASD move  Q/E down/up  Shift fast  scroll speed  click: capture mouse  Esc: menu  F: walk"
     };
     let target = script.target.map_or(String::new(), |t| {
         let e = script.world.entity(t);
