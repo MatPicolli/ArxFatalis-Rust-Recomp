@@ -81,6 +81,20 @@ fn light_vertex(lights: &[&StaticLight], ambient: f32, pos: Vec3, normal: Vec3) 
     c
 }
 
+/// How brightly the level's lights light a spot, 0..255 (the strongest colour channel): what hides the hero in the
+/// dark from characters that look for them.
+pub fn light_at(lights: &[StaticLight], pos: Vec3) -> f32 {
+    let near = select_lights(lights, pos);
+    // Light falls on a spot from every side: sum the lights with no surface to face (cos = 1).
+    let mut c = Vec3::splat(DEFAULT_AMBIENT_255);
+    for l in &near {
+        let d = l.pos.distance(pos);
+        let k = if d <= l.fall_start { l.intensity * GLOBAL_LIGHT_FACTOR } else { ((l.fall_end - d) / (l.fall_end - l.fall_start)).max(0.0) * l.intensity * GLOBAL_LIGHT_FACTOR };
+        c += l.rgb255 * k;
+    }
+    c.max_element().min(255.0)
+}
+
 fn srgb_to_linear(c: f32) -> f32 {
     let c = (c / 255.0).clamp(0.0, 1.0);
     if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }

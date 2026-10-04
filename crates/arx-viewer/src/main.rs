@@ -129,6 +129,10 @@ struct Args {
     /// Level mode: start with the weapon drawn, for headless testing of combat
     #[arg(long)]
     draw_weapon: bool,
+    /// Level mode: start with these attributes (`strength,mind,dexterity,constitution`), for headless testing of
+    /// equipment that asks for them
+    #[arg(long, value_delimiter = ',')]
+    attrs: Vec<i32>,
     /// Level mode: swing the weapon by itself (wind up, let go, repeat), for headless testing of combat
     #[arg(long)]
     attack_test: bool,
@@ -454,6 +458,7 @@ struct LevelArgs {
     equip: Vec<String>,
     draw_weapon: bool,
     attack_test: bool,
+    attrs: Vec<i32>,
 }
 
 #[derive(Resource)]
@@ -514,6 +519,7 @@ fn run_level(args: Args, pak: PakSet) {
         equip: args.equip.clone(),
         draw_weapon: args.draw_weapon,
         attack_test: args.attack_test,
+        attrs: args.attrs.clone(),
     })
     .insert_resource(entities::EntityCache::default())
     .insert_resource(entities::SpawnedEntities::default())

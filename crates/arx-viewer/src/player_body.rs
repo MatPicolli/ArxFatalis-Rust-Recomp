@@ -37,6 +37,7 @@ struct WeaponVisual {
 pub struct PlayerBody {
     pub entity: Option<Entity>,
     weapon: Option<WeaponVisual>,
+    shield: Option<WeaponVisual>,
     base_slot: Option<String>,
     overlay_slot: Option<String>,
     /// Characters the current swing has hit.
@@ -44,6 +45,7 @@ pub struct PlayerBody {
     /// Vertices of the body that carry things: the hand, the other hand.
     primary_attach: Option<usize>,
     left_attach: Option<usize>,
+    shield_attach: Option<usize>,
 }
 
 #[derive(Resource, Default)]
@@ -97,6 +99,7 @@ pub fn spawn(
         let find = |name: &str| ftl.actions.iter().find(|a| a.name.eq_ignore_ascii_case(name)).map(|a| a.vertex as usize);
         body.primary_attach = find("primary_attach");
         body.left_attach = find("left_attach");
+        body.shield_attach = find("shield_attach");
     }
 }
 
@@ -252,7 +255,86 @@ fn script_anim(s: &mut Scripting, arx: &Arx, path: &str) -> Option<Arc<arx_forma
     s.anim(&arx.0, path)
 }
 
-/// Keep the weapon model in the hand, and land blows: after the animations moved the arm, find where the weapon is.
+/// Build the model of something held (a weapon in the hand, a shield on the arm) and find where it is gripped.
+#[allow(clippy::too_many_arguments)]
+fn make_visual(
+    commands: &mut Commands,
+    arx: &Arx,
+    lights: &LevelLights,
+    s: &mut Scripting,
+    caches: &mut Caches,
+    item: EntityId,
+    grip: &str,
+) -> Option<WeaponVisual> {
+    let (class, instance) = {
+        let e = s.world.entity(item);
+        (e.class.clone(), e.instance)
+    };
+    let mut stats = EntityStats::default();
+    let opts = SpawnOpts { hide_selection: None, not_pickable: true, lenient_skeleton: false };
+    let made = spawn_entity(
+        commands, &arx.0, &lights.0, s, &mut caches.pickables.0, &mut caches.ecache, &mut caches.tcache, &mut caches.meshes, &mut caches.materials, &mut caches.images,
+        &class, [0.0; 3], [0.0; 3], instance, item, true, &mut stats, &opts,
+    );
+    let Some(e) = made else {
+        eprintln!("could not build the model of {class}: {stats:?}");
+        return None;
+    };
+    commands.entity(e).insert(WeaponTag);
+    caches.spawned.0.insert(item);
+    let model = s.host.state(item).and_then(|st| st.mesh.clone()).unwrap_or_else(|| class.clone());
+    let ftl = arx.0.read(&format!("game/{model}.ftl")).ok().and_then(|b| Ftl::parse(&b).ok());
+    let (attach, hits) = ftl.map_or((Vec3::ZERO, Vec::new()), |f| {
+        let v = |i: u32| Vec3::from(f.vertices[i as usize].pos);
+        let attach = f.actions.iter().find(|a| a.name.eq_ignore_ascii_case(grip)).map_or_else(|| v(f.origin), |a| v(a.vertex));
+        let hits = f
+            .actions
+            .iter()
+            .filter_map(|a| a.name.to_ascii_lowercase().strip_prefix("hit_").and_then(|n| n.parse::<f32>().ok()).map(|r| (v(a.vertex), r)))
+            .collect();
+        (attach, hits)
+    });
+    Some(WeaponVisual { item, entity: e, attach, hits })
+}
+
+/// Make the held model follow what is equipped in a slot (building or removing it).
+#[allow(clippy::too_many_arguments)]
+fn follow_equipment(
+    commands: &mut Commands,
+    arx: &Arx,
+    lights: &LevelLights,
+    s: &mut Scripting,
+    caches: &mut Caches,
+    slot: &mut Option<WeaponVisual>,
+    equipped: Option<EntityId>,
+    grip: &str,
+) {
+    if slot.as_ref().map(|w| w.item) == equipped {
+        return;
+    }
+    if let Some(old) = slot.take() {
+        commands.entity(old.entity).despawn();
+    }
+    if let Some(item) = equipped {
+        *slot = make_visual(commands, arx, lights, s, caches, item, grip);
+    }
+}
+
+/// Where a held model goes so that its grip point sits at `vertex` of the posed body: the bone's rotation turns it,
+/// its own grip vertex is the pivot.
+fn held_transform(w: &WeaponVisual, vertex: usize, anim: &Animated, body_tf: &Transform) -> Option<Transform> {
+    let pose = anim.pose.as_ref()?;
+    let flip = |v: Vec3| Vec3::from(to_bevy(v.to_array()));
+    let bone = anim.skeleton.vertex_bone[vertex];
+    // Bone rotation in Bevy axes: conjugate by the Arx -> Bevy flip.
+    let q = pose.bone_quat[bone];
+    let q_b = Quat::from_xyzw(q.x, -q.y, -q.z, q.w);
+    let local = Transform { translation: flip(pose.vertices[vertex]) - q_b * flip(w.attach), rotation: q_b, scale: Vec3::ONE };
+    Some(body_tf.mul_transform(local))
+}
+
+/// Keep the weapon model in the hand and the shield on the arm, and land blows: after the animations moved the arm,
+/// find where the weapon is.
 #[allow(clippy::too_many_arguments)]
 pub fn attach(
     mut commands: Commands,
@@ -265,72 +347,39 @@ pub fn attach(
     mut npcs: ResMut<Npcs>,
     mut caches: Caches,
     bodies: Query<(&Transform, &Animated), Without<WeaponTag>>,
-    mut weapons: Query<(&mut Transform, &mut Visibility), With<WeaponTag>>,
+    mut held: Query<(&mut Transform, &mut Visibility), With<WeaponTag>>,
 ) {
     let Some(body_entity) = body.entity else { return };
     let s = &mut *script;
-    let equipped = s.host.player_weapon();
-    // The weapon model follows what is equipped.
-    if body.weapon.as_ref().map(|w| w.item) != equipped {
-        if let Some(old) = body.weapon.take() {
-            commands.entity(old.entity).despawn();
-        }
-        if let Some(item) = equipped {
-            let (class, instance) = {
-                let e = s.world.entity(item);
-                (e.class.clone(), e.instance)
-            };
-            let mut stats = EntityStats::default();
-            let opts = SpawnOpts { hide_selection: None, not_pickable: true, lenient_skeleton: false };
-            let made = spawn_entity(
-                &mut commands, &arx.0, &lights.0, s, &mut caches.pickables.0, &mut caches.ecache, &mut caches.tcache, &mut caches.meshes, &mut caches.materials, &mut caches.images,
-                &class, [0.0; 3], [0.0; 3], instance, item, true, &mut stats, &opts,
-            );
-            if made.is_none() {
-                eprintln!("could not build the weapon model of {class}: {stats:?}");
-            }
-            if let Some(e) = made {
-                commands.entity(e).insert(WeaponTag);
-                caches.spawned.0.insert(item);
-                let model = s.host.state(item).and_then(|st| st.mesh.clone()).unwrap_or_else(|| class.clone());
-                let ftl = arx.0.read(&format!("game/{model}.ftl")).ok().and_then(|b| Ftl::parse(&b).ok());
-                let (attach, hits) = ftl.map_or((Vec3::ZERO, Vec::new()), |f| {
-                    let v = |i: u32| Vec3::from(f.vertices[i as usize].pos);
-                    let attach = f.actions.iter().find(|a| a.name.eq_ignore_ascii_case("primary_attach")).map_or_else(|| v(f.origin), |a| v(a.vertex));
-                    let hits = f
-                        .actions
-                        .iter()
-                        .filter_map(|a| a.name.to_ascii_lowercase().strip_prefix("hit_").and_then(|n| n.parse::<f32>().ok()).map(|r| (v(a.vertex), r)))
-                        .collect();
-                    (attach, hits)
-                });
-                body.weapon = Some(WeaponVisual { item, entity: e, attach, hits });
-            }
-        }
-    }
+    let (weapon_item, shield_item) = (s.host.player_weapon(), s.host.player.equipped_in(arx_script::EquipSlot::Shield));
+    let b = &mut *body;
+    follow_equipment(&mut commands, &arx, &lights, s, &mut caches, &mut b.weapon, weapon_item, "primary_attach");
+    follow_equipment(&mut commands, &arx, &lights, s, &mut caches, &mut b.shield, shield_item, "shield_attach");
 
     let Ok((body_tf, anim)) = bodies.get(body_entity) else { return };
-    let (Some(pose), Some(primary)) = (anim.pose.as_ref(), body.primary_attach) else { return };
-    let bone = anim.skeleton.vertex_bone[primary];
-    let flip = |v: Vec3| Vec3::from(to_bevy(v.to_array()));
-    // Bone rotation in Bevy axes: conjugate by the Arx -> Bevy flip.
-    let q = pose.bone_quat[bone];
-    let q_b = Quat::from_xyzw(q.x, -q.y, -q.z, q.w);
-    let hand = flip(pose.vertices[primary]);
+    let Some(pose) = anim.pose.as_ref() else { return };
     let fighting = combat.state.stage != Stage::Sheathed;
+    let flip = |v: Vec3| Vec3::from(to_bevy(v.to_array()));
     if std::env::var_os("ARX_LOG_BODY").is_some() {
-        eprintln!("body at {:?}; hand {:?}; slot {:?}/{:?}; weapon {}", body_tf.translation, hand, body.base_slot, body.overlay_slot, body.weapon.is_some());
+        eprintln!("body at {:?}; slot {:?}/{:?}; weapon {} shield {}", body_tf.translation, body.base_slot, body.overlay_slot, body.weapon.is_some(), body.shield.is_some());
     }
 
-    // The weapon: the attach point of its model sits in the hand.
+    // The weapon in the hand (only while it is drawn), and the shield on the left arm.
     let mut centres: Vec<(Vec3, f32)> = Vec::new();
-    if let Some(w) = &body.weapon
-        && let Ok((mut tf, mut vis)) = weapons.get_mut(w.entity)
+    if let (Some(w), Some(v)) = (&body.weapon, body.primary_attach)
+        && let Ok((mut tf, mut vis)) = held.get_mut(w.entity)
+        && let Some(t) = held_transform(w, v, anim, body_tf)
     {
-        let local = Transform { translation: hand - q_b * flip(w.attach), rotation: q_b, scale: Vec3::ONE };
-        *tf = body_tf.mul_transform(local);
+        *tf = t;
         *vis = if fighting { Visibility::Inherited } else { Visibility::Hidden };
         centres = w.hits.iter().map(|&(v, r)| (tf.transform_point(flip(v)), r)).collect();
+    }
+    if let (Some(w), Some(v)) = (&body.shield, body.shield_attach)
+        && let Ok((mut tf, mut vis)) = held.get_mut(w.entity)
+        && let Some(t) = held_transform(w, v, anim, body_tf)
+    {
+        *tf = t;
+        *vis = Visibility::Inherited;
     }
     if body.weapon.is_none() {
         // Bare hands: the fists themselves.
@@ -384,6 +433,11 @@ pub fn debug_equip(mut frames: Local<u32>, args: Res<crate::LevelArgs>, mut scri
     }
     let s = &mut *script;
     let player = s.player;
+    if let [st, mi, de, co] = args.attrs[..] {
+        s.host.player.attributes = arx_script::Attributes { strength: st, mind: mi, dexterity: de, constitution: co };
+        s.host.player.recompute();
+        s.host.publish_player(&mut s.world);
+    }
     for name in &args.equip {
         let Some(item) = s.world.find(name, player) else {
             eprintln!("--equip: no entity named {name}");

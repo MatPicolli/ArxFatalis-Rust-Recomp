@@ -14,7 +14,7 @@ pub struct Npcs(pub Option<NpcWorld>);
 
 /// Move the characters on by the frame's time. They see and hear the player; the player is where the script world
 /// last put them.
-pub fn update(time: Res<Time>, fly: Res<Fly>, mut npcs: ResMut<Npcs>, mut s: ResMut<Scripting>) {
+pub fn update(time: Res<Time>, fly: Res<Fly>, lights: Res<crate::entities::LevelLights>, mut npcs: ResMut<Npcs>, mut s: ResMut<Scripting>) {
     let (Some(npcs), Some(world)) = (npcs.0.as_mut(), fly.world.as_ref()) else { return };
     let s = &mut *s;
     let env = Env {
@@ -22,7 +22,7 @@ pub fn update(time: Res<Time>, fly: Res<Fly>, mut npcs: ResMut<Npcs>, mut s: Res
         player_pos: Vec3::from(s.world.entity(s.player).pos),
         player_alive: !s.host.player.is_dead(),
         player_stealth: 15.0 + s.host.player.skills.get(Skill::Stealth) / 10.0,
-        player_light: 255.0,
+        player_light: crate::entities::light_at(&lights.0, fly.pos),
         player_torch: false,
     };
     npcs.update(&mut s.world, &mut s.host, &env, time.delta_secs().min(0.1) * 1000.0);

@@ -190,7 +190,7 @@ fixture collision, chests and corpses as containers, readable notices (`note`) a
 Done since: footsteps from the engine's material tables (`SoundMap`), dragging items in the 3D world and throwing them, NPC path-finding / walking / patrolling / perception / melee, equipment (slots, `setequip` modifiers, `equip`), the hero's first-person body and weapon animations, the hit-strength gauge, blows and damage, characters that die and give experience.
 
 Missing: the map and spell pages of the book, combat cursors, active-spell and hunger icons, the HUD sliding away in free look,
-cinematic cameras for `speak -c`, spells, bows and arrows, shields and armour drawn on the hero, NPC weapons drawn in hand, NPC footsteps, `usepath`, inventory weight limits,
+cinematic cameras for `speak -c`, spells, bows and arrows, armour drawn on the hero (`tweak`), NPC weapons drawn in hand, NPC footsteps, `usepath`, inventory weight limits,
 `replaceme`, level changes (`teleport -l`, `worldfade`, needs state transfer), ladders, leaning, music/ambiance zones, fog and dynamic/flickering lights, menus and save games. About 60 script
 commands are skipped (the interpreter ignores a command it does not know, line by line, and counts it in
 `Stats::unknown_commands`; `arx script` prints the most frequent ones). With jumping off, `arx walk N --no-jump` has no
