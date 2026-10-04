@@ -385,6 +385,11 @@ impl NpcWorld {
             self.npcs[i].attack = Attack::default();
             return false;
         }
+        // Nobody keeps hitting the dead.
+        if Some(target) == cx.world.player && !cx.env.player_alive {
+            self.npcs[i].attack = Attack::default();
+            return false;
+        }
         let dist = self.npcs[i].pos.distance(Self::entity_pos(cx, target));
         let kind = self.weapon_kind_of(cx.host, id);
         let prefix = kind.prefix();
@@ -393,7 +398,10 @@ impl NpcWorld {
         let stage = self.npcs[i].attack.stage;
         match stage {
             None => {
-                if dist < STRIKE_DISTANCE && !self.npcs[i].layer.force && matches!(self.npcs[i].layer.slot.as_deref(), None | Some("wait" | "fight_wait")) {
+                // Whatever the legs are doing (the engine plays blows on a layer of their own): a fighter that
+                // arrived still in its walk used to stand there until something else reset its animation.
+                let free = !self.npcs[i].layer.force && !self.npcs[i].layer.slot.as_deref().is_some_and(|s| s.contains("strike") || s.starts_with("hit") || s == "die");
+                if dist < STRIKE_DISTANCE && free {
                     let dir = self.rng.range(0, 3) as usize;
                     let slot = slot_of(dir, "_start");
                     if cx.has_slot(id, &slot) {

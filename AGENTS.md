@@ -197,6 +197,24 @@ sets the screenshot frame (large levels need ~60 frames before everything appear
   `arx_level::zones` (paths with a height are zones: `enterzone`/`leavezone`, `controlledzone_*`). Scripts depend on system
   variables being there: an unknown `^var` reads as 0, `^target`/`^speaking`/`^life` are published, the hero's id is `player`,
   and every entity gets a `main` heartbeat. A skeleton is made for every model with animations (no bone-count check).
+- **The jump and the crouch are deliberately not the original's** (the owner asked: "more grounded, even if different").
+  `arx_physics::Player::classic = true` gives the port described above; the default throws the body up 95 units under one
+  gravity of 1700 units/s^2 for jump and fall alike, keeps about running speed in the air (1.3x forward) and on landing,
+  and ducks in 140 ms with the cylinder low at once. Gaps the original's long jump (three times running speed in the air)
+  crossed may now be out of reach; if a level needs one, that is the place to look. The eyes ease through a crouch
+  (`PlayerBody::eye_rise`).
+- **Fighting characters**: a blow starts whatever the legs' animation is (only a forced animation, a blow or `die` hold
+  it back). Requiring `wait` made a goblin that arrived in `fight_walk_forward` stand still until it was hit again.
+  `arx npc 1 20 --hit goblin_base_0050 [--behind] [--dark]` strikes a character every two seconds and prints what it does.
+- **Speech**: whoever speaks plays `talk_neutral|happy|angry` (head and jaw only) as a second animation layer
+  (`speech::talk`). Subtitles are written during conversation scenes (black bars), as in the original, and otherwise only
+  for speakers within 700 units. Sound fades by the engine's model (`audio::gain`: full to 200 units, inverse distance with
+  rolloff 1.3, flat past 2200); Bevy's own distance fading is switched off by a tiny spatial scale and only pans.
+- **The hero bends to look** (`Skeleton::pose_layers_bent`, the engine's `ex_rotate`): head/neck/chest/belt take
+  0.1/0.1/0.4/0.4 of the pitch with a weapon drawn, a quarter each otherwise, so blows go where the eyes point. Losing the
+  controls to a cutscene puts the weapon away (`PutPlayerInNormalStance`), or the outside body T-poses its arms.
+- The captured mouse is re-centred every frame and released when the window loses focus; while it is captured the
+  interface gets no cursor position (a hidden cursor used to click whatever it was parked on).
 - **Frame rate: never rewrite a mesh that did not change.** Every `Assets<Mesh>::get_mut` uploads that mesh again and costs
   0.01-0.02 ms inside Bevy, whatever its size; a level has ~3000 meshes. The torch light used to rewrite 1900 of them per
   tick (13 ms). Now each torch's effect on each vertex is precomputed (`LitChunk::lit_by`), only torches within 2200 units

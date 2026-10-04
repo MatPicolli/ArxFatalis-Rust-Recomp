@@ -12,6 +12,10 @@ use std::{collections::HashMap, sync::Arc};
 /// At most this many `herosay` messages are on screen at once.
 const MAX_NOTES: usize = 4;
 
+/// Speech farther away than this is not written out (unless it is a conversation scene): at this distance its
+/// voice is down to a quarter.
+const SUBTITLE_DISTANCE: f32 = 700.0;
+
 /// Shown for a message with no voice: base time plus time per character.
 fn read_time(text: &str) -> f32 {
     2.0 + 0.06 * text.chars().count() as f32
@@ -25,6 +29,9 @@ struct Line {
     audio: Option<Entity>,
     unbreakable: bool,
     on_end: Option<(Arc<Script>, usize)>,
+    /// Heard everywhere rather than from the speaker (the hero's own voice, a narrator).
+    at_player: bool,
+    mood: arx_script::Mood,
 }
 
 struct Note {
@@ -170,14 +177,21 @@ fn start_line(
     let sample = voice(&mut speech.cache, arx, assets, &file);
 
     let mut audio = None;
+    let at_player = req.flags.off_voice || req.speaker == script.player;
     if let (Some((handle, _)), false) = (&sample, speech.muted) {
-        let at_player = req.flags.off_voice || req.speaker == script.player;
         let entity = if at_player {
             commands.spawn((AudioPlayer::new(handle.clone()), PlaybackSettings::DESPAWN.with_volume(bevy::audio::Volume::Linear(speech.volume)))).id()
         } else {
             let p = Vec3::from(to_bevy(script.world.entity(req.speaker).pos));
+            let listener = Vec3::from(to_bevy(script.world.entity(script.player).pos));
+            let loudness = speech.volume * crate::audio::gain(p.distance(listener));
             commands
-                .spawn((AudioPlayer::new(handle.clone()), PlaybackSettings::DESPAWN.with_volume(bevy::audio::Volume::Linear(speech.volume)).with_spatial(true), Transform::from_translation(p)))
+                .spawn((
+                    AudioPlayer::new(handle.clone()),
+                    PlaybackSettings::DESPAWN.with_volume(bevy::audio::Volume::Linear(loudness)).with_spatial(true),
+                    Transform::from_translation(p),
+                    crate::audio::Falloff(speech.volume),
+                ))
                 .id()
         };
         audio = Some(entity);
@@ -209,6 +223,8 @@ fn start_line(
         audio,
         unbreakable: req.flags.unbreakable,
         on_end: req.on_end,
+        at_player,
+        mood: req.flags.mood,
     });
 }
 
@@ -268,7 +284,7 @@ pub fn update(
                 let s = &mut *speech;
                 if let (Some((handle, _)), false) = (voice(&mut s.cache, &arx, &mut assets, &file), s.muted) {
                     let p = Vec3::from(to_bevy(script.world.entity(entity).pos));
-                    commands.spawn((AudioPlayer::new(handle), PlaybackSettings::DESPAWN.with_volume(bevy::audio::Volume::Linear(s.volume)).with_spatial(true), Transform::from_translation(p)));
+                    commands.spawn((AudioPlayer::new(handle), PlaybackSettings::DESPAWN.with_volume(bevy::audio::Volume::Linear(s.volume)).with_spatial(true), Transform::from_translation(p), crate::audio::Falloff(s.volume)));
                 }
             }
         }
@@ -315,10 +331,16 @@ pub fn update(
         }
     }
 
+    // What is said in a conversation scene (the black bars) is always written out, as in the original; outside one,
+    // only what is close enough to be heard clearly, so that chatter rooms away does not fill the screen.
+    let conversation = script.host.stage.cinemascope;
+    let listener = Vec3::from(script.world.entity(script.player).pos);
+    let near = |l: &Line| l.at_player || conversation || Vec3::from(script.world.entity(l.speaker).pos).distance(listener) < SUBTITLE_DISTANCE;
     let subs = if speech.subtitles {
         speech
             .lines
             .iter()
+            .filter(|l| near(l))
             .filter_map(|l| l.text.as_deref())
             .collect::<Vec<_>>()
             .join("\n")
@@ -331,6 +353,51 @@ pub fn update(
     let msgs = speech.notes.iter().map(|n| n.text.as_str()).collect::<Vec<_>>().join("\n");
     if notes.0 != msgs {
         notes.0 = msgs;
+    }
+}
+
+/// Whoever speaks moves their mouth: the character's talking animation (`talk_neutral`, `talk_happy`, `talk_angry`,
+/// which move the head and jaw only) plays over whatever the body is doing, for as long as the line lasts
+/// (`ARX_SPEECH_Update`). The hero's first-person body is left alone: its second layer is the arms.
+pub fn talk(
+    arx: Res<Arx>,
+    speech: Res<Speech>,
+    body: Res<crate::player_body::PlayerBody>,
+    mut script: ResMut<Scripting>,
+    mut q: Query<(Entity, &crate::scripting::ScriptRef, &mut crate::animated::Animated)>,
+    mut talking: Local<HashMap<Entity, String>>,
+) {
+    if speech.lines.is_empty() && talking.is_empty() {
+        return;
+    }
+    for (entity, r, mut animated) in &mut q {
+        if Some(entity) == body.entity {
+            continue;
+        }
+        let want = speech.lines.iter().find(|l| l.speaker == r.0).and_then(|l| {
+            let st = script.host.state(r.0)?;
+            let slot = match l.mood {
+                arx_script::Mood::Happy => "talk_happy",
+                arx_script::Mood::Angry => "talk_angry",
+                arx_script::Mood::Neutral => "talk_neutral",
+            };
+            st.anims.get(slot).or_else(|| st.anims.get("talk_neutral")).cloned()
+        });
+        match want {
+            Some(path) => {
+                if (talking.get(&entity) != Some(&path) || animated.overlay.is_none())
+                    && let Some(tea) = script.anim(&arx.0, &path)
+                {
+                    animated.overlay = Some(crate::animated::Overlay { anim: tea, elapsed_us: 0, looping: true });
+                    talking.insert(entity, path);
+                }
+            }
+            None => {
+                if talking.remove(&entity).is_some() {
+                    animated.overlay = None;
+                }
+            }
+        }
     }
 }
 

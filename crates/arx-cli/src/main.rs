@@ -72,7 +72,13 @@ enum Cmd {
     /// report what each did: behaviour, animation, distance walked, whether its route and anchors worked
     Npc { level: u32, #[arg(default_value_t = 30.0)] secs: f32,
         /// only characters whose id contains this text
-        #[arg(short, long, default_value = "")] filter: String },
+        #[arg(short, long, default_value = "")] filter: String,
+        /// stand the player next to this character and strike it every two seconds, printing what it does
+        #[arg(long)] hit: Option<String>,
+        /// with --hit: strike from behind
+        #[arg(long)] behind: bool,
+        /// with --hit: the player stands in the dark
+        #[arg(long)] dark: bool },
     /// Build the model of every entity whose scripts changed its looks (`tweak`: body parts from other models,
     /// swapped textures) and report what could not be applied (no argument = all levels)
     Tweaks { level: Option<u32>, /// list every tweaked entity
@@ -848,7 +854,7 @@ TOTAL: {ents} entities ({with_script} class scripts, {with_over} instance script
                 }
             }
         }
-        Cmd::Npc { level, secs, filter } => {
+        Cmd::Npc { level, secs, filter, hit, behind, dark } => {
             use arx_level::npc::{Env, build_npcs};
             let dlf = pak.load_dlf(level).map_err(anyhow::Error::msg)?;
             let fts = arx_formats::fts::Fts::parse(&pak.read(&format!("game/graph/levels/level{level}/fast.fts"))?)?;
@@ -875,6 +881,45 @@ TOTAL: {ents} entities ({with_script} class scripts, {with_over} instance script
             let frames = (secs * 30.0) as usize;
             let far = glam::Vec3::new(1.0e7, 0.0, 1.0e7);
             s.world.entity_mut(s.player).pos = far.to_array();
+            if let Some(name) = &hit {
+                let player = s.player;
+                let Some(target) = s.world.find(name, player) else { anyhow::bail!("no entity {name}") };
+                let mut stand = glam::Vec3::ZERO;
+                // Somebody the level keeps out of sight until later is brought in.
+                s.host.modify(target, |st| st.hidden = false);
+                // The level starts in its intro with the controls taken away; here the game is under way.
+                s.host.stage.controls = true;
+                for id in 0..s.world.entities.len() as u32 {
+                    if s.world.entity(id).kind == arx_script::EntityKind::Npc {
+                        s.world.queue_event(None, id, "controls_on", Vec::new());
+                    }
+                }
+                for frame in 0..frames {
+                    let n = npcs.npc(target).expect("a character");
+                    if frame == 0 {
+                        // In front of it, or (`--behind`) at its back, where it does not see who strikes.
+                        let (sin, cos) = n.yaw.to_radians().sin_cos();
+                        let facing = glam::Vec3::new(-sin, 0.0, cos);
+                        stand = n.pos + facing * if behind { -120.0 } else { 120.0 };
+                    }
+                    let (pos, height) = (n.pos, 100.0);
+                    s.world.entity_mut(player).pos = stand.to_array();
+                    let env = Env { collision: &collision, player_pos: stand, player_alive: !s.host.player.is_dead(), player_stealth: 15.0, player_light: if dark { 5.0 } else { 255.0 }, player_torch: false };
+                    if frame % 60 == 15 {
+                        let mut already = Vec::new();
+                        let hits = npcs.player_strike(&mut s.world, &mut s.host, &env, &[(pos - glam::Vec3::Y * height, 60.0)], 0.3, &mut already);
+                        for h in &hits { println!("[{:.1}s] STRUCK: damage {:.1} missed {} killed {}", frame as f32 / 30.0, h.damage, h.missed, h.killed); }
+                    }
+                    npcs.update(&mut s.world, &mut s.host, &env, 1000.0 / 30.0);
+                    s.world.update(&mut s.host, 1000.0 / 30.0);
+                    s.world.heartbeat(&mut s.host);
+                    if frame % 15 == 0 {
+                        let n = npcs.npc(target).expect("a character");
+                        println!("[{:.1}s] behavior {:>4} {:?} anim {:<16} life {:>4.1} dist {:>5.0} yaw {:>4.0} sees {} traveling {} reached {} hero life {:.0}", frame as f32 / 30.0, n.behavior, n.move_mode, n.animation().unwrap_or("-"), n.life, (n.pos - stand).length(), n.yaw, n.detect, n.is_traveling(), n.reached, s.host.player.life.current);
+                    }
+                }
+                return Ok(());
+            }
             for _ in 0..frames {
                 let env = Env { collision: &collision, player_pos: far, player_alive: true, player_stealth: 15.0, player_light: 255.0, player_torch: false };
                 npcs.update(&mut s.world, &mut s.host, &env, 1000.0 / 30.0);

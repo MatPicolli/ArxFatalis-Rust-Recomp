@@ -476,6 +476,7 @@ pub fn spawn_entity(
             keep_pose: ftl.groups.len() > 1,
             pose: None,
             shown: None,
+            bend: Vec::new(),
         });
         stats.animated += 1;
     }

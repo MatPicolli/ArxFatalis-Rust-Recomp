@@ -142,6 +142,13 @@ impl Skeleton {
     /// Pose from several layers at once (topmost first), each an animation and the time into it. `root` is added to the
     /// root bone. Also gives each bone's final rotation and position, for attaching things to it.
     pub fn pose_layers(&self, layers: &[(&Tea, i64)], root: Vec3) -> Pose {
+        self.pose_layers_bent(layers, root, &[])
+    }
+
+    /// [`Skeleton::pose_layers`] with extra rotations put on some bones before their animation's own (the engine's
+    /// `ex_rotate`): how a body bends at the belt, chest, neck and head to look up or down. Each is a bone and a
+    /// rotation in the model's own axes (Arx).
+    pub fn pose_layers_bent(&self, layers: &[(&Tea, i64)], root: Vec3, bend: &[(usize, Quat)]) -> Pose {
         let located: Vec<(&Tea, usize, f32)> = layers
             .iter()
             .map(|&(anim, time)| {
@@ -149,7 +156,12 @@ impl Skeleton {
                 (anim, frame, t)
             })
             .collect();
-        let (rot, trans, scale) = self.locals(&located);
+        let (mut rot, trans, scale) = self.locals(&located);
+        for &(bone, extra) in bend {
+            if let Some(r) = rot.get_mut(bone) {
+                *r = extra * *r;
+            }
+        }
         self.concatenate(&rot, &trans, &scale, root)
     }
 

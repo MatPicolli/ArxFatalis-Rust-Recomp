@@ -53,6 +53,10 @@ pub struct PlayerBody {
     view_attach: Option<usize>,
     /// The model serial the bodies were built at (armour and the chosen face change the model).
     serial: u32,
+    /// The bones the body bends at to look up and down: head, neck, chest, belt.
+    bend_bones: [Option<usize>; 4],
+    /// How high above the feet the eyes are shown (it follows the body, but eases through a crouch).
+    eye_rise: Option<f32>,
     /// What scripts last played on the hero, to notice when they play something else.
     script_key: Option<(u32, Option<String>)>,
     /// A pose scripts gave the hero (lying in the cell, being dragged, sitting at the council): the slot, whether it
@@ -117,6 +121,9 @@ pub fn spawn(
         body.left_attach = find("left_attach");
         body.shield_attach = find("shield_attach");
         body.view_attach = find("view_attach");
+        // A bone is a group of the model, in the same order.
+        let bone = |name: &str| ftl.groups.iter().position(|g| g.name.eq_ignore_ascii_case(name));
+        body.bend_bones = [bone("head"), bone("neck"), bone("chest"), bone("belt")];
     }
 }
 
@@ -199,10 +206,18 @@ pub fn drive(
     if live {
         combat.state.steer(motion.delta);
     }
-    // A hero with a drawn weapon who dies, or leaves walking mode, puts it away at once.
-    if (dead || !fly.walk) && combat.state.stage != Stage::Sheathed {
+    // A hero with a drawn weapon who dies, leaves walking mode or loses the controls to a cutscene puts it away at
+    // once and stands up (`ARX_PLAYER_PutPlayerInNormalStance`); otherwise the body seen from outside would hold a
+    // fighting stance with nothing moving its arms.
+    let mut put_away = false;
+    if (dead || !fly.walk || !s.host.stage.controls) && combat.state.stage != Stage::Sheathed {
         combat.state = PlayerCombat::default();
         s.host.player.fighting = false;
+        updates.clear();
+        put_away = true;
+    }
+    if !s.host.stage.controls {
+        fly.crouch_toggle = false;
     }
     // `--attack-test` lets a scripted run swing by itself: wind up for a while, then let go.
     let scripted = args.attack_test && combat.state.stage != Stage::Sheathed && time.elapsed_secs() % 4.0 < 3.0;
@@ -275,6 +290,23 @@ pub fn drive(
     }
     let Ok((mut tf, mut vis, mut anim)) = q.get_mut(entity) else { return };
     anim.keep_pose = true;
+    if put_away {
+        anim.overlay = None;
+        body.overlay_slot = None;
+    }
+    // The body bends to where the hero looks (the engine's extra rotations): a tenth of the pitch at the head and
+    // at the neck and four tenths at the chest and at the belt with a weapon drawn, so the arms and the blade swing
+    // where the eyes point; a quarter at each otherwise.
+    anim.bend.clear();
+    if body.scripted.is_none() && !dead {
+        let pitch = -fly.pitch;
+        let share = if combat.state.is_fighting() { [0.1, 0.1, 0.4, 0.4] } else { [0.25; 4] };
+        for (bone, part) in body.bend_bones.iter().zip(share) {
+            if let Some(bone) = bone {
+                anim.bend.push((*bone, Quat::from_rotation_x(pitch * part)));
+            }
+        }
+    }
     // Where the hero stands, facing where they look.
     tf.translation = fly.player.feet;
     tf.rotation = Quat::from_rotation_y(fly.yaw + std::f32::consts::PI);
@@ -419,6 +451,7 @@ pub fn attach(
     mut commands: Commands,
     arx: Res<Arx>,
     fly: Res<Fly>,
+    time: Res<Time>,
     lights: Res<LevelLights>,
     mut body: ResMut<PlayerBody>,
     mut combat: ResMut<Combat>,
@@ -470,6 +503,14 @@ pub fn attach(
             eye.x = body_tf.translation.x + o.x;
             eye.z = body_tf.translation.z + o.y;
         }
+        // The pose changes at once when the hero ducks or stands up; the eyes ease into it instead of snapping.
+        let rise = eye.y - body_tf.translation.y;
+        let shown = match body.eye_rise {
+            Some(now) if (rise - now).abs() > 3.0 && (rise - now).abs() < 90.0 => now + (rise - now) * (time.delta_secs() * 14.0).min(1.0),
+            _ => rise,
+        };
+        body.eye_rise = Some(shown);
+        eye.y = body_tf.translation.y + shown;
         camera.translation = eye;
     }
 

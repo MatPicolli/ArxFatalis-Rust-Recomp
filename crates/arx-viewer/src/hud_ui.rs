@@ -514,7 +514,8 @@ pub fn mouse(
     let (w, h) = (window.width(), window.height());
     let g = geometry(w, h, &ui);
     // Screenshot runs ignore the real mouse.
-    let Some(pos) = window.cursor_position().filter(|_| shot.is_none()) else { return };
+    // While the mouse turns the view there is no cursor: where the hidden one happens to be must not click anything.
+    let Some(pos) = window.cursor_position().filter(|_| shot.is_none() && ui.cursor_mode) else { return };
     let player = s.player;
     // The ray from the camera through the cursor: what lies under it in the world.
     let ray = if ui.cursor_mode { camera.0.viewport_to_world(camera.1, pos).ok() } else { None };
@@ -759,7 +760,7 @@ pub fn draw(
 
     let g = geometry(w, h, &ui);
     let mut c = Canvas::new(font.0.clone());
-    let cursor = window.cursor_position().filter(|_| shot.is_none());
+    let cursor = window.cursor_position().filter(|_| shot.is_none() && ui.cursor_mode);
     let hover = |r: Rect| cursor.is_some_and(|p| r.contains(p));
     let mut tooltip: Option<(String, Vec2)> = None;
 

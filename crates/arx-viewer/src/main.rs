@@ -357,7 +357,7 @@ fn load_current(
                 bounds = Some(m.bounds);
                 commands.spawn((
                     Shown,
-                    animated::Animated { skeleton, anim, meshes: m.meshes, elapsed_us: 0, looping: true, root_motion: false, overlay: None, keep_pose: false, pose: None, shown: None },
+                    animated::Animated { skeleton, anim, meshes: m.meshes, elapsed_us: 0, looping: true, root_motion: false, overlay: None, keep_pose: false, pose: None, shown: None, bend: Vec::new() },
                 ));
             }
             bounds
@@ -553,7 +553,10 @@ fn run_level(args: Args, pak: PakSet) {
                 ..default()
             })
             // Arx units are about centimetres; spatial audio works in metres.
-            .set(bevy::audio::AudioPlugin { default_spatial_scale: bevy::audio::SpatialScale::new(0.01), ..default() }),
+            // The audio engine's own fading with distance is far too steep for the game's rooms. Scaled this small,
+            // every sound is "within arm's reach" for it, so it only pans left and right, and `audio::falloff`
+            // sets the loudness the way the original does.
+            .set(bevy::audio::AudioPlugin { default_spatial_scale: bevy::audio::SpatialScale::new(0.0001), ..default() }),
     )
     .insert_resource(ClearColor(Color::BLACK))
     .insert_resource(Arx(std::sync::Arc::new(pak)))
@@ -638,11 +641,13 @@ fn run_level(args: Args, pak: PakSet) {
             timed!(entities::spawn_dropped, "entities::spawn_dropped"),
             timed!(entities::respawn, "entities::respawn"),
             timed!(scripting::apply_state, "scripting::apply_state"),
+            timed!(speech::talk, "speech::talk"),
             timed!(npcs::apply, "npcs::apply"),
             timed!(npcs::log, "npcs::log"),
             timed!(scripting::auto_use, "scripting::auto_use"),
             timed!(scripting::sync_obstacles, "scripting::sync_obstacles"),
             timed!(audio::play_sounds, "audio::play_sounds"),
+            timed!(audio::falloff, "audio::falloff"),
         )
             .chain(),
         (
@@ -879,7 +884,7 @@ fn fly_camera(
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
     mut fly: ResMut<Fly>,
-    mut cursor: Single<&mut CursorOptions, With<Window>>,
+    mut window: Single<(&mut Window, &mut CursorOptions)>,
     mut cam: Single<&mut Transform, (With<Camera3d>, Without<crate::book_hero::BookCamera>)>,
     shot: Option<Res<Shot>>,
     mut script: ResMut<scripting::Scripting>,
@@ -891,6 +896,7 @@ fn fly_camera(
     // Screenshot runs are scripted: ignore the real keyboard and mouse so they are reproducible.
     // A cutscene takes the controls away as well.
     let live = shot.is_none() && script.host.stage.controls;
+    let (window, cursor) = &mut *window;
     let keys: &ButtonInput<KeyCode> = if live { &keys } else { &ButtonInput::default() };
     let mouse: &ButtonInput<MouseButton> = if live { &mouse } else { &ButtonInput::default() };
     let motion = if live { motion.delta } else { Vec2::ZERO };
@@ -908,8 +914,18 @@ fn fly_camera(
     if mouse.just_pressed(MouseButton::Left) && !wants_cursor && !ui.over_hud && ui.hover_item.is_none() {
         cursor.grab_mode = CursorGrabMode::Locked;
     }
+    // A window that is not in front has no business holding the mouse.
+    if !window.focused {
+        cursor.grab_mode = CursorGrabMode::None;
+    }
     cursor.visible = false;
     let captured = cursor.grab_mode != CursorGrabMode::None;
+    // The captured mouse is kept in the middle of the window: the system may only confine it, and a hidden cursor
+    // left wherever it was caught would wander to the edge, or sit on a button.
+    if captured && shot.is_none() {
+        let middle = Vec2::new(window.width(), window.height()) / 2.0;
+        window.set_cursor_position(Some(middle));
+    }
     ui.cursor_mode = !captured;
     if captured || mouse.pressed(MouseButton::Right) && !wants_cursor {
         fly.yaw -= motion.x * fly.mouse_speed;

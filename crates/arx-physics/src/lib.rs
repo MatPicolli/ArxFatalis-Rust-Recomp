@@ -7,7 +7,8 @@
 //!
 //! The player's movement follows the original engine (`PlayerMovementIterate`): keys push the body with a
 //! force whose strength comes from the speed of the hero animation that would be playing, the body's
-//! horizontal velocity is damped every step, jumps rise a fixed 130 units in 200 ms and then fall slowly,
+//! horizontal velocity is damped every step, jumps rise a fixed 130 units in 200 ms and then fall slowly
+//! (that is `Player::classic`; by default the jump and the crouch are tightened, see there),
 //! and a long fall hurts. See [`MoveInput`], [`Player`] and `arx player-speeds`.
 
 pub mod items;
@@ -55,6 +56,13 @@ const JUMP_REQUEST_MS: f32 = 350.0;
 pub const SAFE_FALL_HEIGHT: f32 = 400.0;
 /// Length of the crouch-in / crouch-out animations (`human_normal_crouch_in/out`).
 const CROUCH_ANIM_MS: f32 = 708.3;
+/// The tightened movement (see [`Player::classic`]): how long ducking and standing up take, ...
+const QUICK_CROUCH_MS: f32 = 140.0;
+/// ... the one gravity that pulls on a jump and on a fall alike (units/s^2), ...
+const QUICK_GRAVITY: f32 = 1700.0;
+/// ... how high a jump goes (the take-off speed follows from it), and the fastest a fall gets.
+const QUICK_JUMP_HEIGHT: f32 = 95.0;
+const QUICK_FALL_SPEED_MAX: f32 = 2600.0;
 /// A new body step is never longer than this, so thin walls cannot be skipped.
 const MAX_SUBSTEP_SECS: f32 = 1.0 / 60.0;
 
@@ -813,6 +821,11 @@ pub struct Player {
     walked: f32,
     steps: u32,
     jumped: bool,
+    /// Move exactly as the original does: a jump that rises 130 units in a fifth of a second and then floats down,
+    /// three times the running speed in the air, a dead stop on landing, and a crouch that takes 0.7 s before the
+    /// body is any lower. Off by default: the owner of this project asked for a jump with ordinary gravity that
+    /// keeps its speed, and a crouch that answers at once.
+    pub classic: bool,
 }
 
 /// Distance walked between footsteps (`STEP_DISTANCE`).
@@ -847,12 +860,24 @@ impl Player {
             walked: 0.0,
             steps: 0,
             jumped: false,
+            classic: false,
         }
     }
 
     /// Height of the collision cylinder right now.
     pub fn height(&self) -> f32 {
-        if self.stance == Stance::Crouched { CROUCH_HEIGHT } else { PLAYER_HEIGHT }
+        let low = match self.stance {
+            Stance::Crouched => true,
+            // The original only gets lower once the crouch-in animation has ended.
+            Stance::GoingDown(_) => !self.classic,
+            _ => false,
+        };
+        if low { CROUCH_HEIGHT } else { PLAYER_HEIGHT }
+    }
+
+    /// How long ducking or standing up takes.
+    fn crouch_ms(&self) -> f32 {
+        if self.classic { CROUCH_ANIM_MS } else { QUICK_CROUCH_MS }
     }
 
     pub fn is_crouching(&self) -> bool {
@@ -861,7 +886,8 @@ impl Player {
 
     /// Eye height above the feet; it follows the crouch animations.
     pub fn eye_height(&self) -> f32 {
-        let lerp = |from: f32, to: f32, left: f32| from + (to - from) * (1.0 - left / CROUCH_ANIM_MS);
+        let total = self.crouch_ms();
+        let lerp = |from: f32, to: f32, left: f32| from + (to - from) * (1.0 - left / total);
         match self.stance {
             Stance::Standing => EYE_HEIGHT,
             Stance::GoingDown(left) => lerp(EYE_HEIGHT, CROUCH_EYE_HEIGHT, left),
@@ -925,6 +951,15 @@ impl Player {
 
     /// Strength of the push this step, from the animation the engine would be playing.
     fn push_scale(&self, input: &MoveInput) -> f32 {
+        if self.phase != JumpPhase::None && !self.classic {
+            // In the air the body keeps about its running speed, a little more going forward.
+            return match input.kind {
+                MoveKind::Backward => SCALE_RUN * 0.8,
+                MoveKind::Forward => SCALE_RUN * 1.3,
+                MoveKind::Strafe => SCALE_RUN,
+                MoveKind::None => 0.0,
+            };
+        }
         if self.phase != JumpPhase::None {
             return match input.kind {
                 MoveKind::Backward => SCALE_AIR_BACKWARD,
@@ -934,7 +969,8 @@ impl Player {
             };
         }
         match self.stance {
-            Stance::GoingDown(_) | Stance::GettingUp(_) => SCALE_CROUCH_TRANSITION,
+            Stance::GoingDown(_) | Stance::GettingUp(_) if self.classic => SCALE_CROUCH_TRANSITION,
+            Stance::GoingDown(_) | Stance::GettingUp(_) => SCALE_CROUCH_WALK,
             Stance::Crouched => match input.kind {
                 MoveKind::Strafe => SCALE_CROUCH_STRAFE,
                 _ => SCALE_CROUCH_WALK,
@@ -950,6 +986,9 @@ impl Player {
     /// Landing slows the push for a while: half strength for 300 ms, then the engine's own ramp, which
     /// (as in the original) overshoots below zero before it reaches full strength again at 600 ms.
     fn landing_recovery(&self) -> f32 {
+        if !self.classic {
+            return 1.0;
+        }
         let since = self.clock_ms - self.last_landing_ms;
         if since >= 600.0 {
             return 1.0;
@@ -968,13 +1007,16 @@ impl Player {
         // Crouching. The body stays crouched while there is no room to stand.
         let can_stand = world.headroom(self.feet, self.feet.y, PLAYER_HEIGHT) >= PLAYER_HEIGHT;
         let want_crouch = input.crouch || !can_stand;
+        let crouch_ms = self.crouch_ms();
+        // (Turning round half-way carries on from where the body is, so that a tap does not make it jump.)
+        let rest = |left: f32| if self.classic { crouch_ms } else { crouch_ms - left };
         self.stance = match (self.stance, want_crouch) {
-            (Stance::Standing, true) => Stance::GoingDown(CROUCH_ANIM_MS),
-            (Stance::GoingDown(_), false) => Stance::GettingUp(CROUCH_ANIM_MS),
+            (Stance::Standing, true) => Stance::GoingDown(crouch_ms),
+            (Stance::GoingDown(left), false) => Stance::GettingUp(rest(left)),
             (Stance::GoingDown(left), true) if left > dt_ms => Stance::GoingDown(left - dt_ms),
             (Stance::GoingDown(_), true) => Stance::Crouched,
-            (Stance::Crouched, false) => Stance::GettingUp(CROUCH_ANIM_MS),
-            (Stance::GettingUp(_), true) => Stance::GoingDown(CROUCH_ANIM_MS),
+            (Stance::Crouched, false) => Stance::GettingUp(crouch_ms),
+            (Stance::GettingUp(left), true) => Stance::GoingDown(rest(left)),
             (Stance::GettingUp(left), false) if left > dt_ms => Stance::GettingUp(left - dt_ms),
             (Stance::GettingUp(_), false) => Stance::Standing,
             (stance, _) => stance,
@@ -991,10 +1033,18 @@ impl Player {
             self.jump_request_ms = None;
             if self.stance == Stance::Standing || can_stand {
                 self.stance = Stance::Standing;
-                self.phase = JumpPhase::Ascending(0.0);
                 self.on_ground = false;
-                self.vel_y = 0.0;
                 self.jumped = true;
+                if self.classic {
+                    self.phase = JumpPhase::Ascending(0.0);
+                    self.vel_y = 0.0;
+                } else {
+                    // Thrown up and pulled back down by the same gravity all the way.
+                    self.phase = JumpPhase::Descending;
+                    self.falling = true;
+                    self.fall_start_y = self.feet.y;
+                    self.vel_y = (2.0 * QUICK_GRAVITY * QUICK_JUMP_HEIGHT).sqrt();
+                }
             }
         }
 
@@ -1021,19 +1071,31 @@ impl Player {
                 self.phase = if now >= JUMP_RISE_MS { self.start_fall(rise) } else { JumpPhase::Ascending(now) };
             }
             _ if self.on_ground => self.vel_y = 0.0,
-            _ => self.vel_y -= if self.falling { FALL_GRAVITY } else { WORLD_GRAVITY } * dt,
+            _ if self.classic => self.vel_y -= if self.falling { FALL_GRAVITY } else { WORLD_GRAVITY } * dt,
+            _ => self.vel_y = (self.vel_y - QUICK_GRAVITY * dt).max(-QUICK_FALL_SPEED_MAX),
         }
 
         // A drop that gets fast enough and has nothing close below counts as a fall.
         if !self.on_ground && self.phase == JumpPhase::None && self.vel_y < -FALL_TRIGGER_SPEED {
             let gap = world.floor_height(self.feet.x, self.feet.z, self.feet.y).map_or(f32::INFINITY, |f| self.feet.y - f);
             if gap > 80.0 {
-                self.phase = self.start_fall(0.0);
+                if self.classic {
+                    self.phase = self.start_fall(0.0);
+                } else {
+                    // The fall is measured from here; its speed is kept.
+                    self.falling = true;
+                    self.fall_start_y = self.feet.y;
+                    self.phase = JumpPhase::Descending;
+                }
             }
         }
 
         let was_on_ground = self.on_ground;
         self.move_body(world, self.vel_h * dt, rise, dt);
+        // A fall is as high as the highest point reached.
+        if self.falling && !self.classic {
+            self.fall_start_y = self.fall_start_y.max(self.feet.y);
+        }
         if !was_on_ground && self.on_ground {
             self.land();
         }
@@ -1051,7 +1113,9 @@ impl Player {
         self.phase = JumpPhase::None;
         self.last_landing_ms = self.clock_ms;
         if self.falling {
-            self.vel_h = Vec2::ZERO;
+            if self.classic {
+                self.vel_h = Vec2::ZERO;
+            }
             let height = self.fall_start_y - self.feet.y;
             if height > SAFE_FALL_HEIGHT {
                 self.landed_fall = Some(height);
@@ -1119,6 +1183,20 @@ impl Player {
                 return;
             }
             self.on_ground = false;
+        }
+
+        // Going up (a jump thrown by its speed): the head may meet a ceiling, and then the way is down.
+        if self.vel_y > 0.0 {
+            pos.y += self.vel_y * dt;
+            if let Some(c) = world.ceiling_above(pos, old.y + STEP_HEIGHT, pos.y + h)
+                && c < pos.y + h
+            {
+                pos.y = (c - h).max(old.y);
+                self.vel_y = 0.0;
+            }
+            self.on_ground = false;
+            self.feet = pos;
+            return;
         }
 
         // Falling: land on a floor we reach or cross during this step.
@@ -1306,6 +1384,8 @@ mod tests {
     fn a_jump_rises_about_130_units_and_takes_under_a_second() {
         let w = CollisionWorld::from_triangles(floor(4000.0));
         let mut p = Player::new(Vec3::ZERO);
+        // The original's movement is what this pins down.
+        p.classic = true;
         settle(&w, &mut p, 0.5);
         let (mut apex, mut air) = (0.0f32, 0.0f32);
         let jump = MoveInput { jump: true, ..Default::default() };
@@ -1327,6 +1407,8 @@ mod tests {
     fn holding_jump_does_not_bounce_and_a_press_during_a_fall_is_remembered_briefly() {
         let w = CollisionWorld::from_triangles(floor(4000.0));
         let mut p = Player::new(Vec3::ZERO);
+        // The original's movement is what this pins down.
+        p.classic = true;
         settle(&w, &mut p, 0.5);
         let held = MoveInput { jump: true, ..Default::default() };
         let mut jumps = 0;
@@ -1345,6 +1427,8 @@ mod tests {
     fn a_running_jump_carries_forward_and_landing_stops_the_slide() {
         let w = CollisionWorld::from_triangles(floor(4000.0));
         let mut p = Player::new(Vec3::new(0.0, 0.0, -3000.0));
+        // The original's movement is what this pins down.
+        p.classic = true;
         settle(&w, &mut p, 0.3);
         run(&w, &mut p, forward(), 1.5);
         let start = p.feet.z;
@@ -1360,6 +1444,8 @@ mod tests {
         assert!(landed_at.is_some());
         let _ = start;
         let mut q = Player::new(Vec3::new(0.0, 0.0, -3000.0));
+        // The original's movement is what this pins down.
+        q.classic = true;
         settle(&w, &mut q, 0.3);
         run(&w, &mut q, forward(), 1.5);
         let z0 = q.feet.z;
@@ -1378,6 +1464,8 @@ mod tests {
     #[test]
     fn landing_slows_the_push_with_the_engines_ramp() {
         let mut p = Player::new(Vec3::ZERO);
+        // The original's movement is what this pins down.
+        p.classic = true;
         p.last_landing_ms = 0.0;
         for (since, expect) in [(0.0, 0.5), (299.0, 0.5), (450.0, 0.0), (599.0, -0.497), (600.0, 1.0), (5000.0, 1.0)] {
             p.clock_ms = since;
@@ -1389,6 +1477,8 @@ mod tests {
     fn jump_cannot_clear_a_tall_wall_and_lands_again() {
         let w = room();
         let mut p = Player::new(Vec3::ZERO);
+        // The original's movement is what this pins down.
+        p.classic = true;
         settle(&w, &mut p, 0.5);
         p.step(&w, 1.0 / 60.0, MoveInput { jump: true, ..forward() });
         let mut apex = 0.0f32;
@@ -1518,6 +1608,8 @@ mod tests {
     fn crouching_lowers_the_body_and_eyes_after_the_animation() {
         let w = floor_only();
         let mut p = Player::new(Vec3::ZERO);
+        // The original's movement is what this pins down.
+        p.classic = true;
         settle(&w, &mut p, 0.3);
         assert_eq!((p.height(), p.eye_height()), (PLAYER_HEIGHT, EYE_HEIGHT));
         let crouch = MoveInput { crouch: true, ..Default::default() };
@@ -1536,6 +1628,8 @@ mod tests {
         // 150 high: too low to stand, enough to crouch.
         let w = low_ceiling(150.0);
         let mut p = Player::new(Vec3::new(0.0, 0.0, 0.0));
+        // The original's movement is what this pins down.
+        p.classic = true;
         settle(&w, &mut p, 0.3);
         // Standing, the head hits the ceiling's edge like a wall (the original does not crouch for you here).
         run(&w, &mut p, forward(), 4.0);
@@ -1614,6 +1708,8 @@ mod tests {
     fn falls_are_floaty_once_fast_enough() {
         let w = CollisionWorld::from_triangles(floor(4000.0));
         let mut p = Player::new(Vec3::new(0.0, 2000.0, 0.0));
+        // The original's movement is what this pins down.
+        p.classic = true;
         let mut v_late = 0.0f32;
         for _ in 0..200 {
             p.step(&w, 1.0 / 60.0, MoveInput::default());
@@ -1717,4 +1813,64 @@ mod tests {
         w.set_obstacle_enabled(door, false);
         assert!((w.raycast(Vec3::new(0.0, 100.0, 0.0), Vec3::Z, 1000.0).unwrap().t - 500.0).abs() < 1e-2);
     }
+    #[test]
+    fn the_tightened_jump_is_thrown_and_pulled_down_by_one_gravity() {
+        let w = floor_only();
+        let mut p = Player::new(Vec3::new(0.0, 0.0, 0.0));
+        settle(&w, &mut p, 0.5);
+        assert!(p.on_ground && !p.classic);
+        // Running, then a jump: up to about 95 units, back down in well under a second, and still running.
+        let forward = MoveInput::from_keys(0.0, true, false, false, false);
+        run(&w, &mut p, forward, 1.5);
+        let speed = p.vel_h.length();
+        let from = p.feet;
+        p.step(&w, 1.0 / 60.0, MoveInput { jump: true, ..forward });
+        assert!(p.take_jump() && !p.on_ground);
+        let (mut apex, mut frames, mut airborne_speed) = (0.0f32, 0, 0.0f32);
+        while !p.on_ground && frames < 600 {
+            p.step(&w, 1.0 / 60.0, forward);
+            apex = apex.max(p.feet.y);
+            airborne_speed = airborne_speed.max(p.vel_h.length());
+            frames += 1;
+        }
+        let secs = frames as f32 / 60.0;
+        assert!((apex - QUICK_JUMP_HEIGHT).abs() < 6.0, "apex {apex}");
+        assert!((0.55..0.8).contains(&secs), "in the air for {secs} s");
+        assert!(airborne_speed < speed * 1.4, "no faster than a run and a third: {airborne_speed} against {speed}");
+        assert!(p.vel_h.length() > speed * 0.9, "landing does not stop the run: {}", p.vel_h.length());
+        let carried = (p.feet - from).length();
+        assert!((170.0..300.0).contains(&carried), "carried {carried} units");
+        assert_eq!(p.take_landing(), None, "a jump does not hurt");
+        // A long drop still does: the height is counted from the top.
+        let mut q = Player::new(Vec3::new(0.0, 700.0, 0.0));
+        while !q.on_ground {
+            q.step(&w, 1.0 / 60.0, MoveInput::default());
+        }
+        let fell = q.take_landing().expect("a 700 unit fall hurts");
+        assert!((fell - 700.0).abs() < 60.0, "fell {fell}");
+    }
+
+    #[test]
+    fn the_tightened_crouch_answers_at_once() {
+        let w = floor_only();
+        let mut p = Player::new(Vec3::ZERO);
+        settle(&w, &mut p, 0.5);
+        let crouch = MoveInput { crouch: true, ..Default::default() };
+        p.step(&w, 1.0 / 60.0, crouch);
+        // The body is low from the first frame; the eyes follow within a fraction of a second.
+        assert_eq!(p.height(), CROUCH_HEIGHT);
+        run(&w, &mut p, crouch, 0.05);
+        assert!(p.eye_height() < EYE_HEIGHT && p.eye_height() > CROUCH_EYE_HEIGHT);
+        run(&w, &mut p, crouch, 0.2);
+        assert_eq!((p.stance, p.eye_height()), (Stance::Crouched, CROUCH_EYE_HEIGHT));
+        // Moving while ducking is at the crouched pace straight away, not slower.
+        let mut q = Player::new(Vec3::ZERO);
+        settle(&w, &mut q, 0.5);
+        run(&w, &mut q, MoveInput { crouch: true, ..MoveInput::from_keys(0.0, true, false, false, false) }, 1.0);
+        assert!((q.vel_h.length() - 100.0).abs() < 5.0, "{}", q.vel_h.length());
+        // And up again as quickly.
+        run(&w, &mut p, MoveInput::default(), 0.2);
+        assert_eq!((p.stance, p.height(), p.eye_height()), (Stance::Standing, PLAYER_HEIGHT, EYE_HEIGHT));
+    }
+
 }

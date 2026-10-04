@@ -35,6 +35,8 @@ pub struct Animated {
     pub pose: Option<Pose>,
     /// What the meshes show now: a pose that has not changed is not built and uploaded again.
     pub shown: Option<Shown>,
+    /// Extra rotations on some bones (a bone and a rotation in the model's axes): the hero bending to look up or down.
+    pub bend: Vec<(usize, Quat)>,
 }
 
 /// The animations and times a pose was built from.
@@ -43,6 +45,8 @@ pub struct Shown {
     anim: usize,
     time: i64,
     overlay: Option<(usize, i64)>,
+    /// The bend, to a thousandth.
+    bend: i64,
 }
 
 /// Mark a mesh entity so it is not culled by its (stale) bind-pose bounds.
@@ -81,7 +85,8 @@ pub fn animate(
             let t = if o.looping { o.anim.looped_time(o.elapsed_us) } else { o.elapsed_us.clamp(0, o.anim.duration_us) };
             (Arc::as_ptr(&o.anim) as usize, t)
         });
-        let shown = Shown { anim: Arc::as_ptr(&anim) as usize, time: t, overlay: overlay_at };
+        let bend = a.bend.iter().map(|(bone, q)| (*bone as i64 + 1) * ((q.x * 1000.0) as i64 * 7 + (q.y * 1000.0) as i64 * 13 + (q.z * 1000.0) as i64 * 17 + (q.w * 1000.0) as i64)).sum();
+        let shown = Shown { anim: Arc::as_ptr(&anim) as usize, time: t, overlay: overlay_at, bend };
         if a.shown == Some(shown) {
             continue;
         }
@@ -96,7 +101,7 @@ pub fn animate(
                 layers.push((o, *ot));
             }
             layers.push((&anim, t));
-            let pose = a.skeleton.pose_layers(&layers, Vec3::ZERO.to_array().into());
+            let pose = a.skeleton.pose_layers_bent(&layers, Vec3::ZERO.to_array().into(), &a.bend);
             let out = pose.vertices.iter().map(|p| to_bevy(p.to_array())).collect();
             if a.keep_pose {
                 a.pose = Some(pose);
