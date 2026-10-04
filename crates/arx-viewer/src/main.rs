@@ -11,12 +11,14 @@ mod animated;
 mod audio;
 mod convert;
 mod entities;
+mod drag;
 mod hud;
 mod hud_book;
 mod hud_ui;
 mod level;
 mod scripting;
 mod speech;
+mod steps;
 
 use arx_formats::PakSet;
 use bevy::{
@@ -109,6 +111,13 @@ struct Args {
     /// Level mode: start with this much experience (levels up the hero), for headless testing
     #[arg(long, default_value_t = 0)]
     xp: i64,
+    /// Level mode: walk forward by itself from the start (headless testing of movement and footsteps)
+    #[arg(long)]
+    walk_forward: bool,
+    /// Level mode: give the player this entity, drag it out over the world along the view direction (`id` or
+    /// `id:pitch-degrees`, default looking slightly down) and let go of it, for headless testing of dragging/throwing
+    #[arg(long)]
+    throw_test: Option<String>,
     /// Level mode: start with the inventory panel open
     #[arg(long)]
     show_inventory: bool,
@@ -429,6 +438,8 @@ struct LevelArgs {
     give_and_drop: Vec<String>,
     show_book: Option<String>,
     xp: i64,
+    walk_forward: bool,
+    throw_test: Option<String>,
 }
 
 #[derive(Resource)]
@@ -484,6 +495,8 @@ fn run_level(args: Args, pak: PakSet) {
         give_and_drop: args.give_and_drop.clone(),
         show_book: args.show_book.clone(),
         xp: args.xp,
+        walk_forward: args.walk_forward,
+        throw_test: args.throw_test.clone(),
     })
     .insert_resource(entities::EntityCache::default())
     .insert_resource(entities::SpawnedEntities::default())
@@ -505,6 +518,9 @@ fn run_level(args: Args, pak: PakSet) {
     .insert_resource(audio::Sounds::new(args.mute))
     .insert_resource(speech::Speech::new(locale, args.language.clone(), !args.no_subtitles, args.mute))
     .add_systems(Startup, (hud_ui::load_font, speech::spawn_ui).chain())
+    .add_systems(Startup, steps::load)
+    .insert_resource(steps::StepSounds::default())
+    .insert_resource(drag::ItemBodies::default())
     .insert_resource(hud_ui::UiFont::default())
     .insert_resource(hud::Ui { hud_scale: args.hud_scale, ..default() })
     .insert_resource(hud_ui::UiAssets::default())
@@ -520,10 +536,14 @@ fn run_level(args: Args, pak: PakSet) {
             scripting::sync_obstacles,
             audio::play_sounds,
             fly_camera,
+            steps::footsteps,
+            steps::ui_sounds,
             hud::debug_pickup,
             hud::input,
             scripting::interact,
             hud_ui::mouse,
+            drag::debug_throw,
+            drag::step_bodies,
             hud_ui::draw,
             animated::animate,
             level_hud,
@@ -698,6 +718,7 @@ fn fly_camera(
     shot: Option<Res<Shot>>,
     mut script: ResMut<scripting::Scripting>,
     mut ui: ResMut<hud::Ui>,
+    args: Res<LevelArgs>,
     mut was_open: Local<bool>,
     mut regrab: Local<bool>,
 ) {
@@ -717,7 +738,7 @@ fn fly_camera(
         cursor.grab_mode = CursorGrabMode::Locked;
     }
     *was_open = wants_cursor;
-    if mouse.just_pressed(MouseButton::Left) && !wants_cursor && !ui.over_hud {
+    if mouse.just_pressed(MouseButton::Left) && !wants_cursor && !ui.over_hud && ui.hover_item.is_none() {
         cursor.grab_mode = CursorGrabMode::Locked;
     }
     if keys.just_pressed(KeyCode::Escape) {
@@ -758,7 +779,7 @@ fn fly_camera(
         let mut input = if dead {
             arx_physics::MoveInput::default()
         } else {
-            arx_physics::MoveInput::from_keys(fly.yaw, keys.pressed(KeyCode::KeyW), keys.pressed(KeyCode::KeyS), keys.pressed(KeyCode::KeyA), keys.pressed(KeyCode::KeyD))
+            arx_physics::MoveInput::from_keys(fly.yaw, keys.pressed(KeyCode::KeyW) || args.walk_forward, keys.pressed(KeyCode::KeyS), keys.pressed(KeyCode::KeyA), keys.pressed(KeyCode::KeyD))
         };
         input.stealth = keys.pressed(KeyCode::ShiftLeft);
         input.crouch = !dead && (keys.pressed(KeyCode::KeyX) || fly.crouch_toggle);
@@ -769,8 +790,14 @@ fn fly_camera(
         if let Some(height) = fly.player.take_landing() {
             let damage = arx_physics::fall_damage(height);
             script.host.player.life.add(-damage);
-            let text = if script.host.player.is_dead() { "You are dead - press R".to_owned() } else { format!("Ouch! The fall cost {damage:.0} life") };
-            script.host.push_message(text);
+            // The player's own script cries out (`on ouch`) or dies (`on die`).
+            let player = script.player;
+            let sc = &mut *script;
+            sc.world.send_event(&mut sc.host, None, player, "ouch", vec![format!("{damage:.0}")]);
+            if sc.host.player.is_dead() {
+                sc.world.send_event(&mut sc.host, None, player, "die", Vec::new());
+                sc.host.push_message("You are dead - press R".to_owned());
+            }
         }
         fly.pos = fly.player.eye();
     } else {

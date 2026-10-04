@@ -14,12 +14,16 @@ pub const BAG_HIDDEN: f32 = 110.0;
 /// Where the chest panel hides to the left (unscaled pixels).
 pub const PANEL_HIDDEN: f32 = -160.0;
 
-/// An item being dragged with the mouse.
+/// An item being dragged with the mouse: an icon over the interface, the 3D item itself out in the world.
 #[derive(Clone, Copy)]
 pub struct Drag {
     pub item: EntityId,
     /// Where the cursor grabbed the icon, relative to its top-left corner (pixels).
     pub grab: Vec2,
+    /// It was picked up from the floor, not out of the inventory.
+    pub from_world: bool,
+    /// It has been given a model in the scene (needed for items that came out of chests).
+    pub spawned: bool,
 }
 
 #[derive(Resource)]
@@ -55,6 +59,12 @@ pub struct Ui {
     /// The developer overlay (position, help line) is shown (`F3`).
     pub debug: bool,
     /// The open page of the player's book.
+    /// Where the dragged item would go if let go now (while it is dragged over the world).
+    pub drag_spot: Option<arx_physics::items::DragSpot>,
+    /// The item lying in the world under the cursor.
+    pub hover_item: Option<EntityId>,
+    /// Interface sounds to play (`sfx/<name>.wav`).
+    pub sfx: Vec<&'static str>,
     pub book: Option<crate::hud_book::BookPage>,
     /// First page (always even) of the note or quest log shown.
     pub note_page: usize,
@@ -80,6 +90,9 @@ impl Default for Ui {
             hud_scale: 0.5,
             kbd: false,
             debug: false,
+            drag_spot: None,
+            hover_item: None,
+            sfx: Vec::new(),
             book: None,
             note_page: 0,
             quest_page: 0,
@@ -181,7 +194,9 @@ pub fn input(
         ui.debug = !ui.debug;
     }
     if keys.just_pressed(KeyCode::KeyB) && ui.reading.is_none() {
-        ui.book = if ui.book.is_some() { None } else { Some(crate::hud_book::BookPage::Stats) };
+        let was_open = ui.book.is_some();
+        ui.sfx.push(if was_open { "book_close" } else { "book_open" });
+        ui.book = if was_open { None } else { Some(crate::hud_book::BookPage::Stats) };
     }
     // Things to read (notes, signs) come first; any of these keys puts them away.
     for note in s.host.take_notes() {
@@ -197,6 +212,7 @@ pub fn input(
     }
     if keys.just_pressed(KeyCode::KeyI) {
         ui.open = !ui.open;
+        ui.sfx.push("interface_backpack");
     }
     // An open container (chest, corpse) has the keyboard until it is closed or the player walks away.
     if let Some(container) = s.host.open_container {

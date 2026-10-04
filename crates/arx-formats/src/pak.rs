@@ -246,6 +246,17 @@ impl PakSet {
         Some(crate::locale::Locale::parse(&bytes))
     }
 
+    /// What hits what makes which sound: the step, weapon and armour tables of the game, merged.
+    pub fn load_sound_map(&self) -> crate::soundmap::SoundMap {
+        let mut map = crate::soundmap::SoundMap::default();
+        for name in ["snd_armor", "snd_step", "snd_weapon"] {
+            if let Ok(bytes) = self.read(&format!("localisation/{name}.ini")) {
+                map.merge(crate::soundmap::SoundMap::parse(&String::from_utf8_lossy(&bytes)));
+            }
+        }
+        map
+    }
+
     pub fn len(&self) -> usize {
         self.files.len()
     }

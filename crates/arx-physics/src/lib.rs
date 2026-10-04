@@ -10,6 +10,8 @@
 //! horizontal velocity is damped every step, jumps rise a fixed 130 units in 200 ms and then fall slowly,
 //! and a long fall hurts. See [`MoveInput`], [`Player`] and `arx player-speeds`.
 
+pub mod items;
+
 use arx_formats::{fts::Fts, poly};
 use glam::{Vec2, Vec3};
 use std::collections::HashMap;
@@ -79,6 +81,40 @@ struct Tri {
     n: Vec3,
     min_y: f32,
     max_y: f32,
+    /// Index into the world's material names (0 = unknown): what the surface is made of.
+    mat: u8,
+}
+
+/// Where a ray hit a surface.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RayHit {
+    /// Distance along the ray.
+    pub t: f32,
+    /// Unit normal facing the ray.
+    pub normal: Vec3,
+}
+
+/// Moeller-Trumbore, two-sided: distance and the normal turned toward the ray origin.
+fn ray_triangle(origin: Vec3, dir: Vec3, t: &Tri) -> Option<(f32, Vec3)> {
+    let (e1, e2) = (t.b - t.a, t.c - t.a);
+    let p = dir.cross(e2);
+    let det = e1.dot(p);
+    if det.abs() < 1e-7 {
+        return None;
+    }
+    let inv = 1.0 / det;
+    let to = origin - t.a;
+    let u = to.dot(p) * inv;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = to.cross(e1);
+    let v = dir.dot(q) * inv;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let dist = e2.dot(q) * inv;
+    (dist > 1e-4).then(|| (dist, if t.n.dot(dir) > 0.0 { -t.n } else { t.n }))
 }
 
 /// A solid object that is not part of the level geometry (a door, a portcullis, a chest), made of
@@ -118,6 +154,11 @@ pub struct CollisionWorld {
     cylinders: RwLock<Vec<Cylinder>>,
     /// Centre of the largest flat, upward-facing solid triangle: a safe place to put the player.
     fallback_spawn: Option<(f32, Vec3)>,
+    /// Surface materials (`stone`, `wood`, ...), indexed by `Tri::mat`; entry 0 is `unknown`.
+    material_names: Vec<String>,
+    /// Water surfaces (not solid), for knowing when the player wades.
+    water: Vec<Tri>,
+    water_grid: HashMap<(i32, i32), Vec<u32>>,
 }
 
 /// Arx (+Y down, +Z forward) to y-up, -Z forward.
@@ -155,29 +196,99 @@ impl CollisionWorld {
     /// `NOCOL` polygons are not solid.
     pub fn from_fts(fts: &Fts) -> Self {
         let mut w = CollisionWorld::default();
+        w.material_names.push("unknown".to_owned());
         for p in &fts.polys {
+            let v: Vec<Vec3> = p.verts[..p.vertex_count()].iter().map(|v| to_yup(v.pos)).collect();
+            if p.flags & poly::WATER != 0 {
+                w.push_water(v[0], v[1], v[2]);
+                if v.len() == 4 {
+                    w.push_water(v[3], v[2], v[1]);
+                }
+            }
             if p.flags & (poly::WATER | poly::TRANS | poly::NOCOL) != 0 {
                 continue;
             }
-            let v: Vec<Vec3> = p.verts[..p.vertex_count()].iter().map(|v| to_yup(v.pos)).collect();
-            w.push(v[0], v[1], v[2], to_yup(p.norm));
+            // A floor with no texture counts as earth, one whose texture is not recognised as unknown.
+            let material = match fts.textures.get(&p.tex).filter(|n| !n.is_empty()) {
+                Some(name) => arx_formats::soundmap::floor_material(name),
+                None => "earth",
+            };
+            let mat = w.material_id(material);
+            w.push(v[0], v[1], v[2], to_yup(p.norm), mat);
             if v.len() == 4 {
-                w.push(v[3], v[2], v[1], to_yup(p.norm2));
+                w.push(v[3], v[2], v[1], to_yup(p.norm2), mat);
             }
         }
         w
+    }
+
+    fn material_id(&mut self, name: &str) -> u8 {
+        if let Some(i) = self.material_names.iter().position(|n| n == name) {
+            return i as u8;
+        }
+        self.material_names.push(name.to_owned());
+        (self.material_names.len() - 1) as u8
+    }
+
+    fn push_water(&mut self, a: Vec3, b: Vec3, c: Vec3) {
+        let geo = (b - a).cross(c - a);
+        if geo.length_squared() < 1e-6 {
+            return;
+        }
+        let (min, max) = (a.min(b).min(c), a.max(b).max(c));
+        let id = self.water.len() as u32;
+        self.water.push(Tri { a, b, c, n: geo.normalize(), min_y: min.y, max_y: max.y, mat: 0 });
+        for cx in cell(min.x)..=cell(max.x) {
+            for cz in cell(min.z)..=cell(max.z) {
+                self.water_grid.entry((cx, cz)).or_default().push(id);
+            }
+        }
+    }
+
+    /// Height of the water surface over `(x, z)`, if there is water there.
+    pub fn water_level_at(&self, x: f32, z: f32) -> Option<f32> {
+        let p = Vec2::new(x, z);
+        let mut best: Option<f32> = None;
+        for t in self.water_grid.get(&(cell(x), cell(z)))?.iter().map(|&i| &self.water[i as usize]) {
+            let (_, inside) = closest_on_tri_2d(p, Vec2::new(t.a.x, t.a.z), Vec2::new(t.b.x, t.b.z), Vec2::new(t.c.x, t.c.z));
+            if inside {
+                let y = if t.n.y.abs() > 0.1 { t.a.y - (t.n.x * (x - t.a.x) + t.n.z * (z - t.a.z)) / t.n.y } else { t.max_y };
+                if best.is_none_or(|b| y > b) {
+                    best = Some(y);
+                }
+            }
+        }
+        best
+    }
+
+    /// What the highest surface under `(x, z)` that is not above `max_y` is made of (`stone`, `wood`, ...).
+    pub fn floor_material(&self, x: f32, z: f32, max_y: f32) -> Option<&str> {
+        let (_, mat) = self.floor_surface(x, z, max_y)?;
+        Some(self.material_names.get(mat as usize).map_or("unknown", String::as_str))
     }
 
     /// Build a world from explicit y-up triangles (mainly for tests and tools).
     pub fn from_triangles(tris: impl IntoIterator<Item = [Vec3; 3]>) -> Self {
         let mut w = CollisionWorld::default();
+        w.material_names.push("unknown".to_owned());
         for [a, b, c] in tris {
-            w.push(a, b, c, Vec3::ZERO);
+            w.push(a, b, c, Vec3::ZERO, 0);
         }
         w
     }
 
-    fn push(&mut self, a: Vec3, b: Vec3, c: Vec3, stored_normal: Vec3) {
+    /// Like [`CollisionWorld::from_triangles`], with a material name for each triangle (tests and tools).
+    pub fn from_material_triangles<'a>(tris: impl IntoIterator<Item = ([Vec3; 3], &'a str)>) -> Self {
+        let mut w = CollisionWorld::default();
+        w.material_names.push("unknown".to_owned());
+        for ([a, b, c], material) in tris {
+            let mat = w.material_id(material);
+            w.push(a, b, c, Vec3::ZERO, mat);
+        }
+        w
+    }
+
+    fn push(&mut self, a: Vec3, b: Vec3, c: Vec3, stored_normal: Vec3, mat: u8) {
         let geo = (b - a).cross(c - a);
         if geo.length_squared() < 1e-6 {
             return; // degenerate
@@ -194,7 +305,7 @@ impl CollisionWorld {
                 self.fallback_spawn = Some((area, (a + b + c) / 3.0));
             }
         }
-        self.tris.push(Tri { a, b, c, n, min_y: min.y, max_y: max.y });
+        self.tris.push(Tri { a, b, c, n, min_y: min.y, max_y: max.y, mat });
         for cx in cell(min.x)..=cell(max.x) {
             for cz in cell(min.z)..=cell(max.z) {
                 self.grid.entry((cx, cz)).or_default().push(id);
@@ -224,7 +335,7 @@ impl CollisionWorld {
             let (lo, hi) = (a.min(b).min(c), a.max(b).max(c));
             min = min.min(lo);
             max = max.max(hi);
-            list.push(Tri { a, b, c, n, min_y: lo.y, max_y: hi.y });
+            list.push(Tri { a, b, c, n, min_y: lo.y, max_y: hi.y, mat: 0 });
         }
         if list.is_empty() {
             return None;
@@ -286,8 +397,13 @@ impl CollisionWorld {
 
     /// Height of the highest walkable surface under `(x, z)` that is not above `max_y`.
     pub fn floor_height(&self, x: f32, z: f32, max_y: f32) -> Option<f32> {
+        self.floor_surface(x, z, max_y).map(|(y, _)| y)
+    }
+
+    /// The highest walkable surface under `(x, z)` that is not above `max_y`: its height and material.
+    fn floor_surface(&self, x: f32, z: f32, max_y: f32) -> Option<(f32, u8)> {
         let p = Vec2::new(x, z);
-        let mut best: Option<f32> = None;
+        let mut best: Option<(f32, u8)> = None;
         let mut consider = |t: &Tri| {
             if t.n.y.abs() < SUPPORT_NORMAL_Y || t.min_y > max_y + 1.0 {
                 return;
@@ -298,8 +414,8 @@ impl CollisionWorld {
             }
             // Plane: n . (q - a) = 0 solved for y.
             let y = t.a.y - (t.n.x * (x - t.a.x) + t.n.z * (z - t.a.z)) / t.n.y;
-            if y <= max_y && best.is_none_or(|b| y > b) {
-                best = Some(y);
+            if y <= max_y && best.is_none_or(|b| y > b.0) {
+                best = Some((y, t.mat));
             }
         };
         for t in self.query(p, p) {
@@ -312,6 +428,46 @@ impl CollisionWorld {
             }
             for t in &o.tris {
                 consider(t);
+            }
+        }
+        best
+    }
+
+    /// The first surface a ray meets within `max_t` (level geometry and solid entities, whichever way they face).
+    pub fn raycast(&self, origin: Vec3, dir: Vec3, max_t: f32) -> Option<RayHit> {
+        let dir = dir.normalize_or_zero();
+        if dir == Vec3::ZERO {
+            return None;
+        }
+        // Candidate triangles: every grid cell along the ray's shadow on the ground.
+        let steps = ((max_t / (CELL * 0.5)).ceil() as usize).max(1);
+        let mut best: Option<RayHit> = None;
+        let mut test = |t: &Tri| {
+            if let Some((dist, n)) = ray_triangle(origin, dir, t)
+                && dist <= max_t
+                && best.is_none_or(|b| dist < b.t)
+            {
+                best = Some(RayHit { t: dist, normal: n });
+            }
+        };
+        let mut seen: Vec<u32> = Vec::new();
+        for i in 0..=steps {
+            let p = origin + dir * (max_t * i as f32 / steps as f32);
+            if let Some(ids) = self.grid.get(&(cell(p.x), cell(p.z))) {
+                for &id in ids {
+                    if !seen.contains(&id) {
+                        seen.push(id);
+                        test(&self.tris[id as usize]);
+                    }
+                }
+            }
+        }
+        let (lo, hi) = (origin.min(origin + dir * max_t), origin.max(origin + dir * max_t));
+        for (o, enabled) in self.obstacles.iter().zip(&self.obstacle_enabled) {
+            if o.max.cmpge(lo).all() && o.min.cmple(hi).all() && enabled.load(Ordering::Relaxed) {
+                for t in &o.tris {
+                    test(t);
+                }
             }
         }
         best
@@ -564,7 +720,14 @@ pub struct Player {
     jump_held: bool,
     jump_request_ms: Option<f32>,
     landed_fall: Option<f32>,
+    /// Distance walked since the last footstep (units).
+    walked: f32,
+    steps: u32,
+    jumped: bool,
 }
+
+/// Distance walked between footsteps (`STEP_DISTANCE`).
+const STEP_DISTANCE: f32 = 120.0;
 
 /// Falling this far below the last solid ground means the player left the level.
 const RESCUE_DEPTH: f32 = 3000.0;
@@ -592,6 +755,9 @@ impl Player {
             jump_held: false,
             jump_request_ms: None,
             landed_fall: None,
+            walked: 0.0,
+            steps: 0,
+            jumped: false,
         }
     }
 
@@ -619,6 +785,16 @@ impl Player {
         self.feet + Vec3::Y * self.eye_height()
     }
 
+    /// Footsteps taken since the last call: one for every 120 units walked on the ground (twice as often crouched).
+    pub fn take_steps(&mut self) -> u32 {
+        std::mem::take(&mut self.steps)
+    }
+
+    /// Whether the player left the ground by jumping since the last call.
+    pub fn take_jump(&mut self) -> bool {
+        std::mem::take(&mut self.jumped)
+    }
+
     /// The height of the last landing that hurt (falls above [`SAFE_FALL_HEIGHT`]); each is reported once.
     pub fn take_landing(&mut self) -> Option<f32> {
         self.landed_fall.take()
@@ -632,8 +808,18 @@ impl Player {
             self.jump_request_ms = Some(0.0);
         }
         self.jump_held = input.jump;
+        let before = self.feet;
         for _ in 0..n {
             self.substep(world, sub_ms, input);
+        }
+        // Footsteps: only while walking on the ground, and not in the air or falling.
+        if self.on_ground && self.phase == JumpPhase::None && !self.falling {
+            let moved = (self.feet - before).length();
+            self.walked += if self.is_crouching() { moved * 2.0 } else { moved };
+            while self.walked >= STEP_DISTANCE {
+                self.walked -= STEP_DISTANCE;
+                self.steps += 1;
+            }
         }
         if self.on_ground {
             self.last_ground = self.feet;
@@ -719,6 +905,7 @@ impl Player {
                 self.phase = JumpPhase::Ascending(0.0);
                 self.on_ground = false;
                 self.vel_y = 0.0;
+                self.jumped = true;
             }
         }
 
@@ -1339,5 +1526,67 @@ mod tests {
         settle(&w2, &mut r, 0.5);
         run(&w2, &mut r, forward(), 3.0);
         assert!(r.feet.z > 350.0, "a cylinder floating above the head does not block: z = {}", r.feet.z);
+    }
+
+    #[test]
+    fn floors_know_their_material_and_water_is_found() {
+        let tris = [
+            ([Vec3::new(-100.0, 0.0, -100.0), Vec3::new(-100.0, 0.0, 100.0), Vec3::new(100.0, 0.0, 100.0)], "stone"),
+            ([Vec3::new(-100.0, 0.0, -100.0), Vec3::new(100.0, 0.0, 100.0), Vec3::new(100.0, 0.0, -100.0)], "stone"),
+            ([Vec3::new(300.0, 0.0, -100.0), Vec3::new(300.0, 0.0, 100.0), Vec3::new(500.0, 0.0, 100.0)], "wood"),
+        ];
+        let w = CollisionWorld::from_material_triangles(tris);
+        assert_eq!(w.floor_material(0.0, 0.0, 10.0), Some("stone"));
+        assert_eq!(w.floor_material(450.0, 90.0, 10.0), Some("wood"));
+        assert_eq!(w.floor_material(1000.0, 0.0, 10.0), None);
+        assert_eq!(w.water_level_at(0.0, 0.0), None);
+        let mut v = CollisionWorld::default();
+        v.push_water(Vec3::new(-50.0, -20.0, -50.0), Vec3::new(-50.0, -20.0, 50.0), Vec3::new(50.0, -20.0, 50.0));
+        assert_eq!(v.water_level_at(-30.0, 30.0), Some(-20.0));
+        assert_eq!(v.water_level_at(30.0, -30.0), None, "outside the triangle");
+    }
+
+    #[test]
+    fn walking_makes_a_step_every_120_units_and_crouching_doubles_it() {
+        let w = CollisionWorld::from_triangles(floor(8000.0));
+        let mut p = Player::new(Vec3::new(0.0, 0.0, -7000.0));
+        settle(&w, &mut p, 0.3);
+        p.take_steps();
+        let z0 = p.feet.z;
+        run(&w, &mut p, forward(), 6.0);
+        let travelled = p.feet.z - z0;
+        let steps = p.take_steps();
+        assert_eq!(steps, (travelled / 120.0).floor() as u32, "{travelled} units, {steps} steps");
+        assert!(steps >= 10);
+        // Not in the air.
+        p.take_steps();
+        p.step(&w, 1.0 / 60.0, MoveInput { jump: true, ..forward() });
+        assert!(p.take_jump());
+        let before = p.feet.z;
+        for _ in 0..30 {
+            p.step(&w, 1.0 / 60.0, forward());
+        }
+        assert!(p.feet.z - before > 100.0 && p.take_steps() == 0, "no footsteps while jumping");
+    }
+
+    #[test]
+    fn rays_hit_floors_walls_and_entities() {
+        let mut w = room();
+        // Down at the floor.
+        let hit = w.raycast(Vec3::new(0.0, 100.0, 0.0), Vec3::NEG_Y, 500.0).unwrap();
+        assert!((hit.t - 100.0).abs() < 1e-3 && hit.normal.y > 0.99, "{hit:?}");
+        // Along the floor into the wall at z = 500, facing back at the ray.
+        let hit = w.raycast(Vec3::new(0.0, 100.0, 0.0), Vec3::Z, 1000.0).unwrap();
+        assert!((hit.t - 500.0).abs() < 1e-2 && hit.normal.z < -0.99, "{hit:?}");
+        // Too short, or pointing away from everything.
+        assert!(w.raycast(Vec3::new(0.0, 100.0, 0.0), Vec3::Z, 400.0).is_none());
+        assert!(w.raycast(Vec3::new(0.0, 100.0, 0.0), Vec3::Y, 1000.0).is_none());
+        // An entity in the way is hit first, and not once it is switched off.
+        let door = w
+            .add_obstacle(quad(Vec3::new(-100.0, 0.0, 300.0), Vec3::new(100.0, 0.0, 300.0), Vec3::new(100.0, 230.0, 300.0), Vec3::new(-100.0, 230.0, 300.0)))
+            .unwrap();
+        assert!((w.raycast(Vec3::new(0.0, 100.0, 0.0), Vec3::Z, 1000.0).unwrap().t - 300.0).abs() < 1e-2);
+        w.set_obstacle_enabled(door, false);
+        assert!((w.raycast(Vec3::new(0.0, 100.0, 0.0), Vec3::Z, 1000.0).unwrap().t - 500.0).abs() < 1e-2);
     }
 }

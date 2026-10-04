@@ -11,7 +11,8 @@
 //! Everything is rebuilt as plain UI image nodes every frame (there are only a few dozen). [`geometry`] is the one
 //! place that knows where things are, so drawing and mouse handling cannot disagree.
 
-use crate::hud::{BAG_HIDDEN, Drag, PANEL_HIDDEN, Ui, display_name, drop_position};
+use crate::convert::to_bevy;
+use crate::hud::{BAG_HIDDEN, Drag, PANEL_HIDDEN, Ui, display_name};
 use crate::hud_book::{self, BookPage, Derived, NoteKind};
 use crate::scripting::Scripting;
 use crate::speech::Speech;
@@ -456,6 +457,7 @@ fn book_click(ui: &mut Ui, s: &mut Scripting, bk: Rect, pos: Vec2, right: bool) 
     for a in Attribute::ALL {
         if local(hud_book::attribute_icon(a)).contains(pos) {
             let ok = if right { player.refund_attribute(a) } else { player.spend_attribute(a) };
+            ui.sfx.push("menu_release");
             if !ok {
                 s.host.push_message("No point to move".to_owned());
             }
@@ -465,6 +467,7 @@ fn book_click(ui: &mut Ui, s: &mut Scripting, bk: Rect, pos: Vec2, right: bool) 
     for k in Skill::ALL {
         if local(hud_book::skill_icon(k)).contains(pos) {
             let ok = if right { player.refund_skill(k) } else { player.spend_skill(k) };
+            ui.sfx.push("menu_release");
             if !ok {
                 s.host.push_message("No point to move".to_owned());
             }
@@ -482,19 +485,29 @@ pub fn mouse(
     buttons: Res<ButtonInput<MouseButton>>,
     shot: Option<Res<crate::Shot>>,
     fly: Res<Fly>,
-    cam: Single<&Transform, With<Camera3d>>,
+    camera: Single<(&Camera, &GlobalTransform), With<Camera3d>>,
+    pickables: Res<crate::scripting::Pickables>,
+    mut bodies: ResMut<crate::drag::ItemBodies>,
     speech: Res<Speech>,
     mut ui: ResMut<Ui>,
     mut s: ResMut<Scripting>,
 ) {
     ui.scale = interface_scale(window.width(), window.height(), ui.hud_scale);
     ui.over_hud = false;
+    ui.hover_item = None;
     let s = &mut *s;
     let (w, h) = (window.width(), window.height());
     let g = geometry(w, h, &ui);
     // Screenshot runs ignore the real mouse.
     let Some(pos) = window.cursor_position().filter(|_| shot.is_none()) else { return };
     let player = s.player;
+    // The ray from the camera through the cursor: what lies under it in the world.
+    let ray = if ui.cursor_mode { camera.0.viewport_to_world(camera.1, pos).ok() } else { None };
+    if let Some(r) = ray {
+        ui.hover_item = crate::scripting::pick_ray(&pickables, s, r.origin, *r.direction, crate::drag::PICK_REACH)
+            .map(|(_, id)| id)
+            .filter(|&id| s.world.entity(id).kind == arx_script::EntityKind::Item);
+    }
 
     // A note being read takes the mouse first; clicking its page corners turns pages, clicking elsewhere puts it away.
     if let Some(geo) = reading_geometry(&ui, w) {
@@ -502,8 +515,10 @@ pub fn mouse(
         if buttons.just_pressed(MouseButton::Left) {
             if geo.has_buttons && geo.prev.contains(pos) && ui.note_page >= 2 {
                 ui.note_page -= 2;
+                ui.sfx.push("book_page_turn");
             } else if geo.has_buttons && geo.next.contains(pos) && ui.note_page + 2 < geo.pages.len() {
                 ui.note_page += 2;
+                ui.sfx.push("book_page_turn");
             } else if geo.area.contains(pos) {
                 ui.reading = None;
             }
@@ -522,13 +537,16 @@ pub fn mouse(
             let geo = note_geometry(&quest_text(s, &speech), NoteKind::Quests, bk.min, ui.scale);
             if geo.prev.contains(pos) && ui.quest_page >= 2 {
                 ui.quest_page -= 2;
+                ui.sfx.push("book_page_turn");
             } else if geo.next.contains(pos) && ui.quest_page + 2 < geo.pages.len() {
                 ui.quest_page += 2;
+                ui.sfx.push("book_page_turn");
             }
         }
         // Clicking the book icon again (or the level-up icon) closes / keeps it.
         if buttons.just_pressed(MouseButton::Left) && g.book.contains(pos) {
             ui.book = None;
+            ui.sfx.push("book_close");
         }
         return;
     }
@@ -549,8 +567,10 @@ pub fn mouse(
         ui.kbd = false;
         if g.backpack.contains(pos) {
             ui.open = !ui.open;
+            ui.sfx.push("interface_backpack");
         } else if g.book.contains(pos) || (g.level_up.contains(pos) && (s.host.player.attribute_points > 0 || s.host.player.skill_points > 0)) {
             ui.book = Some(BookPage::Stats);
+            ui.sfx.push("book_open");
         } else if g.health.contains(pos) {
             let n = s.host.player.life.current as i64;
             s.host.push_message(n.to_string());
@@ -573,7 +593,7 @@ pub fn mouse(
                     inventory::use_item(&mut s.world, &mut s.host, player, item);
                 } else {
                     ui.last_click = Some((item, now));
-                    ui.drag = Some(Drag { item, grab: pos - top_left });
+                    ui.drag = Some(Drag { item, grab: pos - top_left, from_world: false, spawned: false });
                 }
             }
         } else if in_panel {
@@ -588,16 +608,81 @@ pub fn mouse(
                     crate::hud::take(s, &speech, container, item);
                 }
             }
+        } else if ui.cursor_mode
+            && let Some(item) = ui.hover_item
+            && ui.drag.is_none()
+        {
+            // An item on the floor: pick it up with the mouse and carry it about.
+            bodies.0.retain(|(id, _)| *id != item);
+            ui.drag = Some(Drag { item, grab: Vec2::ZERO, from_world: true, spawned: true });
+        }
+    }
+
+    // A dragged item: out over the world it is the 3D item itself that follows the cursor.
+    ui.drag_spot = None;
+    if let Some(mut d) = ui.drag {
+        let carried = s.host.player.inventory.contains(&d.item);
+        let spot = match (ray, fly.world.as_ref()) {
+            (Some(r), Some(world)) if !ui.over_hud => Some(arx_physics::items::drag_spot(world, r.origin, *r.direction, fly.pos, 20.0)),
+            _ => None,
+        };
+        match spot {
+            Some(spot) => {
+                let at = to_bevy(spot.pos.to_array());
+                s.host.modify(d.item, |st| {
+                    st.hidden = false;
+                    st.moved_to = Some(at);
+                });
+                s.world.entity_mut(d.item).pos = at;
+                if !d.spawned {
+                    s.host.note_dropped(d.item);
+                    d.spawned = true;
+                    ui.drag = Some(d);
+                }
+                ui.drag_spot = Some(spot);
+            }
+            // Over the interface the icon is shown instead.
+            None if carried => s.host.modify(d.item, |st| st.hidden = true),
+            None => {}
         }
     }
 
     if buttons.just_released(MouseButton::Left)
         && let Some(drag) = ui.drag.take()
     {
-        if !s.host.player.inventory.contains(&drag.item) {
+        let carried = s.host.player.inventory.contains(&drag.item);
+        let name = display_name(s, &speech, drag.item);
+        if drag.from_world {
+            if in_bag {
+                // From the floor into the backpack, to where it is let go if that is free.
+                s.host.modify(drag.item, |st| st.hidden = false);
+                match inventory::pick_up(&mut s.world, &mut s.host, player, drag.item) {
+                    inventory::PickUp::Refused(_) => s.host.push_message("Your inventory is full".to_owned()),
+                    inventory::PickUp::Gold(n) => s.host.push_message(format!("{n} gold")),
+                    r => {
+                        ui.sfx.push("interface_invstd");
+                        if r == inventory::PickUp::Added
+                            && let Some((x, y)) = cell(&g)
+                        {
+                            s.host.player.move_item(drag.item, ui.bag, x, y);
+                        }
+                    }
+                }
+            } else {
+                crate::drag::release_in_world(&mut ui, s, &fly, &mut bodies, drag.item, ray, &pickables, false);
+            }
+            s.host.prune_inventory();
             return;
         }
-        let name = display_name(s, &speech, drag.item);
+        if !carried {
+            return;
+        }
+        if !in_bag && !in_panel && !ui.over_hud {
+            // Out in the world.
+            crate::drag::release_in_world(&mut ui, s, &fly, &mut bodies, drag.item, ray, &pickables, true);
+            s.host.prune_inventory();
+            return;
+        }
         if in_bag {
             let under = cell(&g).and_then(|(x, y)| s.host.player.item_at(ui.bag, x, y)).filter(|&i| i != drag.item);
             if let Some(target) = under {
@@ -613,19 +698,6 @@ pub fn mouse(
             if let Some(container) = s.host.open_container {
                 inventory::store_in_container(&mut s.world, &mut s.host, player, container, drag.item);
                 s.host.push_message(format!("Put {name} away"));
-            }
-        } else if !ui.over_hud {
-            // Out in the world: use it on what you are looking at, or drop it.
-            match s.target {
-                Some(target) => {
-                    inventory::combine(&mut s.world, &mut s.host, player, drag.item, target);
-                }
-                None => {
-                    let at = drop_position(&fly, &cam);
-                    if inventory::drop_item(&mut s.world, &mut s.host, player, drag.item, at) {
-                        s.host.push_message(format!("Dropped {name}"));
-                    }
-                }
             }
         }
         s.host.prune_inventory();
@@ -898,7 +970,7 @@ pub fn draw(
     }
 
     // --- what the cursor carries, the tooltip, and the cursor itself.
-    if let (Some(d), Some(pos)) = (ui.drag, cursor) {
+    if let (Some(d), Some(pos), true) = (ui.drag, cursor, ui.over_hud) {
         let class = s.world.entity(d.item).class.clone();
         let count = s.host.state(d.item).map_or(1, |st| st.count);
         if let Some(tex) = assets.icon(&arx, &mut images, &class, count) {
@@ -910,7 +982,15 @@ pub fn draw(
     if ui.cursor_mode
         && let Some(pos) = cursor
     {
-        let name = if ui.drag.is_some() { None } else if ui.over_hud { Some("cursors/interaction_on") } else { Some("cursors/cursor") };
+        let name = if ui.drag.is_some() && !ui.over_hud {
+            None
+        } else if ui.drag.is_some() {
+            None
+        } else if ui.over_hud || ui.hover_item.is_some() {
+            Some("cursors/interaction_on")
+        } else {
+            Some("cursors/cursor")
+        };
         if let Some(tex) = name.and_then(|n| assets.get(&arx, &mut images, n)) {
             c.sized(&tex, pos, g.s, Color::WHITE);
         }

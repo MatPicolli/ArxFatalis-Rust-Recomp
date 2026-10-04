@@ -132,6 +132,33 @@ pub fn apply_state(
     }
 }
 
+/// The nearest interactive entity a ray (from the camera, through the cursor or the middle of the screen) passes
+/// through within `reach`: its distance and id.
+pub fn pick_ray(pickables: &Pickables, s: &Scripting, origin: Vec3, dir: Vec3, reach: f32) -> Option<(f32, EntityId)> {
+    let mut best: Option<(f32, EntityId)> = None;
+    for p in &pickables.0 {
+        let Some(st) = s.host.state(p.id) else { continue };
+        if st.hidden || st.destroyed || !st.interactive || st.in_inventory {
+            continue;
+        }
+        let center = Vec3::from(to_bevy(s.world.entity(p.id).pos)) + p.offset;
+        let to = center - origin;
+        let along = to.dot(dir);
+        if along < 0.0 || along > reach + p.radius {
+            continue;
+        }
+        let miss2 = to.length_squared() - along * along;
+        if miss2 > p.radius * p.radius {
+            continue;
+        }
+        let t = along - (p.radius * p.radius - miss2).sqrt();
+        if t <= reach && best.is_none_or(|(bt, _)| t < bt) {
+            best = Some((t, p.id));
+        }
+    }
+    best
+}
+
 /// Find what the player is looking at, and act on it when E is pressed: with an item held, use the item on it;
 /// otherwise pick up items, talk to people, and send `action` to everything else.
 pub fn interact(
