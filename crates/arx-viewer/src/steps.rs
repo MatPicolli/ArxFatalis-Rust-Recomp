@@ -198,3 +198,35 @@ pub fn combat_sounds(
         }
     }
 }
+
+/// Other characters' footsteps: whenever a walking animation puts a foot down, within earshot, with what the character
+/// wears on its feet (`setstepmaterial`, bare by default) on whatever the floor is made of.
+pub fn npc_footsteps(
+    mut commands: Commands,
+    arx: Res<Arx>,
+    fly: Res<Fly>,
+    sounds: Res<Sounds>,
+    mut steps: ResMut<StepSounds>,
+    mut assets: ResMut<Assets<AudioSource>>,
+    mut npcs: ResMut<crate::npcs::Npcs>,
+    script: Res<crate::scripting::Scripting>,
+) {
+    let Some(world) = npcs.0.as_mut() else { return };
+    let list = world.take_footsteps();
+    let (Some(level), false) = (fly.world.as_ref(), sounds.muted) else { return };
+    let player = Vec3::from(script.world.entity(script.player).pos);
+    for f in list {
+        let dist = f.pos.distance(player);
+        if dist > 1500.0 {
+            continue;
+        }
+        let feet = Vec3::new(f.pos.x, -f.pos.y, -f.pos.z);
+        let surface = if level.water_level_at(feet.x, feet.z).is_some_and(|l| l > feet.y + 5.0) { "water" } else { level.floor_material(feet.x, feet.z, feet.y + 10.0).unwrap_or("earth") };
+        let wear = script.host.state(f.id).map(|s| s.step_material.to_ascii_lowercase()).filter(|m| !m.is_empty()).unwrap_or_else(|| DEFAULT_FOOTWEAR.to_owned());
+        let volume = (1.0 - dist / 1500.0).clamp(0.05, 1.0);
+        let played = steps.play(&mut commands, &arx, &mut assets, &wear, surface, volume);
+        if std::env::var_os("ARX_LOG_SOUND").is_some() {
+            eprintln!("npc step: {wear} on {surface}: {played:?}");
+        }
+    }
+}

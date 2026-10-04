@@ -565,6 +565,7 @@ fn run_level(args: Args, pak: PakSet) {
             steps::footsteps,
             steps::ui_sounds,
             steps::combat_sounds,
+            steps::npc_footsteps,
             hud::debug_pickup,
             player_body::debug_equip,
             hud::input,

@@ -80,16 +80,38 @@ pub enum Target {
 pub struct MoveTrack {
     pub duration_us: i64,
     keys: Vec<(i64, Vec3)>,
+    /// Times (microseconds) at which a foot comes down (the animation's `step_sound` keyframes).
+    steps: Vec<i64>,
 }
 
 impl MoveTrack {
     pub fn from_tea(t: &Tea) -> Self {
-        MoveTrack { duration_us: t.duration_us, keys: t.frames.iter().map(|f| (f.time_us, f.translate)).collect() }
+        MoveTrack {
+            duration_us: t.duration_us,
+            keys: t.frames.iter().map(|f| (f.time_us, f.translate)).collect(),
+            steps: t.frames.iter().filter(|f| f.step_sound).map(|f| f.time_us).collect(),
+        }
+    }
+
+    /// The same with foot-fall times (for tests).
+    pub fn with_steps(mut self, steps: Vec<i64>) -> Self {
+        self.steps = steps;
+        self
+    }
+
+    /// How many foot-falls lie in `(from, to]`, wrapping at the end of the animation when `looping`.
+    fn steps_between(&self, from: i64, to: i64) -> u32 {
+        let count = |a: i64, b: i64| self.steps.iter().filter(|&&s| s > a && s <= b).count() as u32;
+        if to >= self.duration_us.max(1) && to > from {
+            count(from, self.duration_us) + count(-1, to - self.duration_us.max(1))
+        } else {
+            count(from, to)
+        }
     }
 
     /// Build from `(time in microseconds, translation)` keys (for tests).
     pub fn from_keys(duration_us: i64, keys: Vec<(i64, Vec3)>) -> Self {
-        MoveTrack { duration_us, keys }
+        MoveTrack { duration_us, keys, steps: Vec::new() }
     }
 
     /// Where the animation has moved the object `time_us` in (Arx coordinates, object space).
@@ -165,6 +187,8 @@ struct Layer {
     ended: bool,
     /// Played by a script (`playanim`): the character's own logic waits for it to end.
     force: bool,
+    /// Foot-falls the last [`Layer::advance`] passed.
+    steps: u32,
 }
 
 impl Layer {
@@ -178,6 +202,7 @@ impl Layer {
 
     /// Advance by `dt_us`; the translation the animation made in that time (object space, Arx coordinates).
     fn advance(&mut self, dt_us: i64) -> Vec3 {
+        self.steps = 0;
         let Some(track) = self.track.clone() else {
             if !self.looping {
                 self.ended = true;
@@ -190,6 +215,7 @@ impl Layer {
         let duration = track.duration_us.max(1);
         let prev = self.time_us;
         let next = prev + dt_us;
+        self.steps = track.steps_between(prev, next);
         if next >= duration {
             if self.looping {
                 self.time_us = next % duration;
@@ -384,6 +410,15 @@ pub struct NpcWorld {
     /// When a door last reported a collision (milliseconds), so it is told at most twice a second.
     door_bumps: HashMap<EntityId, f64>,
     sounds: Vec<CombatSound>,
+    footsteps: Vec<Footstep>,
+}
+
+/// A character's foot came down.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Footstep {
+    pub id: EntityId,
+    /// Where (Arx coordinates).
+    pub pos: Vec3,
 }
 
 /// Yaw (Arx degrees, as stored for NPCs) of a character facing along `(dx, dz)` in Arx coordinates.
@@ -417,12 +452,17 @@ fn distance_xz(a: Vec3, b: Vec3) -> f32 {
 
 impl NpcWorld {
     pub fn new(graph: Arc<AnchorGraph>) -> Self {
-        NpcWorld { graph, npcs: Vec::new(), by_id: HashMap::new(), tracks: HashMap::new(), loader: None, rng: Rng(0x9E37_79B9), now_ms: 0.0, active_range: ACTIVE_RANGE, log: None, obstacle_owner: HashMap::new(), door_bumps: HashMap::new(), sounds: Vec::new() }
+        NpcWorld { graph, npcs: Vec::new(), by_id: HashMap::new(), tracks: HashMap::new(), loader: None, rng: Rng(0x9E37_79B9), now_ms: 0.0, active_range: ACTIVE_RANGE, log: None, obstacle_owner: HashMap::new(), door_bumps: HashMap::new(), sounds: Vec::new(), footsteps: Vec::new() }
     }
 
     /// Tell the world which collision obstacle belongs to which entity.
     pub fn set_obstacle_owners(&mut self, owners: impl IntoIterator<Item = (arx_physics::ObstacleId, EntityId)>) {
         self.obstacle_owner = owners.into_iter().map(|(o, e)| (o.0, e)).collect();
+    }
+
+    /// Footsteps taken since the last call.
+    pub fn take_footsteps(&mut self) -> Vec<Footstep> {
+        std::mem::take(&mut self.footsteps)
     }
 
     pub fn set_track_loader(&mut self, f: TrackLoader) {
@@ -744,7 +784,7 @@ impl NpcWorld {
         let Some(path) = cx.host.state(id).and_then(|s| s.anims.get(slot)).cloned() else { return };
         let track = self.track(&path);
         let n = &mut self.npcs[i];
-        n.layer = Layer { slot: Some(slot.to_owned()), track, time_us: 0, looping, ended: false, force: false };
+        n.layer = Layer { slot: Some(slot.to_owned()), track, time_us: 0, looping, ended: false, force: false, steps: 0 };
         cx.host.modify(id, |s| {
             s.playing = Some(PlayAnim { slot: slot.to_owned(), looping });
             s.anim_serial += 1;
@@ -773,7 +813,7 @@ impl NpcWorld {
         let n = &mut self.npcs[i];
         n.seen_serial = serial;
         n.layer = match playing {
-            Some(p) => Layer { slot: Some(p.slot), track, time_us: 0, looping: p.looping, ended: false, force: true },
+            Some(p) => Layer { slot: Some(p.slot), track, time_us: 0, looping: p.looping, ended: false, force: true, steps: 0 },
             None => Layer::default(),
         };
     }
@@ -1061,6 +1101,12 @@ impl NpcWorld {
         let scale = cx.host.state(id).map_or(1.0, |s| s.scale);
         let dt_us = (f64::from(cx.dt_ms) * 1000.0 * f64::from(self.npcs[i].speed.max(0.0))) as i64;
         let raw = self.npcs[i].layer.advance(dt_us);
+        if self.npcs[i].layer.steps > 0 && !self.npcs[i].dead && self.npcs[i].on_ground {
+            let pos = self.npcs[i].pos;
+            for _ in 0..self.npcs[i].layer.steps {
+                self.footsteps.push(Footstep { id, pos });
+            }
+        }
         if self.npcs[i].dead {
             if self.npcs[i].layer.ended {
                 self.npcs[i].layer.force = false;
@@ -1860,6 +1906,30 @@ on aggression {
         let life = rig.host.player.life.current;
         assert!(life < 1000.0, "the hero was hurt: {life}");
         assert!(1000.0 - life <= 4.0 * 20.0, "blows of up to 4 each, a few of them");
+    }
+
+    #[test]
+    fn walking_characters_take_a_step_whenever_the_animation_puts_a_foot_down() {
+        let mut rig = Rig::new(line(12, 100.0), "");
+        rig.npcs.set_track_loader(Box::new(|path| {
+            if path.ends_with("walk.tea") {
+                Some(walk_track().with_steps(vec![250_000, 750_000]))
+            } else {
+                Some(MoveTrack::from_keys(2_000_000, vec![(0, Vec3::ZERO), (2_000_000, Vec3::ZERO)]))
+            }
+        }));
+        rig.world.entity_mut(rig.marker).pos = [0.0, 0.0, 900.0];
+        rig.host.push_npc_request(NpcRequest::Behavior { entity: rig.npc, flags: String::new(), command: "move_to".into(), param: 0.0 });
+        rig.host.push_npc_request(NpcRequest::SetTarget { entity: rig.npc, flags: String::new(), target: TargetSpec::Entity(rig.marker) });
+        let mut steps = Vec::new();
+        for _ in 0..(4.0 * 60.0) as usize {
+            rig.run(1.0 / 60.0);
+            steps.extend(rig.npcs.take_footsteps());
+        }
+        // Two feet a second for about four seconds of walking.
+        assert!((6..=9).contains(&steps.len()), "{} steps", steps.len());
+        assert!(steps.windows(2).all(|w| w[1].pos.z >= w[0].pos.z - 1.0), "they follow the walk");
+        assert!(rig.npcs.take_footsteps().is_empty());
     }
 
     #[test]

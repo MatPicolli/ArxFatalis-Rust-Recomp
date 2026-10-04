@@ -773,6 +773,8 @@ TOTAL: {ents} entities ({with_script} class scripts, {with_over} instance script
             println!("{:?}: {} keyframes, {} groups ({} static), {:.2}s", t.name, t.frames.len(), t.group_count,
                 t.void_groups.iter().filter(|v| **v).count(), t.duration_us as f64 / 1e6);
             println!("root translation over the whole animation: {:?}", t.frames.last().map(|f| f.translate));
+            let steps: Vec<String> = t.frames.iter().filter(|f| f.step_sound).map(|f| format!("{:.2}s", f.time_us as f64 / 1e6)).collect();
+            println!("foot-fall keyframes: {}", if steps.is_empty() { "none".to_owned() } else { steps.join(", ") });
             if let Some(model) = model {
                 let ftl = arx_formats::ftl::Ftl::parse(&pak.read(&model)?)?;
                 let sk = arx_formats::skeleton::Skeleton::from_ftl(&ftl);

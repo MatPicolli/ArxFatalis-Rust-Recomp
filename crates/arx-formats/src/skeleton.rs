@@ -223,6 +223,35 @@ mod tests {
     }
 
     #[test]
+    fn a_higher_layer_wins_on_the_bones_it_animates_and_leaves_the_rest_to_the_lower_one() {
+        use crate::tea::{GroupAnim, KeyFrame};
+        let key = |t: i64| KeyFrame { num_frame: 0, time_us: t, translate: Vec3::ZERO, rotate: Quat::IDENTITY, step_sound: false };
+        let turn = |angle: f32| GroupAnim { rotate: Quat::from_rotation_z(angle), translate: Vec3::ZERO, zoom: Vec3::ZERO };
+        let still = GroupAnim { rotate: Quat::IDENTITY, translate: Vec3::ZERO, zoom: Vec3::ZERO };
+        // Two bones: a root at the origin and a child one unit along x. Vertex 0 is on the root, vertex 1 on the child.
+        let sk = Skeleton {
+            bones: vec![
+                Bone { parent: None, origin: Vec3::ZERO, rest_offset: Vec3::ZERO },
+                Bone { parent: Some(0), origin: Vec3::X, rest_offset: Vec3::X },
+            ],
+            vertex_bone: vec![0, 1],
+            vertex_local: vec![Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 1.0, 0.0)],
+        };
+        let quarter = std::f32::consts::FRAC_PI_2;
+        // The lower layer turns both bones a quarter turn; the upper one turns only the child, the other way.
+        let legs = Tea { name: String::new(), frames: vec![key(0), key(1000)], group_count: 2, groups: vec![turn(quarter), turn(quarter), turn(quarter), turn(quarter)], void_groups: vec![false, false], duration_us: 1000 };
+        let arm = Tea { name: String::new(), frames: vec![key(0), key(1000)], group_count: 2, groups: vec![still, turn(-quarter), still, turn(-quarter)], void_groups: vec![true, false], duration_us: 1000 };
+        let both = sk.pose_layers(&[(&arm, 0), (&legs, 0)], Vec3::ZERO);
+        // Vertex 0 follows the legs (a quarter turn about z carries (0,1,0) to (-1,0,0)).
+        assert!((both.vertices[0] - Vec3::new(-1.0, 0.0, 0.0)).length() < 1e-4, "{:?}", both.vertices[0]);
+        // The child's own turn comes from the arm: it is not the legs' quarter turn on top of the root's.
+        let only_legs = sk.pose_layers(&[(&legs, 0)], Vec3::ZERO);
+        assert!((both.vertices[1] - only_legs.vertices[1]).length() > 0.5, "the arm changed the child: {:?} vs {:?}", both.vertices[1], only_legs.vertices[1]);
+        // Bone rotations are reported for attaching things.
+        assert!(both.bone_quat[0].angle_between(Quat::from_rotation_z(quarter)) < 1e-3, "{:?}", both.bone_quat);
+    }
+
+    #[test]
     fn slerp_endpoints_and_midpoint() {
         let a = Quat::IDENTITY;
         let b = Quat::from_rotation_y(1.0);
