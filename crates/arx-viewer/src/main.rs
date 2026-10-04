@@ -16,6 +16,7 @@ mod drag;
 mod hud;
 mod npcs;
 mod particles;
+mod perf;
 mod player_body;
 mod hud_book;
 mod hud_ui;
@@ -355,7 +356,7 @@ fn load_current(
                 bounds = Some(m.bounds);
                 commands.spawn((
                     Shown,
-                    animated::Animated { skeleton, anim, meshes: m.meshes, elapsed_us: 0, looping: true, root_motion: false, overlay: None, keep_pose: false, pose: None },
+                    animated::Animated { skeleton, anim, meshes: m.meshes, elapsed_us: 0, looping: true, root_motion: false, overlay: None, keep_pose: false, pose: None, shown: None },
                 ));
             }
             bounds
@@ -501,6 +502,13 @@ struct Fly {
     invert_mouse: bool,
 }
 
+/// A system followed by the mark that charges its time to `name` (see `perf`).
+macro_rules! timed {
+    ($system:expr, $name:literal) => {
+        ($system, perf::lap($name)).chain()
+    };
+}
+
 fn run_level(args: Args, pak: PakSet) {
     let level = args.filter.as_deref().and_then(|s| s.parse().ok()).unwrap_or(1);
     let locale = pak.load_locale(&args.language).unwrap_or_else(|| {
@@ -524,6 +532,9 @@ fn run_level(args: Args, pak: PakSet) {
     if let Some(scale) = args.hud_scale {
         options.set(menu::Opt::HudScale, ((scale - 0.5) / 0.05).round().clamp(0.0, 10.0) as u8);
     }
+    if std::env::var_os("ARX_LOG_FPS").is_some() {
+        options.set(menu::Opt::Vsync, 0);
+    }
     if args.no_subtitles {
         options.set(menu::Opt::Subtitles, 0);
     }
@@ -531,7 +542,11 @@ fn run_level(args: Args, pak: PakSet) {
     app.add_plugins(
         DefaultPlugins
             .set(WindowPlugin {
-                primary_window: Some(Window { title: format!("Arx Fatalis - level {level}"), ..default() }),
+                primary_window: Some(Window {
+                    title: format!("Arx Fatalis - level {level}"),
+                    present_mode: if options.on(menu::Opt::Vsync) { bevy::window::PresentMode::AutoVsync } else { bevy::window::PresentMode::AutoNoVsync },
+                    ..default()
+                }),
                 ..default()
             })
             // Arx units are about centimetres; spatial audio works in metres.
@@ -591,6 +606,7 @@ fn run_level(args: Args, pak: PakSet) {
     .insert_resource(cutscene::Stage(Default::default(), args.no_cutscenes, cutscene::PLAYER_FOV))
     .insert_resource(menu::Menu::new(start_screen, options, persistent, args.menu_do.iter().filter_map(|n| menu::Action::from_name(n)).collect()))
     .insert_resource(lighting::LevelLighting::default())
+    .insert_resource(perf::Perf::default())
     .insert_resource(particles::Particles::default())
     .insert_resource(shadows::Shadows::default())
     .insert_resource(player_body::PlayerBody::default())
@@ -606,55 +622,59 @@ fn run_level(args: Args, pak: PakSet) {
     .insert_resource(hud_ui::UiAssets::default())
     .add_systems(
         Update,
-        (menu::update, (hud_ui::mouse, hud_ui::draw).chain().run_if(menu::creating), ((
-            scripting::tick,
-            npcs::zones,
-            npcs::update,
-            cutscene::update,
-            cutscene::skip,
-            speech::debug_say,
-            speech::update,
-            entities::spawn_dropped,
-            scripting::apply_state,
-            npcs::apply,
-            npcs::log,
-            scripting::auto_use,
-            scripting::sync_obstacles,
-            audio::play_sounds,
+        (perf::begin, timed!(menu::update, "menu::update"), (hud_ui::mouse, hud_ui::draw).chain().run_if(menu::creating), ((
+            timed!(scripting::tick, "scripting::tick"),
+            timed!(npcs::zones, "npcs::zones"),
+            timed!(npcs::update, "npcs::update"),
+            timed!(cutscene::update, "cutscene::update"),
+            timed!(cutscene::skip, "cutscene::skip"),
+            timed!(speech::debug_say, "speech::debug_say"),
+            timed!(speech::update, "speech::update"),
+            timed!(entities::spawn_dropped, "entities::spawn_dropped"),
+            timed!(scripting::apply_state, "scripting::apply_state"),
+            timed!(npcs::apply, "npcs::apply"),
+            timed!(npcs::log, "npcs::log"),
+            timed!(scripting::auto_use, "scripting::auto_use"),
+            timed!(scripting::sync_obstacles, "scripting::sync_obstacles"),
+            timed!(audio::play_sounds, "audio::play_sounds"),
         )
             .chain(),
         (
-            fly_camera,
-            steps::footsteps,
-            steps::ui_sounds,
-            steps::combat_sounds,
-            steps::npc_footsteps,
-            hud::debug_pickup,
-            player_body::debug_equip,
-            hud::input,
-            scripting::interact,
-            hud_ui::mouse,
-            drag::debug_throw,
-            drag::step_bodies,
+            timed!(fly_camera, "fly_camera"),
+            timed!(steps::footsteps, "steps::footsteps"),
+            timed!(steps::ui_sounds, "steps::ui_sounds"),
+            timed!(steps::combat_sounds, "steps::combat_sounds"),
+            timed!(steps::npc_footsteps, "steps::npc_footsteps"),
+            timed!(hud::debug_pickup, "hud::debug_pickup"),
+            timed!(player_body::debug_equip, "player_body::debug_equip"),
+            timed!(hud::input, "hud::input"),
+            timed!(scripting::interact, "scripting::interact"),
+            timed!(hud_ui::mouse, "hud_ui::mouse"),
+            timed!(drag::debug_throw, "drag::debug_throw"),
+            timed!(drag::step_bodies, "drag::step_bodies"),
         )
             .chain(),
         (
-            lighting::update,
-            particles::update,
-            player_body::drive,
-            hud_ui::draw,
-            animated::animate,
-            shadows::update,
-            player_body::attach,
-            cutscene::camera,
-            cutscene::overlay,
-            level_hud,
+            timed!(lighting::update, "lighting::update"),
+            timed!(particles::update, "particles::update"),
+            timed!(player_body::drive, "player_body::drive"),
+            timed!(hud_ui::draw, "hud_ui::draw"),
+            timed!(animated::animate, "animated::animate"),
+            timed!(shadows::update, "shadows::update"),
+            timed!(player_body::attach, "player_body::attach"),
+            timed!(cutscene::camera, "cutscene::camera"),
+            timed!(cutscene::overlay, "cutscene::overlay"),
+            timed!(level_hud, "level_hud"),
         )
             .chain())
             .chain()
             .run_if(menu::closed))
             .chain(),
     );
+    if std::env::var_os("ARX_LOG_FPS").is_some() {
+        // An unfocused window is otherwise held to 60 updates a second, which would hide the real cost.
+        app.insert_resource(bevy::winit::WinitSettings::continuous());
+    }
     if let Some(path) = args.shot {
         app.insert_resource(Shot { path, frames: 0 }).add_systems(Update, take_shot);
     }

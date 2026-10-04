@@ -412,6 +412,7 @@ pub fn spawn_entity(
             // Jointed models keep their pose so their shadows can follow their limbs.
             keep_pose: ftl.groups.len() > 1,
             pose: None,
+            shown: None,
         });
         stats.animated += 1;
     }

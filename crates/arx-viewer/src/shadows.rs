@@ -69,6 +69,9 @@ pub fn update(
     casters: Query<(&Shadow, &Transform, &InheritedVisibility, Option<&Animated>)>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
+    if crate::perf::skip("shadows") {
+        return;
+    }
     let (Some(handle), Some(world)) = (shadows.mesh.as_ref(), fly.world.as_ref()) else { return };
     let eye = cam.translation;
     let mut positions: Vec<[f32; 3]> = Vec::new();

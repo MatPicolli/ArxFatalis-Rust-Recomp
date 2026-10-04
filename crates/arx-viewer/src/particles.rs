@@ -80,6 +80,9 @@ pub fn setup(mut commands: Commands, arx: Res<Arx>, mut particles: ResMut<Partic
 
 /// Spawn flames at the lit fires near the camera, move every particle on, and rebuild the two meshes.
 pub fn update(time: Res<Time>, cam: Single<&Transform, With<Camera3d>>, lighting: Res<LevelLighting>, mut particles: ResMut<Particles>, mut meshes: ResMut<Assets<Mesh>>) {
+    if crate::perf::skip("particles") {
+        return;
+    }
     let dt_ms = time.delta_secs().min(0.1) * 1000.0;
     let p = &mut *particles;
     p.clock_ms += dt_ms;

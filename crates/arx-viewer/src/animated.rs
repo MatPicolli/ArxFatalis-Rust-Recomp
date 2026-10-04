@@ -33,6 +33,16 @@ pub struct Animated {
     /// Keep each frame's [`Pose`] (bone rotations and positions) in `pose`, to attach things to the body.
     pub keep_pose: bool,
     pub pose: Option<Pose>,
+    /// What the meshes show now: a pose that has not changed is not built and uploaded again.
+    pub shown: Option<Shown>,
+}
+
+/// The animations and times a pose was built from.
+#[derive(Clone, Copy, PartialEq)]
+pub struct Shown {
+    anim: usize,
+    time: i64,
+    overlay: Option<(usize, i64)>,
 }
 
 /// Mark a mesh entity so it is not culled by its (stale) bind-pose bounds.
@@ -40,15 +50,42 @@ pub fn no_cull() -> NoFrustumCulling {
     NoFrustumCulling
 }
 
-pub fn animate(time: Res<Time>, mut query: Query<&mut Animated>, mut meshes: ResMut<Assets<Mesh>>) {
+/// Within this distance of the camera a pose is rebuilt every frame; farther away every third frame, and beyond
+/// [`FAR`] every tenth: rebuilding means uploading the meshes again, and at a distance nobody sees the difference.
+const NEAR: f32 = 1500.0;
+const FAR: f32 = 3500.0;
+
+pub fn animate(
+    time: Res<Time>,
+    cam: Single<&Transform, With<Camera3d>>,
+    mut query: Query<(Entity, &mut Animated, Option<&GlobalTransform>)>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut frame: Local<u32>,
+) {
+    *frame = frame.wrapping_add(1);
     let dt = (time.delta_secs_f64() * 1e6) as i64;
-    for mut a in &mut query {
+    for (entity, mut a, at) in &mut query {
         a.elapsed_us += dt;
         if let Some(o) = &mut a.overlay {
             o.elapsed_us += dt;
         }
         let Some(anim) = a.anim.clone() else { continue };
         let t = if a.looping { anim.looped_time(a.elapsed_us) } else { a.elapsed_us.clamp(0, anim.duration_us) };
+        let distance = at.map_or(0.0, |g| g.translation().distance(cam.translation));
+        let every = if distance < NEAR { 1 } else if distance < FAR { 3 } else { 10 };
+        if (frame.wrapping_add(entity.index_u32())) % every != 0 {
+            continue;
+        }
+        // Most things stand still most of the time (a shut door, a lever, a corpse): nothing to do for them.
+        let overlay_at = a.overlay.as_ref().map(|o| {
+            let t = if o.looping { o.anim.looped_time(o.elapsed_us) } else { o.elapsed_us.clamp(0, o.anim.duration_us) };
+            (Arc::as_ptr(&o.anim) as usize, t)
+        });
+        let shown = Shown { anim: Arc::as_ptr(&anim) as usize, time: t, overlay: overlay_at };
+        if a.shown == Some(shown) {
+            continue;
+        }
+        a.shown = Some(shown);
         let world: Vec<[f32; 3]> = if a.overlay.is_some() || a.keep_pose {
             let top = a.overlay.as_ref().map(|o| {
                 let t = if o.looping { o.anim.looped_time(o.elapsed_us) } else { o.elapsed_us.clamp(0, o.anim.duration_us) };
@@ -71,6 +108,7 @@ pub fn animate(time: Res<Time>, mut query: Query<&mut Animated>, mut meshes: Res
         };
         for m in &a.meshes {
             let Some(mut mesh) = meshes.get_mut(&m.handle) else { continue };
+            crate::perf::TOUCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let positions: Vec<[f32; 3]> = m.src.iter().map(|&i| world[i as usize]).collect();
             mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
             if mesh.attribute(Mesh::ATTRIBUTE_NORMAL).is_some() {

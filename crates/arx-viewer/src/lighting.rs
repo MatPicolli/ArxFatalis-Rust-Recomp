@@ -18,8 +18,11 @@ pub const EXTRAS_FIREPLACE: u32 = 0x200;
 
 /// The engine's `GLOBAL_LIGHT_FACTOR`.
 const GLOBAL_LIGHT_FACTOR: f32 = 0.85;
-/// Chunks farther than this from the camera are left with their baked light (too far to see a flicker).
-const LIGHTING_RANGE: f32 = 4500.0;
+/// Torches within this distance of the camera flicker; farther ones keep a steady light (too far to see it).
+const FLICKER_RANGE: f32 = 2200.0;
+/// Level meshes whose colours may be rewritten per tick. Every rewritten mesh is uploaded again, which is what costs,
+/// so the nearest torch flickers every tick and the others take turns within this budget.
+const CHUNKS_PER_TICK: usize = 48;
 
 /// One mesh of the level and how to light it again.
 pub struct LitChunk {
@@ -32,8 +35,9 @@ pub struct LitChunk {
     alphas: Vec<f32>,
     min: Vec3,
     max: Vec3,
-    /// Its colours currently differ from the bake.
-    changed: bool,
+    /// The torches that reach it: for each, the vertices it lights and how strongly (everything about a torch's light
+    /// but its colour is fixed, since neither it nor the level moves).
+    lit_by: Vec<(usize, Vec<(u32, f32)>)>,
 }
 
 impl LitChunk {
@@ -43,7 +47,7 @@ impl LitChunk {
             min = min.min(*p);
             max = max.max(*p);
         }
-        LitChunk { mesh, positions, normals, baked, alphas, min, max, changed: false }
+        LitChunk { mesh, positions, normals, baked, alphas, min, max, lit_by: Vec::new() }
     }
 
     fn distance_to(&self, p: Vec3) -> f32 {
@@ -69,21 +73,35 @@ pub struct Torch {
     pub lit: bool,
     /// The colour this frame, 0..255 (flickering).
     pub now: Vec3,
+    /// The level meshes it reaches.
+    pub chunks: Vec<usize>,
+    /// What `lit` was when its meshes were last coloured.
+    was_lit: bool,
 }
 
-/// The light one torch adds to a vertex, 0..255 per channel (`ApplyTileLights`: Lambert, linear falloff, halved).
-pub fn torch_light(t: &Torch, pos: Vec3, normal: Vec3) -> Vec3 {
+/// How much of a torch's colour reaches a vertex (`ApplyTileLights`: Lambert, linear falloff, halved).
+pub fn torch_factor(t: &Torch, pos: Vec3, normal: Vec3) -> f32 {
     let to = t.pos - pos;
     let dist = to.length();
     if dist >= t.fall_end || dist < 1e-3 {
-        return Vec3::ZERO;
+        return 0.0;
     }
     let cos = normal.dot(to / dist);
     if cos <= 0.0 {
-        return Vec3::ZERO;
+        return 0.0;
     }
     let k = if dist <= t.fall_start { 1.0 } else { (t.fall_end - dist) / (t.fall_end - t.fall_start).max(1e-3) };
-    t.now * (cos * k * t.intensity * GLOBAL_LIGHT_FACTOR * 0.5)
+    cos * k * t.intensity * GLOBAL_LIGHT_FACTOR * 0.5
+}
+
+/// The light one torch adds to a vertex, 0..255 per channel.
+pub fn torch_light(t: &Torch, pos: Vec3, normal: Vec3) -> Vec3 {
+    t.now * torch_factor(t, pos, normal)
+}
+
+/// A torch's colour between flickers, 0..255: the middle of what the flicker takes away.
+fn steady(t: &Torch) -> Vec3 {
+    (t.rgb - t.rgb * t.flicker * 0.25).max(Vec3::ZERO) * 255.0
 }
 
 #[derive(Resource, Default)]
@@ -93,11 +111,15 @@ pub struct LevelLighting {
     lut: Vec<f32>,
     rng: u32,
     since_flicker: f32,
+    /// Meshes whose colours no longer match their torches.
+    dirty: Vec<bool>,
+    /// Whose turn it is among the torches that share the budget.
+    turn: usize,
 }
 
 impl LevelLighting {
-    pub fn new(chunks: Vec<LitChunk>, lights: &[Light], scene_pos: Vec3) -> Self {
-        let torches = lights
+    pub fn new(mut chunks: Vec<LitChunk>, lights: &[Light], scene_pos: Vec3) -> Self {
+        let mut torches: Vec<Torch> = lights
             .iter()
             .filter(|l| l.extras & EXTRAS_SEMIDYNAMIC != 0 && l.fall_end > l.fall_start)
             .map(|l| Torch {
@@ -113,16 +135,39 @@ impl LevelLighting {
                 ex_size: l.ex_size,
                 ex_speed: l.ex_speed,
                 lit: l.extras & (EXTRAS_STARTEXTINGUISHED | EXTRAS_OFF) == 0,
-                now: Vec3::from(l.rgb) * 255.0,
+                now: Vec3::ZERO,
+                chunks: Vec::new(),
+                was_lit: false,
             })
             .collect();
+        for t in &mut torches {
+            t.now = steady(t);
+        }
+        // Which vertices each torch lights, once.
+        for (c, chunk) in chunks.iter_mut().enumerate() {
+            for (i, t) in torches.iter_mut().enumerate() {
+                if chunk.distance_to(t.pos) >= t.fall_end {
+                    continue;
+                }
+                let reached: Vec<(u32, f32)> = (0..chunk.positions.len())
+                    .filter(|&v| chunk.normals[v] != Vec3::ZERO)
+                    .map(|v| (v as u32, torch_factor(t, chunk.positions[v], chunk.normals[v])))
+                    .filter(|&(_, k)| k > 0.0)
+                    .collect();
+                if !reached.is_empty() {
+                    chunk.lit_by.push((i, reached));
+                    t.chunks.push(c);
+                }
+            }
+        }
         let lut = (0..=255u32)
             .map(|c| {
                 let c = c as f32 / 255.0;
                 if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
             })
             .collect();
-        LevelLighting { chunks, torches, lut, rng: 0x1357_9BDF, since_flicker: 1.0 }
+        let dirty = vec![false; chunks.len()];
+        LevelLighting { chunks, torches, lut, rng: 0x1357_9BDF, since_flicker: 1.0, dirty, turn: 0 }
     }
 
     fn random(&mut self) -> f32 {
@@ -131,15 +176,9 @@ impl LevelLighting {
         self.rng ^= self.rng << 5;
         (self.rng >> 8) as f32 / (1u32 << 24) as f32
     }
-
-    /// The torches' light at a point, 0..255 per channel, for something facing `normal` (characters and objects take
-    /// the whole of it, not the half the level's own vertices get).
-    pub fn torches_at(&self, pos: Vec3, normal: Vec3) -> Vec3 {
-        self.torches.iter().filter(|t| t.lit).map(|t| torch_light(t, pos, normal) * 2.0).sum()
-    }
 }
 
-/// Flicker the torches and light the level's chunks near the camera again.
+/// Flicker the torches near the camera and colour again the level meshes they reach.
 pub fn update(time: Res<Time>, cam: Single<&Transform, With<Camera3d>>, mut lighting: ResMut<LevelLighting>, mut meshes: ResMut<Assets<Mesh>>) {
     let l = &mut *lighting;
     if l.torches.is_empty() || l.chunks.is_empty() {
@@ -151,37 +190,62 @@ pub fn update(time: Res<Time>, cam: Single<&Transform, With<Camera3d>>, mut ligh
         return;
     }
     l.since_flicker = 0.0;
-    for i in 0..l.torches.len() {
+    let eye = cam.translation;
+    // A torch lit or put out (and every torch the first time) changes its meshes whatever the budget.
+    for t in &mut l.torches {
+        if t.lit != t.was_lit {
+            t.was_lit = t.lit;
+            for &c in &t.chunks {
+                l.dirty[c] = true;
+            }
+        }
+    }
+    // The nearest torch flickers every tick; the others near the camera take turns with what is left of the budget.
+    let mut near: Vec<(f32, usize)> =
+        l.torches.iter().enumerate().filter(|(_, t)| t.lit && !t.chunks.is_empty()).map(|(i, t)| (t.pos.distance(eye), i)).filter(|&(d, _)| d < FLICKER_RANGE).collect();
+    near.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let others = near.len().saturating_sub(1);
+    let order: Vec<usize> = near.first().map(|n| n.1).into_iter().chain((0..others).map(|k| near[1 + (l.turn + k) % others].1)).collect();
+    let mut budget = CHUNKS_PER_TICK as isize;
+    let mut taken = 0;
+    for (n, i) in order.into_iter().enumerate() {
+        if budget <= 0 {
+            break;
+        }
         let r = Vec3::new(l.random(), l.random(), l.random());
         let t = &mut l.torches[i];
         t.now = ((t.rgb - t.rgb * t.flicker * r * 0.5).max(Vec3::ZERO)) * 255.0;
+        budget -= t.chunks.len() as isize;
+        for &c in &t.chunks {
+            l.dirty[c] = true;
+        }
+        if n > 0 {
+            taken += 1;
+        }
     }
-    let eye = cam.translation;
-    let LevelLighting { chunks, torches, lut, .. } = l;
-    for chunk in chunks.iter_mut() {
-        let near: Vec<&Torch> = if chunk.distance_to(eye) > LIGHTING_RANGE {
-            Vec::new()
-        } else {
-            torches.iter().filter(|t| t.lit && chunk.distance_to(t.pos) < t.fall_end).collect()
-        };
-        if near.is_empty() && !chunk.changed {
+    if others > 0 {
+        l.turn = (l.turn + taken) % others;
+    }
+    let LevelLighting { chunks, torches, lut, dirty, .. } = l;
+    for (chunk, dirty) in chunks.iter().zip(dirty.iter_mut()) {
+        if !std::mem::take(dirty) {
             continue;
         }
         let Some(mut mesh) = meshes.get_mut(&chunk.mesh) else { continue };
-        let colors: Vec<[f32; 4]> = (0..chunk.positions.len())
-            .map(|i| {
-                let mut c = Vec3::from(chunk.baked[i]);
-                if chunk.normals[i] != Vec3::ZERO {
-                    for t in &near {
-                        c += torch_light(t, chunk.positions[i], chunk.normals[i]);
-                    }
-                }
-                let to_linear = |v: f32| lut[v.clamp(0.0, 255.0) as usize];
-                [to_linear(c.x), to_linear(c.y), to_linear(c.z), chunk.alphas[i]]
-            })
-            .collect();
+        let mut colors: Vec<Vec3> = chunk.baked.iter().map(|&c| Vec3::from(c)).collect();
+        for (torch, reached) in &chunk.lit_by {
+            let t = &torches[*torch];
+            if !t.lit {
+                continue;
+            }
+            for &(v, k) in reached {
+                colors[v as usize] += t.now * k;
+            }
+        }
+        let to_linear = |v: f32| lut[v.clamp(0.0, 255.0) as usize];
+        let colors: Vec<[f32; 4]> = colors.iter().zip(&chunk.alphas).map(|(c, &a)| [to_linear(c.x), to_linear(c.y), to_linear(c.z), a]).collect();
         mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
-        chunk.changed = !near.is_empty();
+        crate::perf::TOUCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -204,6 +268,8 @@ mod tests {
             ex_speed: 0.0,
             lit: true,
             now: Vec3::splat(255.0),
+            chunks: Vec::new(),
+            was_lit: false,
         }
     }
 
