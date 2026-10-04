@@ -102,6 +102,8 @@ pub struct ScriptWorld {
     queue: VecDeque<QueuedEvent>,
     pub(crate) timers: Vec<Timer>,
     rng: u64,
+    /// Whose turn it is to get its main event (see [`ScriptWorld::heartbeat`]).
+    heartbeat: usize,
 }
 
 impl Default for ScriptWorld {
@@ -123,6 +125,7 @@ impl ScriptWorld {
             queue: VecDeque::new(),
             timers: Vec::new(),
             rng: 0x2545_F491_4F6C_DD1D,
+            heartbeat: 0,
         }
     }
 
@@ -236,6 +239,26 @@ impl ScriptWorld {
         for _ in 0..4096 {
             let Some(q) = self.queue.pop_front() else { break };
             self.send_event(host, q.sender, q.target, &q.event, q.params);
+        }
+    }
+
+    /// The engine's heartbeat: every frame the next ten entities get their main event (`main` unless a script
+    /// changed it with `setmainevent`; the dead get `dead`). Scripts use it to keep an eye on things (`on main`).
+    pub fn heartbeat(&mut self, host: &mut dyn Host) {
+        for _ in 0..self.entities.len().min(10) {
+            if self.heartbeat >= self.entities.len() {
+                self.heartbeat = 0;
+                return;
+            }
+            let id = self.heartbeat as EntityId;
+            self.heartbeat += 1;
+            let event = self.entity(id).main_event.clone().unwrap_or_else(|| "main".to_owned());
+            let header = format!("on {event}");
+            let e = self.entity(id);
+            let handled = [&e.script, &e.over_script].into_iter().flatten().any(|s| s.find_pos(&header).is_some());
+            if handled {
+                self.send_event(host, None, id, &event, Vec::new());
+            }
         }
     }
 

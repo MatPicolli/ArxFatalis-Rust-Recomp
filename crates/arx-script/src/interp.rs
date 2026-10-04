@@ -332,8 +332,8 @@ impl Args<'_> {
             "gameseconds" => Value::Int((self.world.now_ms / 1000.0) as i64),
             "target" => Value::Text("none".to_owned()),
             "speaking" | "life" | "mana" | "fighting" | "playercasting" | "inplayerinventory" | "poisoned" | "gore" | "demo" | "price" => Value::Int(0),
-            _ if rest.starts_with("playerspell_") || rest.starts_with("myspell_") || rest.starts_with("possess_") => Value::Int(0),
-            _ => Value::Text(String::new()),
+            // Like the engine, anything it does not know reads as the number 0.
+            _ => Value::Int(0),
         }
     }
 

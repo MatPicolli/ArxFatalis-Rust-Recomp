@@ -5,6 +5,7 @@ pub mod anchors;
 pub mod inventory;
 pub mod npc;
 pub mod player_combat;
+pub mod stage;
 pub mod zones;
 
 use arx_formats::{PakSet, dlf::Dlf, ftl::Ftl};

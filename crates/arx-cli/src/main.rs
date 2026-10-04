@@ -876,6 +876,14 @@ TOTAL: {ents} entities ({with_script} class scripts, {with_over} instance script
                 if entities {
                     for e in &d.entities { println!("  {:<70} #{:<4} pos {:?} angle {:?} flags {}", e.class, e.instance, e.pos, e.angle, e.flags); }
                 }
+                if entities {
+                    let sp = fts.as_ref().map_or(glam::Vec3::ZERO, |f| glam::Vec3::from(f.scene_pos));
+                    for p in &d.paths {
+                        let o = glam::Vec3::from(p.pos) + sp;
+                        let pts: Vec<String> = p.pathways.iter().map(|w| format!("{:.0},{:.0},{:.0}@{}ms", o.x + w.pos[0], o.y + w.pos[1], o.z + w.pos[2], w.time_ms)).collect();
+                        println!("  {} {:<28} height {:<5} at {:.0},{:.0},{:.0}: {}", if p.is_zone() { "zone" } else { "path" }, p.name, p.height, o.x, o.y, o.z, pts.join(" "));
+                    }
+                }
             }
         }
         Cmd::Ftl { path: None } => {

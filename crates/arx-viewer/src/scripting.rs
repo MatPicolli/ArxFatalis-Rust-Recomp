@@ -86,6 +86,7 @@ pub fn tick(time: Res<Time>, fly: Res<Fly>, mut s: ResMut<Scripting>) {
     s.world.entity_mut(player).pos = [feet.x, -feet.y, -feet.z];
     s.host.publish_player(&mut s.world);
     s.world.update(&mut s.host, time.delta_secs_f64().min(0.1) * 1000.0);
+    s.world.heartbeat(&mut s.host);
 }
 
 /// Make doors and other entities solid or passable as their scripts say (`collision on/off`,
@@ -209,7 +210,7 @@ pub fn interact(
     if scripted {
         eprintln!("E pressed: looking at {:?}; reading {}", s.target.map(|t| s.world.entity(t).id_string.clone()), ui.reading.is_some());
     }
-    if !(keys.just_pressed(KeyCode::KeyE) || scripted) || ui.reading.is_some() {
+    if !(keys.just_pressed(KeyCode::KeyE) || scripted) || ui.reading.is_some() || !s.host.stage.controls {
         return;
     }
     let Some(target) = s.target else { return };

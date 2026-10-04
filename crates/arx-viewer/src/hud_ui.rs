@@ -744,7 +744,7 @@ pub fn draw(
     ui.scale = interface_scale(w, h, ui.hud_scale);
     let dt = time.delta_secs().min(0.1);
     let p = &s.host.player;
-    if p.is_dead() {
+    if p.is_dead() || s.host.stage.interface_hidden {
         return;
     }
 

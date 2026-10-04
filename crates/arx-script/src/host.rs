@@ -93,6 +93,15 @@ pub struct EntityState {
     pub equipped: bool,
     /// What the hero shouts when a weapon's blow is well aimed (`setstrikespeech`).
     pub strike_speech: String,
+    /// What the entity looks at or follows (`settarget`); characters act on it, cameras look at it.
+    pub target: TargetSpec,
+    /// Cameras: focal length (`camerafocal`, 100..800; the engine's default view is 350), how slowly the view follows
+    /// its target (`camerasmoothing`) and an offset added to the target (`cameratranslatetarget`, Arx coordinates).
+    pub cam_focal: f32,
+    pub cam_smoothing: f32,
+    pub cam_translate: [f32; 3],
+    /// Cannot be hurt (`invulnerability on`).
+    pub invulnerable: bool,
 }
 
 impl Default for EntityState {
@@ -131,6 +140,11 @@ impl Default for EntityState {
             max_durability: 0.0,
             equipped: false,
             strike_speech: String::new(),
+            target: TargetSpec::None,
+            cam_focal: 350.0,
+            cam_smoothing: 0.0,
+            cam_translate: [0.0; 3],
+            invulnerable: false,
         }
     }
 }
@@ -246,6 +260,58 @@ pub enum NpcRequest {
     Pathfind { entity: EntityId, target: Option<EntityId> },
 }
 
+/// A fade of the whole picture (`worldfade`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Fade {
+    /// To the colour (`out`) or back from it (`in`).
+    pub out: bool,
+    pub duration_ms: f32,
+    pub color: [f32; 3],
+    /// Script time when it began.
+    pub started_ms: f64,
+}
+
+/// Something a script asked of the stage: moving along the level's paths, jumping somewhere, turning the hero's head.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StageRequest {
+    /// `setpath [-wf] <name>|none`: follow a path of the level from its beginning (or stop following).
+    SetPath { entity: EntityId, name: Option<String>, worm: bool, follow_direction: bool },
+    /// `usepath f|b|p`: go forward, backward, or pause on the path.
+    UsePath { entity: EntityId, mode: char },
+    /// `teleport <target>`: the entity jumps to where `to` is. `teleport -i` sends it back where it started.
+    Teleport { entity: EntityId, to: Option<EntityId> },
+    /// `teleport -p <target>`: the hero jumps there; `yaw` (engine degrees) if `-a` gave one.
+    TeleportPlayer { to: EntityId, yaw: Option<f32> },
+    /// `teleport -l <level> <target>`: go to another level.
+    ChangeLevel { level: u32, target: String, yaw: Option<f32> },
+    /// `playerlookat <entity>`
+    LookAt { entity: EntityId },
+    /// `cine <name>`: a 2D cinematic was asked for by `entity`.
+    Cinematic { entity: EntityId, name: String },
+}
+
+/// What scripts have done to the way the game is shown and played: the cutscene state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stage {
+    /// The player may move and look (`setplayercontrols`).
+    pub controls: bool,
+    /// Black bars above and below (`cinemascope`).
+    pub cinemascope: bool,
+    /// The HUD is hidden (`playerinterface hide`).
+    pub interface_hidden: bool,
+    pub fade: Option<Fade>,
+    /// The camera entity the scene is seen through (`cameraactivate`), instead of the hero's eyes.
+    pub camera: Option<EntityId>,
+    /// The hero cannot be hurt (`invulnerability -p on`).
+    pub player_invulnerable: bool,
+}
+
+impl Default for Stage {
+    fn default() -> Self {
+        Stage { controls: true, cinemascope: false, interface_hidden: false, fade: None, camera: None, player_invulnerable: false }
+    }
+}
+
 /// Loads the script of an entity class (a virtual path without extension), for items that scripts create
 /// (`inventory add`).
 pub type ScriptLoader = Box<dyn Fn(&str) -> Option<Arc<Script>> + Send + Sync>;
@@ -297,6 +363,9 @@ pub struct StdHost {
     pub npc_weapons: HashMap<EntityId, EntityId>,
     /// Which entity watches each zone (`setcontrolledzone`), by lowercased zone name.
     pub controlled_zones: HashMap<String, EntityId>,
+    /// Cutscene state: camera, fade, bars, whether the player has control.
+    pub stage: Stage,
+    stage_requests: Vec<StageRequest>,
 }
 
 impl StdHost {
@@ -630,6 +699,11 @@ impl StdHost {
         self.player.equipped_in(EquipSlot::Weapon)
     }
 
+    /// Paths, teleports and such that scripts asked for since the last call, in order.
+    pub fn take_stage_requests(&mut self) -> Vec<StageRequest> {
+        std::mem::take(&mut self.stage_requests)
+    }
+
     /// Character commands scripts gave since the last call, in order.
     pub fn take_npc_requests(&mut self) -> Vec<NpcRequest> {
         std::mem::take(&mut self.npc_requests)
@@ -914,6 +988,158 @@ impl Host for StdHost {
                 CmdResult::Success
             }
             "inventory" => self.inventory_command(a),
+            "cameraactivate" => {
+                let w = a.get_word();
+                if w == "none" {
+                    self.stage.camera = None;
+                    return Some(CmdResult::Success);
+                }
+                match a.world.find(&w, me).filter(|&t| a.world.entity(t).kind == EntityKind::Camera) {
+                    Some(t) => {
+                        self.stage.camera = Some(t);
+                        CmdResult::Success
+                    }
+                    None => CmdResult::Failed,
+                }
+            }
+            "camerasmoothing" => {
+                let v = a.get_float();
+                self.state_mut(me).cam_smoothing = v;
+                CmdResult::Success
+            }
+            "camerafocal" => {
+                let v = a.get_float().clamp(100.0, 800.0);
+                self.state_mut(me).cam_focal = v;
+                CmdResult::Success
+            }
+            "cameratranslatetarget" => {
+                let v = [a.get_float(), a.get_float(), a.get_float()];
+                self.state_mut(me).cam_translate = v;
+                CmdResult::Success
+            }
+            "cinemascope" => {
+                let _flags = a.get_flags();
+                self.stage.cinemascope = a.get_bool();
+                CmdResult::Success
+            }
+            "worldfade" => {
+                let dir = a.get_word();
+                let duration_ms = a.get_float();
+                let started_ms = a.world.now_ms;
+                match dir.as_str() {
+                    "out" => {
+                        let color = [a.get_float(), a.get_float(), a.get_float()];
+                        self.stage.fade = Some(Fade { out: true, duration_ms, color, started_ms });
+                    }
+                    "in" => {
+                        let color = self.stage.fade.map_or([0.0; 3], |f| f.color);
+                        self.stage.fade = Some(Fade { out: false, duration_ms, color, started_ms });
+                    }
+                    other => {
+                        a.warn(&format!("unexpected fade direction: {other}"));
+                        return Some(CmdResult::Failed);
+                    }
+                }
+                CmdResult::Success
+            }
+            "setplayercontrols" => {
+                let on = a.get_bool();
+                if on != self.stage.controls {
+                    // Every character hears that the player can (or cannot) act.
+                    let event = if on { "controls_on" } else { "controls_off" };
+                    let npcs: Vec<EntityId> = a.world.entities.iter().filter(|e| e.kind == EntityKind::Npc).map(|e| e.id).collect();
+                    for n in npcs {
+                        a.world.queue_event(Some(me), n, event, Vec::new());
+                    }
+                }
+                self.stage.controls = on;
+                if !on {
+                    self.player.fighting = false;
+                }
+                CmdResult::Success
+            }
+            "playerinterface" => {
+                let _flags = a.get_flags();
+                match a.get_word().as_str() {
+                    "hide" => self.stage.interface_hidden = true,
+                    "show" => self.stage.interface_hidden = false,
+                    other => {
+                        a.warn(&format!("unknown command: {other}"));
+                        return Some(CmdResult::Failed);
+                    }
+                }
+                CmdResult::Success
+            }
+            "playerlookat" => {
+                let w = a.get_word();
+                match a.world.find(&w, me) {
+                    Some(entity) => {
+                        self.stage_requests.push(StageRequest::LookAt { entity });
+                        CmdResult::Success
+                    }
+                    None => CmdResult::Failed,
+                }
+            }
+            "invulnerability" => {
+                let flags = a.get_flags();
+                let on = a.get_bool();
+                if has_flag(&flags, 'p') {
+                    self.stage.player_invulnerable = on;
+                } else {
+                    self.state_mut(me).invulnerable = on;
+                }
+                CmdResult::Success
+            }
+            "setpath" => {
+                let flags = a.get_flags();
+                let name = a.get_word();
+                let name = (name != "none").then_some(name);
+                self.stage_requests.push(StageRequest::SetPath { entity: me, name, worm: has_flag(&flags, 'w'), follow_direction: has_flag(&flags, 'f') });
+                CmdResult::Success
+            }
+            "usepath" => {
+                let mode = a.get_word().chars().next().unwrap_or('f');
+                self.stage_requests.push(StageRequest::UsePath { entity: me, mode });
+                CmdResult::Success
+            }
+            "teleport" => {
+                let flags = a.get_flags();
+                let yaw = has_flag(&flags, 'a').then(|| a.get_float());
+                if has_flag(&flags, 'l') {
+                    let level = a.get_float().max(0.0) as u32;
+                    let target = a.get_word();
+                    self.stage_requests.push(StageRequest::ChangeLevel { level, target, yaw });
+                    return Some(CmdResult::Success);
+                }
+                if has_flag(&flags, 'i') {
+                    self.stage_requests.push(StageRequest::Teleport { entity: me, to: None });
+                    return Some(CmdResult::Success);
+                }
+                let w = a.get_word();
+                if w == "behind" {
+                    return Some(CmdResult::Success);
+                }
+                let Some(to) = a.world.find(&w, me) else {
+                    a.warn(&format!("unknown target: {w}"));
+                    return Some(CmdResult::Failed);
+                };
+                if has_flag(&flags, 'p') {
+                    self.stage_requests.push(StageRequest::TeleportPlayer { to, yaw });
+                } else {
+                    self.stage_requests.push(StageRequest::Teleport { entity: me, to: Some(to) });
+                }
+                CmdResult::Success
+            }
+            "cine" => {
+                let _flags = a.get_flags();
+                let name = a.get_word();
+                if !matches!(name.as_str(), "kill" | "preload") {
+                    self.stage_requests.push(StageRequest::Cinematic { entity: me, name });
+                } else if name == "preload" {
+                    a.skip_word();
+                }
+                CmdResult::Success
+            }
             "setcontrolledzone" => {
                 let w = a.get_word();
                 let zone = a.string_var(&w).to_ascii_lowercase();
@@ -1077,6 +1303,7 @@ impl Host for StdHost {
                         None => TargetSpec::None,
                     },
                 };
+                self.state_mut(me).target = target;
                 self.npc_requests.push(NpcRequest::SetTarget { entity: me, flags, target });
                 CmdResult::Success
             }

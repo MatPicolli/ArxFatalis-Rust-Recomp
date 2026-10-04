@@ -36,9 +36,12 @@ struct WeaponVisual {
 #[derive(Resource, Default)]
 pub struct PlayerBody {
     pub entity: Option<Entity>,
+    /// The same body with its head and chest, shown when the scene is seen from outside (a cutscene camera).
+    outside: Option<Entity>,
     weapon: Option<WeaponVisual>,
     shield: Option<WeaponVisual>,
     base_slot: Option<String>,
+    outside_slot: Option<String>,
     overlay_slot: Option<String>,
     /// Characters the current swing has hit.
     hit: Vec<EntityId>,
@@ -95,7 +98,8 @@ pub fn spawn(
     let opts = SpawnOpts { hide_selection: Some("1st"), not_pickable: true };
     let e = spawn_entity(commands, pak, lights, scripting, pickables, ecache, tcache, meshes, materials, images, BODY_CLASS, arx, [0.0; 3], 1, player, true, &mut stats, &opts);
     body.entity = e;
-    eprintln!("player body: {e:?} stats {stats:?}");
+    let whole = SpawnOpts { hide_selection: None, not_pickable: true };
+    body.outside = spawn_entity(commands, pak, lights, scripting, pickables, ecache, tcache, meshes, materials, images, BODY_CLASS, arx, [0.0; 3], 1, player, true, &mut stats, &whole);
     // Which vertices carry the weapon.
     if let Some(ftl) = pak.read("game/graph/obj3d/interactive/npc/human_base/human_base.ftl").ok().and_then(|b| Ftl::parse(&b).ok()) {
         let find = |name: &str| ftl.actions.iter().find(|a| a.name.eq_ignore_ascii_case(name)).map(|a| a.vertex as usize);
@@ -174,7 +178,7 @@ pub fn drive(
     let dead = s.host.player.is_dead();
 
     // Combat controls: Tab draws or puts away the weapon; the left button winds up and strikes.
-    let attack_held = live && mouse.pressed(MouseButton::Left) && !ui.cursor_mode && !dead && fly.walk;
+    let attack_held = live && mouse.pressed(MouseButton::Left) && !ui.cursor_mode && !dead && fly.walk && s.host.stage.controls;
     let mut updates = Vec::new();
     if live && keys.just_pressed(KeyCode::Tab) && !dead && fly.walk && !ui.open && ui.book.is_none() {
         updates.push(combat.state.toggle(&mut s.host, player));
@@ -196,24 +200,45 @@ pub fn drive(
     combat.blow = main.blow;
     updates.push(main);
 
+    // Seen from outside (a cutscene camera), the whole body is shown instead of the one without head and chest.
+    let from_outside = s.host.stage.camera.is_some();
+    let base_path = {
+        let pressed: &ButtonInput<KeyCode> = if live && s.host.stage.controls { &keys } else { &ButtonInput::default() };
+        let slot = legs_slot(&fly, pressed, combat.state.is_fighting(), args.walk_forward && s.host.stage.controls);
+        s.host.state(player).and_then(|st| st.anims.get(slot)).cloned().map(|p| (slot, p))
+    };
+    if let Some(outside) = body.outside
+        && let Ok((mut tf, mut vis, mut anim)) = q.get_mut(outside)
+    {
+        tf.translation = fly.player.feet;
+        tf.rotation = Quat::from_rotation_y(fly.yaw + std::f32::consts::PI);
+        *vis = if fly.walk && from_outside { Visibility::Inherited } else { Visibility::Hidden };
+        if let Some((slot, path)) = &base_path
+            && body.outside_slot.as_deref() != Some(slot)
+            && let Some(tea) = script_anim(s, &arx, path)
+        {
+            anim.anim = Some(tea);
+            anim.looping = true;
+            anim.elapsed_us = 0;
+            body.outside_slot = Some((*slot).to_owned());
+        }
+    }
     let Ok((mut tf, mut vis, mut anim)) = q.get_mut(entity) else { return };
     anim.keep_pose = true;
     // Where the hero stands, facing where they look.
     tf.translation = fly.player.feet;
     tf.rotation = Quat::from_rotation_y(fly.yaw + std::f32::consts::PI);
-    *vis = if fly.walk && !dead { Visibility::Inherited } else { Visibility::Hidden };
+    *vis = if fly.walk && !dead && !from_outside { Visibility::Inherited } else { Visibility::Hidden };
 
     // Legs.
-    let pressed: &ButtonInput<KeyCode> = if live { &keys } else { &ButtonInput::default() };
-    let slot = legs_slot(&fly, pressed, combat.state.is_fighting(), args.walk_forward);
-    if body.base_slot.as_deref() != Some(slot)
-        && let Some(path) = s.host.state(player).and_then(|st| st.anims.get(slot)).cloned()
-        && let Some(tea) = script_anim(s, &arx, &path)
+    if let Some((slot, path)) = &base_path
+        && body.base_slot.as_deref() != Some(slot)
+        && let Some(tea) = script_anim(s, &arx, path)
     {
         anim.anim = Some(tea);
         anim.looping = true;
         anim.elapsed_us = 0;
-        body.base_slot = Some(slot.to_owned());
+        body.base_slot = Some((*slot).to_owned());
     }
 
     // Arms.
@@ -369,6 +394,7 @@ pub fn attach(
         eprintln!("body at {:?}; slot {:?}/{:?}; weapon {} shield {}", body_tf.translation, body.base_slot, body.overlay_slot, body.weapon.is_some(), body.shield.is_some());
     }
 
+    // (A cutscene camera, if one is active, takes over after this.)
     // The eyes: the camera sits at the body's `view_attach` vertex (so it bobs with the animation and is in front of
     // the chest, not inside it), never more than 46 units off the body's axis.
     if let Some(v) = body.view_attach

@@ -10,6 +10,7 @@ mod anims;
 mod animated;
 mod audio;
 mod convert;
+mod cutscene;
 mod entities;
 mod drag;
 mod hud;
@@ -540,12 +541,13 @@ fn run_level(args: Args, pak: PakSet) {
     .insert_resource(scripting::Obstacles::default())
     .insert_resource(npcs::Npcs::default())
     .insert_resource(npcs::LevelZones::default())
+    .insert_resource(cutscene::Stage::default())
     .insert_resource(player_body::PlayerBody::default())
     .insert_resource(player_body::Combat::default())
     .insert_resource(audio::Sounds::new(args.mute))
     .insert_resource(speech::Speech::new(locale, args.language.clone(), !args.no_subtitles, args.mute))
     .add_systems(Startup, (hud_ui::load_font, speech::spawn_ui).chain())
-    .add_systems(Startup, steps::load)
+    .add_systems(Startup, (steps::load, cutscene::spawn_ui))
     .insert_resource(steps::StepSounds::default())
     .insert_resource(drag::ItemBodies::default())
     .insert_resource(hud_ui::UiFont::default())
@@ -557,6 +559,8 @@ fn run_level(args: Args, pak: PakSet) {
             scripting::tick,
             npcs::zones,
             npcs::update,
+            cutscene::update,
+            cutscene::skip,
             speech::debug_say,
             speech::update,
             entities::spawn_dropped,
@@ -585,6 +589,8 @@ fn run_level(args: Args, pak: PakSet) {
             hud_ui::draw,
             animated::animate,
             player_body::attach,
+            cutscene::camera,
+            cutscene::overlay,
             level_hud,
         )
             .chain())
@@ -594,6 +600,15 @@ fn run_level(args: Args, pak: PakSet) {
         app.insert_resource(Shot { path, frames: 0 }).add_systems(Update, take_shot);
     }
     app.run();
+}
+
+/// What a level's simulation keeps besides its scripts.
+#[derive(bevy::ecs::system::SystemParam)]
+struct LevelState<'w> {
+    npcs: ResMut<'w, npcs::Npcs>,
+    body: ResMut<'w, player_body::PlayerBody>,
+    zones: ResMut<'w, npcs::LevelZones>,
+    stage: ResMut<'w, cutscene::Stage>,
 }
 
 fn setup_level(
@@ -607,13 +622,12 @@ fn setup_level(
     mut pickables: ResMut<scripting::Pickables>,
     mut spawned: ResMut<entities::SpawnedEntities>,
     mut obstacles: ResMut<scripting::Obstacles>,
-    mut npcs: ResMut<npcs::Npcs>,
-    mut body: ResMut<player_body::PlayerBody>,
-    mut zones: ResMut<npcs::LevelZones>,
+    level: LevelState,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
 ) {
+    let LevelState { mut npcs, mut body, mut zones, mut stage } = level;
     commands.spawn((
         Camera3d::default(),
         Projection::Perspective(PerspectiveProjection {
@@ -690,6 +704,7 @@ fn setup_level(
                     n.log = std::env::var("ARX_LOG_NPC").ok();
                 }
                 zones.0 = arx_level::zones::Zones::from_dlf(d, info.scene_pos);
+                stage.0 = arx_level::stage::StageWorld::from_dlf(d, info.scene_pos, &scripting.ids);
                 eprintln!("zones: {}", zones.0.zones.len());
             }
             let collision = std::sync::Arc::new(collision);
@@ -778,7 +793,8 @@ fn fly_camera(
     mut regrab: Local<bool>,
 ) {
     // Screenshot runs are scripted: ignore the real keyboard and mouse so they are reproducible.
-    let live = shot.is_none();
+    // A cutscene takes the controls away as well.
+    let live = shot.is_none() && script.host.stage.controls;
     let keys: &ButtonInput<KeyCode> = if live { &keys } else { &ButtonInput::default() };
     let mouse: &ButtonInput<MouseButton> = if live { &mouse } else { &ButtonInput::default() };
     let motion = if live { motion.delta } else { Vec2::ZERO };
