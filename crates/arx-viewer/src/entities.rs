@@ -472,6 +472,7 @@ pub fn spawn_entity(
             looping,
             root_motion: !class.contains("/npc/"),
             overlay: None,
+            under: None,
             // Jointed models keep their pose so their shadows can follow their limbs.
             keep_pose: ftl.groups.len() > 1,
             pose: None,

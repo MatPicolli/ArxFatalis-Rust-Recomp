@@ -62,6 +62,24 @@ Model/texture controls: Left/Right = prev/next, PgUp/PgDn = +-25, Home = first, 
 
 The game starts on the original's main menu (`gui/MainMenu.cpp`: its background, font and positions), and `Esc` brings it back as the pause menu; while it is open nothing in the level moves and its sounds are paused. *New quest* opens character creation: the book's character sheet with 16 attribute and 18 skill points to hand out (left click spends, right click takes back), *Quick generation* (first the average hero, then random ones, as in the original), the hero's face, and *Done* once every point is spent, which starts the level's intro. *Options* has full screen, VSync, field of view, HUD size, subtitles, master/effects/speech volume, mouse sensitivity and inverted mouse; they take effect at once and are kept in `%APPDATA%\arx-fatalis-rust\options.cfg`. Loading, saving and the credits are shown but do nothing yet. With a game running, *New quest* asks first and then starts the program again on character creation.
 
+## Mods
+
+Drop a mod into the `mods` folder next to where you run the game (it is made on the first run; `--mods-dir` or `ARX_MODS` points somewhere else) and it is used: no installing, no editing of the game's files.
+
+- A mod is a **folder** or a **`.pak` archive**. Inside it, files sit where the game has them: `graph/obj3d/textures/...` (textures), `graph/obj3d/interactive/.../x.asl` (scripts), `game/graph/obj3d/...ftl` (models), `game/graph/levels/...` and `graph/levels/...` (levels), `graph/interface/...` (menus, HUD), `sfx/...`, `speech/<language>/...`, `localisation/...`, `misc/...`.
+- A file a mod has **replaces** the game's file of that name; anything else is **added**. Mods apply in alphabetical order, so of two mods with the same file the later one wins.
+- An optional `mod.ini` at the top (`name = ...`, `author = ...`, `version = ...`, `description = ...`) is what the menu shows.
+- With anything in the folder, the main/pause menu gets a **Mods** entry: tick mods on and off there, then *Apply* (the game starts again, because mods are read at start-up). Which mods are off is kept in `%APPDATA%\arx-fatalis-rust\mods-off.cfg`, so the mods themselves stay untouched.
+
+```bash
+cargo run --release -p arx-cli -- extract graph/obj3d/interactive/items/provisions/bottle_wine/bottle_wine.asl -o my_mod/graph/obj3d/interactive/items/provisions/bottle_wine/bottle_wine.asl   # start from a game file
+cargo run --release -p arx-cli -- pack my_mod -o mods/my_mod.pak     # a folder into one .pak (the game's own format)
+cargo run --release -p arx-cli -- mods -f                            # what is in mods/, and every file it replaces or adds
+cargo run --release -p arx-cli -- --mods-dir mods script 1           # the tools look at the plain game unless told to use mods
+```
+
+Not there yet: changing the load order in the menu, mods that patch part of a file (a mod replaces whole files), and mods that add native code.
+
 ## Interface
 
 The HUD is laid out like the original's (`gui/Hud.cpp`) using its own bitmaps: the life gauge bottom-left and the mana gauge bottom-right (a filled gauge shows through the empty gauge's frame; click one for the number), and above the mana gauge the backpack, the spell book (not available yet) and, once you have gold, the purse (hover for the amount). The backpack slides up from the bottom: a 16x3 grid per bag (`addbag` adds more), every item taking as many 32-pixel slots as its icon is big, with the item's own icon and stack count drawn in the original's digit font. Chests slide in from the left with the chest's own skin and the pick-all and close buttons.

@@ -68,11 +68,62 @@ pub fn normalize(path: &str) -> String {
     path.replace('\\', "/").trim_matches('/').to_ascii_lowercase()
 }
 
+/// Build an archive the game (and the original engines) can read from `(path, contents)` pairs: files stored as they
+/// are, then the table of contents, obfuscated with the full game's key. This is how a mod is packed into one file.
+pub fn write_archive(files: &[(String, Vec<u8>)]) -> Vec<u8> {
+    // The data: a four-byte pointer to the table, then every file one after another.
+    let mut out = vec![0u8; 4];
+    let mut placed: Vec<(String, String, u32, u32)> = Vec::new();
+    for (path, bytes) in files {
+        let path = normalize(path);
+        let (dir, name) = path.rsplit_once('/').map_or(("", path.as_str()), |(d, n)| (d, n));
+        placed.push((dir.to_owned(), name.to_owned(), out.len() as u32, bytes.len() as u32));
+        out.extend_from_slice(bytes);
+    }
+    // The table: an empty root directory first (the game's own archives begin that way, which is also what makes
+    // the first four obfuscated bytes equal the key's), then each directory with its files.
+    let mut fat: Vec<u8> = vec![0, 0, 0, 0, 0];
+    let mut dirs: Vec<&str> = placed.iter().map(|p| p.0.as_str()).collect();
+    dirs.sort_unstable();
+    dirs.dedup();
+    for dir in dirs {
+        let inside: Vec<&(String, String, u32, u32)> = placed.iter().filter(|p| p.0 == dir).collect();
+        if dir.is_empty() && inside.is_empty() {
+            continue;
+        }
+        // Directories are written the way the original writes them: backslashes, with one at the end.
+        if !dir.is_empty() {
+            fat.extend_from_slice(dir.replace('/', "\\").as_bytes());
+            fat.push(b'\\');
+        }
+        fat.push(0);
+        fat.extend_from_slice(&(inside.len() as u32).to_le_bytes());
+        for (_, name, offset, size) in inside {
+            fat.extend_from_slice(name.as_bytes());
+            fat.push(0);
+            fat.extend_from_slice(&offset.to_le_bytes());
+            fat.extend_from_slice(&0u32.to_le_bytes()); // flags: stored, not compressed
+            fat.extend_from_slice(&0u32.to_le_bytes()); // (the uncompressed size of a compressed file)
+            fat.extend_from_slice(&size.to_le_bytes());
+        }
+    }
+    for (b, k) in fat.iter_mut().zip(KEY_FULL.iter().cycle()) {
+        *b ^= k;
+    }
+    let at = out.len() as u32;
+    out[..4].copy_from_slice(&at.to_le_bytes());
+    out.extend_from_slice(&(fat.len() as u32).to_le_bytes());
+    out.extend_from_slice(&fat);
+    out
+}
+
 #[derive(Default)]
 pub struct PakSet {
     archives: Vec<Mmap>,
     archive_names: Vec<String>,
     files: HashMap<String, PakEntry>,
+    /// The files that come from a mod, and which (see `mods`).
+    pub(crate) mod_files: HashMap<String, String>,
 }
 
 struct Cursor<'a> {
@@ -198,7 +249,7 @@ impl PakSet {
             if name.starts_with('.') {
                 continue;
             }
-            let vpath = format!("{mount}/{name}");
+            let vpath = if mount.is_empty() { name } else { format!("{mount}/{name}") };
             let Ok(ty) = e.file_type() else { continue };
             if ty.is_dir() {
                 self.add_loose_dir(&e.path(), &vpath);
@@ -207,6 +258,16 @@ impl PakSet {
                 self.files.insert(vpath, PakEntry { source: Source::Loose(e.path()), size });
             }
         }
+    }
+
+    /// Drop a file from the virtual file system.
+    pub(crate) fn forget(&mut self, path: &str) {
+        self.files.remove(&normalize(path));
+    }
+
+    /// The id of the mod a file comes from, if it comes from one.
+    pub fn mod_of(&self, path: &str) -> Option<&str> {
+        self.mod_files.get(&normalize(path)).map(String::as_str)
     }
 
     /// Find a texture by name the way the engine does: strip any extension, then try

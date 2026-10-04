@@ -178,6 +178,9 @@ struct Args {
     /// `options`, `back`, `quit`, `yes`, `no`, `resume`), for headless testing
     #[arg(long, value_delimiter = ',')]
     menu_do: Vec<String>,
+    /// The folder mods are dropped into (folders or `.pak` archives; see the README)
+    #[arg(long, env = "ARX_MODS", default_value = "mods")]
+    mods_dir: PathBuf,
     /// Save a screenshot to this file after a few frames, then exit
     #[arg(long)]
     shot: Option<PathBuf>,
@@ -228,8 +231,18 @@ fn main() {
         eprintln!("cannot open game data in {}: {e}", args.game_dir.display());
         std::process::exit(1);
     });
+    // Mods: whatever is in the mods folder goes over the game's files. The folder is made on the first proper run, so
+    // that there is somewhere to drop things.
+    let mut pak = pak;
+    if args.shot.is_none() && args.mode == Mode::Level && !args.mods_dir.exists() && std::fs::create_dir_all(&args.mods_dir).is_ok() {
+        let _ = std::fs::write(args.mods_dir.join("README.txt"), MODS_README);
+    }
+    let mods = pak.apply_mods(&args.mods_dir, &arx_formats::mods::read_disabled());
+    for m in &mods {
+        eprintln!("mod {}: {} ({} files, {} replace the game's){}", m.id, m.name, m.files, m.replaces, if m.enabled { "" } else { " - switched off" });
+    }
     if args.mode == Mode::Level {
-        run_level(args, pak);
+        run_level(args, pak, mods);
         return;
     }
     let ext: &[&str] = match args.mode {
@@ -357,7 +370,7 @@ fn load_current(
                 bounds = Some(m.bounds);
                 commands.spawn((
                     Shown,
-                    animated::Animated { skeleton, anim, meshes: m.meshes, elapsed_us: 0, looping: true, root_motion: false, overlay: None, keep_pose: false, pose: None, shown: None, bend: Vec::new() },
+                    animated::Animated { skeleton, anim, meshes: m.meshes, elapsed_us: 0, looping: true, root_motion: false, overlay: None, under: None, keep_pose: false, pose: None, shown: None, bend: Vec::new() },
                 ));
             }
             bounds
@@ -512,7 +525,10 @@ macro_rules! timed {
     };
 }
 
-fn run_level(args: Args, pak: PakSet) {
+/// Left in a new mods folder.
+const MODS_README: &str = "Drop mods here: a folder or a .pak archive each.\r\n\r\nInside a mod, files sit where the game has them (graph/..., game/..., sfx/..., speech/..., localisation/..., misc/...).\r\nA file a mod has replaces the game's file of that name; anything else is added. Mods apply in alphabetical order.\r\nAn optional mod.ini at the top of a mod gives it a name, author, version and description.\r\nSwitch mods on and off under Mods in the game's menu.\r\n";
+
+fn run_level(args: Args, pak: PakSet, mods: Vec<arx_formats::mods::Mod>) {
     let level = args.filter.as_deref().and_then(|s| s.parse().ok()).unwrap_or(1);
     let locale = pak.load_locale(&args.language).unwrap_or_else(|| {
         eprintln!("no localisation for language {:?}; text will show its keys", args.language);
@@ -611,7 +627,7 @@ fn run_level(args: Args, pak: PakSet) {
     .insert_resource(npcs::Npcs::default())
     .insert_resource(npcs::LevelZones::default())
     .insert_resource(cutscene::Stage(Default::default(), args.no_cutscenes, cutscene::PLAYER_FOV))
-    .insert_resource(menu::Menu::new(start_screen, options, persistent, args.menu_do.iter().filter_map(|n| menu::Action::from_name(n)).collect()))
+    .insert_resource(menu::Menu::new(start_screen, options, persistent, args.menu_do.iter().filter_map(|n| menu::Action::from_name(n)).collect(), mods))
     .insert_resource(lighting::LevelLighting::default())
     .insert_resource(perf::Perf::default())
     .insert_resource(book_hero::BookHero::default())

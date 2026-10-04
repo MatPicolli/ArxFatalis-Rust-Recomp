@@ -8,6 +8,7 @@ pub mod fts;
 pub mod ftl;
 pub mod llf;
 pub mod locale;
+pub mod mods;
 pub mod soundmap;
 pub mod pak;
 pub mod poly;

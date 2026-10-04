@@ -132,6 +132,18 @@ pub fn apply_state(
                     a.looping = play.looping;
                     a.elapsed_us = 0;
                 }
+                // A blow (and readying a weapon) moves the arms and chest only; the engine plays it on a layer of its
+                // own while the legs keep their fighting stance. Without that the legs freeze.
+                let upper_body = play.slot.contains("strike") || play.slot.contains("ready");
+                let stance = upper_body.then(|| st.anims.get("fight_wait").or_else(|| st.anims.get("wait")).cloned()).flatten();
+                match stance.and_then(|path| s.load_anim(&arx.0, &path)) {
+                    Some(tea) => {
+                        if a.under.as_ref().is_none_or(|u| !Arc::ptr_eq(&u.anim, &tea)) {
+                            a.under = Some(crate::animated::Overlay { anim: tea, elapsed_us: 0, looping: true });
+                        }
+                    }
+                    None => a.under = None,
+                }
             }
         }
     }

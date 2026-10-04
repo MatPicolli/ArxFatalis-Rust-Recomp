@@ -30,6 +30,9 @@ pub struct Animated {
     /// Apply the animation's translation of the whole object (gates, trapdoors); characters walk by other means.
     pub root_motion: bool,
     pub overlay: Option<Overlay>,
+    /// An animation under the first: it moves the bones the first leaves alone (a fighter's legs keep their
+    /// stance while a blow, which is arms and chest only, plays).
+    pub under: Option<Overlay>,
     /// Keep each frame's [`Pose`] (bone rotations and positions) in `pose`, to attach things to the body.
     pub keep_pose: bool,
     pub pose: Option<Pose>,
@@ -45,6 +48,7 @@ pub struct Shown {
     anim: usize,
     time: i64,
     overlay: Option<(usize, i64)>,
+    under: Option<(usize, i64)>,
     /// The bend, to a thousandth.
     bend: i64,
 }
@@ -73,6 +77,9 @@ pub fn animate(
         if let Some(o) = &mut a.overlay {
             o.elapsed_us += dt;
         }
+        if let Some(o) = &mut a.under {
+            o.elapsed_us += dt;
+        }
         let Some(anim) = a.anim.clone() else { continue };
         let t = if a.looping { anim.looped_time(a.elapsed_us) } else { a.elapsed_us.clamp(0, anim.duration_us) };
         let distance = at.map_or(0.0, |g| g.translation().distance(cam.translation));
@@ -81,17 +88,16 @@ pub fn animate(
             continue;
         }
         // Most things stand still most of the time (a shut door, a lever, a corpse): nothing to do for them.
-        let overlay_at = a.overlay.as_ref().map(|o| {
-            let t = if o.looping { o.anim.looped_time(o.elapsed_us) } else { o.elapsed_us.clamp(0, o.anim.duration_us) };
-            (Arc::as_ptr(&o.anim) as usize, t)
-        });
+        let at_time = |o: &Overlay| if o.looping { o.anim.looped_time(o.elapsed_us) } else { o.elapsed_us.clamp(0, o.anim.duration_us) };
+        let overlay_at = a.overlay.as_ref().map(|o| (Arc::as_ptr(&o.anim) as usize, at_time(o)));
+        let under_at = a.under.as_ref().map(|o| (Arc::as_ptr(&o.anim) as usize, at_time(o)));
         let bend = a.bend.iter().map(|(bone, q)| (*bone as i64 + 1) * ((q.x * 1000.0) as i64 * 7 + (q.y * 1000.0) as i64 * 13 + (q.z * 1000.0) as i64 * 17 + (q.w * 1000.0) as i64)).sum();
-        let shown = Shown { anim: Arc::as_ptr(&anim) as usize, time: t, overlay: overlay_at, bend };
+        let shown = Shown { anim: Arc::as_ptr(&anim) as usize, time: t, overlay: overlay_at, under: under_at, bend };
         if a.shown == Some(shown) {
             continue;
         }
         a.shown = Some(shown);
-        let world: Vec<[f32; 3]> = if a.overlay.is_some() || a.keep_pose {
+        let world: Vec<[f32; 3]> = if a.overlay.is_some() || a.under.is_some() || a.keep_pose {
             let top = a.overlay.as_ref().map(|o| {
                 let t = if o.looping { o.anim.looped_time(o.elapsed_us) } else { o.elapsed_us.clamp(0, o.anim.duration_us) };
                 (o.anim.clone(), t)
@@ -101,6 +107,10 @@ pub fn animate(
                 layers.push((o, *ot));
             }
             layers.push((&anim, t));
+            let below = a.under.as_ref().map(|o| (o.anim.clone(), at_time(o)));
+            if let Some((o, ot)) = &below {
+                layers.push((o, *ot));
+            }
             let pose = a.skeleton.pose_layers_bent(&layers, Vec3::ZERO.to_array().into(), &a.bend);
             let out = pose.vertices.iter().map(|p| to_bevy(p.to_array())).collect();
             if a.keep_pose {

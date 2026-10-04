@@ -1049,7 +1049,8 @@ pub fn draw(
         } else if ui.over_hud || ui.hover_item.is_some() {
             Some("cursors/interaction_on")
         } else {
-            Some("cursors/cursor")
+            // The hand of the original (its first frame; `cursors/cursor` is only a placeholder triangle).
+            Some("cursors/cursor00")
         };
         if let Some(tex) = name.and_then(|n| assets.get(&arx, &mut images, n)) {
             c.sized(&tex, pos, g.s, Color::WHITE);

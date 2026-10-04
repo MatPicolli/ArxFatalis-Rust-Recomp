@@ -12,6 +12,9 @@ struct Cli {
     /// Game installation directory (containing data.pak etc.)
     #[arg(long, env = "ARX_DIR", default_value = DEFAULT_GAME_DIR, global = true)]
     game_dir: PathBuf,
+    /// Apply the mods in this folder before doing anything (the tools look at the plain game otherwise)
+    #[arg(long, global = true)]
+    mods_dir: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -20,6 +23,11 @@ struct Cli {
 enum Cmd {
     /// File counts and sizes per top-level directory and per file extension
     Stats,
+    /// List the mods in a folder (default `mods`): what each holds and which of the game's files it replaces
+    Mods { dir: Option<PathBuf>, /// list every file
+        #[arg(short, long)] files: bool },
+    /// Pack a folder into a `.pak` archive (a mod in one file)
+    Pack { dir: PathBuf, #[arg(short, long)] out: PathBuf },
     /// List files below a virtual path prefix
     Ls { prefix: Option<String> },
     /// Extract one file to `--out` (default: current dir, flat)
@@ -90,10 +98,50 @@ enum Cmd {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let pak = std::sync::Arc::new(PakSet::open_game_dir(&cli.game_dir)
-        .with_context(|| format!("opening {}", cli.game_dir.display()))?);
+    if let Cmd::Pack { dir, out } = &cli.cmd {
+        let mut loose = PakSet::new();
+        loose.add_loose_dir(dir, "");
+        let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+        for (path, _) in loose.iter() {
+            files.push((path.to_owned(), loose.read(path)?.into_owned()));
+        }
+        files.sort();
+        anyhow::ensure!(!files.is_empty(), "{} has no files", dir.display());
+        let bytes = arx_formats::pak::write_archive(&files);
+        std::fs::write(out, &bytes).with_context(|| format!("writing {}", out.display()))?;
+        println!("{}: {} files, {} bytes", out.display(), files.len(), bytes.len());
+        return Ok(());
+    }
+    let mut pak = PakSet::open_game_dir(&cli.game_dir).with_context(|| format!("opening {}", cli.game_dir.display()))?;
+    if let Cmd::Mods { dir, files } = &cli.cmd {
+        let dir = dir.clone().or(cli.mods_dir.clone()).unwrap_or_else(|| PathBuf::from("mods"));
+        let game: std::collections::HashSet<String> = pak.iter().map(|(p, _)| p.to_owned()).collect();
+        let mods = pak.apply_mods(&dir, &arx_formats::mods::read_disabled());
+        println!("{}: {} mods", dir.display(), mods.len());
+        for m in &mods {
+            println!("  {:<24} {:<8} {} {}  {} files, {} replace the game's  {}", m.id, format!("{:?}", m.kind).to_lowercase(), if m.enabled { "on " } else { "OFF" }, m.name, m.files, m.replaces, m.byline());
+            if !m.description.is_empty() {
+                println!("      {}", m.description);
+            }
+        }
+        if *files {
+            let mut all: Vec<(&str, &str)> = pak.iter().filter_map(|(p, _)| pak.mod_of(p).map(|m| (p, m))).collect();
+            all.sort();
+            for (path, m) in all {
+                println!("  {} {path}  [{m}]", if game.contains(path) { "replaces" } else { "adds    " });
+            }
+        }
+        return Ok(());
+    }
+    if let Some(dir) = &cli.mods_dir {
+        for m in pak.apply_mods(dir, &arx_formats::mods::read_disabled()) {
+            eprintln!("mod {}: {} files{}", m.id, m.files, if m.enabled { "" } else { " (switched off)" });
+        }
+    }
+    let pak = std::sync::Arc::new(pak);
 
     match cli.cmd {
+        Cmd::Mods { .. } | Cmd::Pack { .. } => unreachable!("handled above"),
         Cmd::Stats => {
             let mut by_dir: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
             let mut by_ext: BTreeMap<&str, (usize, usize)> = BTreeMap::new();

@@ -14,6 +14,7 @@ use crate::speech::Speech;
 use crate::steps::StepSounds;
 use crate::{Arx, Fly, Shot};
 use arx_formats::locale::Locale;
+use arx_formats::mods::Mod;
 use bevy::{
     app::AppExit,
     audio::{AudioPlayer, AudioSink, AudioSinkPlayback, AudioSource, GlobalVolume, PlaybackSettings, SpatialAudioSink, Volume},
@@ -147,8 +148,7 @@ impl Options {
 
 /// Where the options are kept between runs: the user's own settings folder, never the repository.
 fn options_file() -> Option<PathBuf> {
-    let dir = std::env::var_os("APPDATA").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(dir.join("arx-fatalis-rust").join("options.cfg"))
+    arx_formats::mods::config_dir().map(|dir| dir.join("options.cfg"))
 }
 
 pub fn load_options() -> Options {
@@ -175,6 +175,8 @@ pub enum Screen {
     ConfirmQuit,
     /// Character creation.
     Create,
+    /// The mods found in the mods folder, to switch on and off.
+    Mods,
 }
 
 impl Screen {
@@ -184,6 +186,7 @@ impl Screen {
             "options" => Some(Screen::Options),
             "create" => Some(Screen::Create),
             "quit" => Some(Screen::ConfirmQuit),
+            "mods" => Some(Screen::Mods),
             _ => None,
         }
     }
@@ -204,6 +207,12 @@ pub enum Action {
     QuickGen,
     Skin,
     Done,
+    Mods,
+    /// Switch the mod with this number on or off.
+    ToggleMod(usize),
+    ModsPage(i8),
+    /// Keep the choice of mods and start the game again with it.
+    ApplyMods,
 }
 
 impl Action {
@@ -220,6 +229,9 @@ impl Action {
             "quickgen" => Action::QuickGen,
             "skin" => Action::Skin,
             "done" => Action::Done,
+            "mods" => Action::Mods,
+            "togglemod" => Action::ToggleMod(0),
+            "applymods" => Action::ApplyMods,
             _ => return None,
         })
     }
@@ -286,10 +298,21 @@ fn text(text: String, row: Rect, size: f32, align: Align, action: Option<Action>
     Item { at: row, hit, look: Look::Text { text, size, align }, action, enabled: true, hint: None }
 }
 
+/// How many mods the mods page lists at a time.
+pub const MODS_PER_PAGE: usize = 8;
+
+/// The mods as the menu shows them: what is in the mods folder, which page of it is open, and whether the choice
+/// differs from what the game is running with.
+pub struct ModList<'a> {
+    pub mods: &'a [Mod],
+    pub page: usize,
+    pub changed: bool,
+}
+
 /// Everything on a screen, back to front, for a `w` x `h` window. `started`: a game is running behind the menu.
 /// `can_finish`: every point of the new hero is handed out. `book`: where the character sheet is.
 #[allow(clippy::too_many_arguments)]
-pub fn layout(screen: Screen, started: bool, o: &Options, can_finish: bool, w: f32, h: f32, book: Rect, l: &Labels) -> Vec<Item> {
+pub fn layout(screen: Screen, started: bool, o: &Options, can_finish: bool, w: f32, h: f32, book: Rect, l: &Labels, mods: &ModList) -> Vec<Item> {
     let (rx, ry) = (w / 640.0, h / 480.0);
     let mut items = Vec::new();
     if screen == Screen::Create {
@@ -312,17 +335,19 @@ pub fn layout(screen: Screen, started: bool, o: &Options, can_finish: bool, w: f
 
     items.push(image("menus/menu_main_background", Rect::new(0.0, 0.0, w, h), None));
     let size = 27.0 * ry;
-    for (i, (key, fallback, action)) in [
+    let mut entries = vec![
         ("system_menus_main_resumegame", "Resume game", Some(Action::Resume)),
         ("system_menus_main_newquest", "New quest", Some(Action::NewQuest)),
         ("system_menus_main_editquest", "Load / Save", None),
         ("system_menus_main_options", "Options", Some(Action::Options)),
         ("system_menus_main_credits", "Credits", None),
         ("system_menus_main_quit", "Quit", Some(Action::Quit)),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    ];
+    // With something in the mods folder, the menu has an entry for it.
+    if !mods.mods.is_empty() {
+        entries.insert(4, ("system_menus_main_mods", "Mods", Some(Action::Mods)));
+    }
+    for (i, (key, fallback, action)) in entries.into_iter().enumerate() {
         let at = Vec2::new(370.0 * rx, (100.0 + 50.0 * i as f32) * ry);
         let mut item = text(l.get(key, fallback), Rect::new(at.x, at.y, w, at.y + size * 1.3), size, Align::Left, action);
         item.enabled = match action {
@@ -383,6 +408,37 @@ pub fn layout(screen: Screen, started: bool, o: &Options, can_finish: bool, w: f
             items.push(text(l.get("system_yes", "Yes"), row, size, Align::Left, Some(Action::Yes)));
             items.push(text(l.get("system_no", "No"), row, size, Align::Right, Some(Action::No)));
         }
+        Screen::Mods => {
+            let (size, small) = (13.0 * ry, 9.5 * ry);
+            let unit = 15.0 * ry;
+            let pages = mods.mods.len().div_ceil(MODS_PER_PAGE).max(1);
+            let page = mods.page.min(pages - 1);
+            let y = win.min.y + 30.0 * ry;
+            let title = if pages > 1 { format!("{} ({} / {pages})", l.get("system_menus_main_mods", "Mods"), page + 1) } else { l.get("system_menus_main_mods", "Mods") };
+            items.push(text(title, Rect::new(left, y, right, y + size * 1.3), 16.0 * ry, Align::Center, None));
+            for (row, (index, m)) in mods.mods.iter().enumerate().skip(page * MODS_PER_PAGE).take(MODS_PER_PAGE).enumerate() {
+                let y = win.min.y + (62.0 + 38.0 * row as f32) * ry;
+                let name = if m.enabled { "menus/menu_checkbox_on" } else { "menus/menu_checkbox_off" };
+                items.push(image(name, Rect::new(left, y, left + unit, y + unit), Some(Action::ToggleMod(index))));
+                let label = if m.byline().is_empty() { m.name.clone() } else { format!("{}  ({})", m.name, m.byline()) };
+                items.push(text(label, Rect::new(left + unit * 1.5, y, right, y + unit), size, Align::Left, Some(Action::ToggleMod(index))));
+                // What it is, and how much of the game it touches.
+                let what = if m.description.is_empty() { String::new() } else { format!("{}  ", m.description) };
+                let about = format!("{what}[{} files, {} replace the game's]", m.files, m.replaces);
+                items.push(text(about, Rect::new(left + unit * 1.5, y + size * 1.25, right, y + size * 1.25 + small * 1.3), small, Align::Left, None));
+            }
+            let y = win.max.y - 62.0 * ry;
+            items.push(image("menus/back", Rect::new(left, y, left + 20.0 * ry, y + 20.0 * ry), Some(Action::Back)));
+            if pages > 1 {
+                let x = left + 40.0 * ry;
+                items.push(image("menus/menu_slider_button_left", Rect::new(x, y + 2.0 * ry, x + unit, y + 2.0 * ry + unit), Some(Action::ModsPage(-1))));
+                items.push(image("menus/menu_slider_button_right", Rect::new(x + unit * 1.5, y + 2.0 * ry, x + unit * 2.5, y + 2.0 * ry + unit), Some(Action::ModsPage(1))));
+            }
+            // A changed choice only counts once the game has started again with it.
+            let mut apply = text("Apply (restarts the game)".to_owned(), Rect::new(left, y, right, y + size * 1.3), size, Align::Right, Some(Action::ApplyMods));
+            apply.enabled = mods.changed;
+            items.push(apply);
+        }
         Screen::Main | Screen::Create => {}
     }
     items
@@ -407,16 +463,21 @@ pub struct Menu {
     first_quickgen: bool,
     rng: u32,
     samples: HashMap<String, Option<Handle<AudioSource>>>,
+    /// What is in the mods folder (with the choice being made in the menu), and what the game was started with.
+    pub mods: Vec<Mod>,
+    mods_running: Vec<bool>,
+    mods_page: usize,
     /// `--menu-do`: things to click by themselves, one every few frames (the next is last).
     script: Vec<Action>,
     frames: u32,
 }
 
 impl Menu {
-    pub fn new(screen: Option<Screen>, options: Options, persistent: bool, mut script: Vec<Action>) -> Self {
+    pub fn new(screen: Option<Screen>, options: Options, persistent: bool, mut script: Vec<Action>, mods: Vec<Mod>) -> Self {
         script.reverse();
+        let mods_running = mods.iter().map(|m| m.enabled).collect();
         let rng = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.subsec_nanos()) | 1;
-        Menu { started: screen.is_none(), screen, options, applied: false, persistent, first_quickgen: true, rng, samples: HashMap::new(), script, frames: 0 }
+        Menu { started: screen.is_none(), screen, options, applied: false, persistent, first_quickgen: true, rng, samples: HashMap::new(), mods, mods_running, mods_page: 0, script, frames: 0 }
     }
 
     fn random(&mut self) -> f32 {
@@ -501,10 +562,15 @@ fn play(menu: &mut Menu, commands: &mut Commands, gfx: &mut Gfx, muted: bool, na
 }
 
 /// Start the game again from nothing, on character creation: the level is loaded afresh by a new run of the program.
-fn restart() -> bool {
+fn restart(new_quest: bool) -> bool {
     let Ok(exe) = std::env::current_exe() else { return false };
     let args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--new-quest").collect();
-    std::process::Command::new(exe).args(args).arg("--new-quest").spawn().is_ok()
+    let mut command = std::process::Command::new(exe);
+    command.args(args);
+    if new_quest {
+        command.arg("--new-quest");
+    }
+    command.spawn().is_ok()
 }
 
 const TEXT: Color = Color::srgb(232.0 / 255.0, 204.0 / 255.0, 143.0 / 255.0);
@@ -570,7 +636,8 @@ pub fn update(
     let book = hud_book::book_rect(w, h, interface_scale(w, h, game.ui.hud_scale));
     let player = &game.s.host.player;
     let can_finish = player.attribute_points == 0 && player.skill_points == 0;
-    let items = layout(screen, menu.started, &menu.options, can_finish, w, h, book, &Labels(&game.speech.locale));
+    let mod_list = ModList { mods: &menu.mods, page: menu.mods_page, changed: menu.mods.iter().map(|m| m.enabled).ne(menu.mods_running.iter().copied()) };
+    let items = layout(screen, menu.started, &menu.options, can_finish, w, h, book, &Labels(&game.speech.locale), &mod_list);
     let pos = window.cursor_position().filter(|_| live);
     let hovered = pos.and_then(|p| item_at(&items, p)).filter(|i| i.enabled).cloned();
 
@@ -678,6 +745,27 @@ pub fn update(
             menu.screen = Some(Screen::Create);
         }
         Action::Options => menu.screen = Some(Screen::Options),
+        Action::Mods => menu.screen = Some(Screen::Mods),
+        Action::ToggleMod(i) => {
+            if let Some(m) = menu.mods.get_mut(i) {
+                m.enabled = !m.enabled;
+            }
+        }
+        Action::ModsPage(by) => {
+            let pages = menu.mods.len().div_ceil(MODS_PER_PAGE).max(1);
+            menu.mods_page = menu.mods_page.saturating_add_signed(by as isize).min(pages - 1);
+        }
+        Action::ApplyMods => {
+            // Mods are read when the game starts, so the choice is kept and the game started again.
+            let off = menu.mods.iter().filter(|m| !m.enabled).map(|m| m.id.clone()).collect();
+            match arx_formats::mods::write_disabled(&off) {
+                Ok(()) if restart(false) => {
+                    exit.write(AppExit::Success);
+                }
+                Ok(()) => {}
+                Err(e) => eprintln!("cannot save the choice of mods: {e}"),
+            }
+        }
         Action::Quit => menu.screen = Some(Screen::ConfirmQuit),
         Action::Back | Action::No => match screen {
             Screen::Main => close = menu.started,
@@ -689,7 +777,7 @@ pub fn update(
             _ => menu.screen = Some(Screen::Main),
         },
         Action::Yes => {
-            if screen == Screen::ConfirmQuit || restart() {
+            if screen == Screen::ConfirmQuit || restart(true) {
                 exit.write(AppExit::Success);
             } else {
                 menu.screen = Some(Screen::Main);
@@ -755,7 +843,7 @@ mod tests {
 
     fn screen(screen: Screen, started: bool, o: &Options, can_finish: bool) -> Vec<Item> {
         let locale = Locale::default();
-        layout(screen, started, o, can_finish, 1280.0, 960.0, Rect::new(300.0, 200.0, 1000.0, 800.0), &Labels(&locale))
+        layout(screen, started, o, can_finish, 1280.0, 960.0, Rect::new(300.0, 200.0, 1000.0, 800.0), &Labels(&locale), &ModList { mods: &[], page: 0, changed: false })
     }
 
     fn label(item: &Item) -> &str {
@@ -819,6 +907,45 @@ mod tests {
         assert!(items.iter().filter(|i| matches!(i.action, Some(Action::Toggle(_) | Action::Set(..) | Action::Step(..) | Action::Back))).all(|i| win.contains(i.hit.min) && win.contains(i.hit.max)));
         // The main entries stay usable beside it.
         assert!(items.iter().any(|i| i.action == Some(Action::Quit)));
+    }
+
+    #[test]
+    fn mods_get_a_menu_entry_and_a_page_once_there_are_some() {
+        use arx_formats::mods::ModKind;
+        let locale = Locale::default();
+        let a_mod = |n: usize, enabled: bool| Mod {
+            id: format!("mod{n}"),
+            name: format!("Mod {n}"),
+            author: "me".into(),
+            version: String::new(),
+            description: "Does things.".into(),
+            path: Default::default(),
+            kind: ModKind::Folder,
+            enabled,
+            files: 3,
+            replaces: 1,
+        };
+        let mods: Vec<Mod> = (0..11).map(|n| a_mod(n, n != 1)).collect();
+        let show = |screen: Screen, page: usize, changed: bool| layout(screen, true, &Options::default(), false, 1280.0, 960.0, Rect::default(), &Labels(&locale), &ModList { mods: &mods, page, changed });
+        // The main menu has one entry more, between the options and the credits; without mods it is as it was.
+        let main = show(Screen::Main, 0, false);
+        let entries: Vec<&str> = main.iter().filter(|i| matches!(i.look, Look::Text { .. })).map(label).collect();
+        assert_eq!(entries, ["Resume game", "New quest", "Load / Save", "Options", "Mods", "Credits", "Quit"]);
+        assert!(!screen(Screen::Main, true, &Options::default(), false).iter().any(|i| i.action == Some(Action::Mods)));
+        // The page lists eight at a time, each with its switch showing its state.
+        let page = show(Screen::Mods, 0, false);
+        let switches: Vec<&Item> = page.iter().filter(|i| matches!(i.action, Some(Action::ToggleMod(_))) && matches!(i.look, Look::Image(_))).collect();
+        assert_eq!(switches.len(), MODS_PER_PAGE);
+        assert_eq!(switches[1].look, Look::Image("menus/menu_checkbox_off"));
+        assert_eq!(switches[2].look, Look::Image("menus/menu_checkbox_on"));
+        assert!(page.iter().any(|i| label(i) == "Mod 0  (me)") && page.iter().any(|i| label(i).contains("3 files, 1 replace")));
+        assert!(page.iter().any(|i| i.action == Some(Action::ModsPage(1))));
+        // The second page has the rest, numbered as in the list.
+        let rest = show(Screen::Mods, 1, false);
+        assert_eq!(rest.iter().filter(|i| matches!(i.action, Some(Action::ToggleMod(n)) if n >= 8) && matches!(i.look, Look::Image(_))).count(), 3);
+        // Nothing to apply until the choice differs from what is running.
+        let apply = |items: &[Item]| items.iter().find(|i| i.action == Some(Action::ApplyMods)).unwrap().enabled;
+        assert!(!apply(&page) && apply(&show(Screen::Mods, 0, true)));
     }
 
     #[test]

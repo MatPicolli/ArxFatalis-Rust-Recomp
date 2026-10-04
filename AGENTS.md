@@ -215,6 +215,18 @@ sets the screenshot frame (large levels need ~60 frames before everything appear
   controls to a cutscene puts the weapon away (`PutPlayerInNormalStance`), or the outside body T-poses its arms.
 - The captured mouse is re-centred every frame and released when the window loses focus; while it is captured the
   interface gets no cursor position (a hidden cursor used to click whatever it was parked on).
+- **Mods** (`arx-formats/src/mods.rs`, README "Mods"): folders or `.pak` archives in `mods/` (ignored by git) layered over
+  the game's files in alphabetical order by `PakSet::apply_mods`; everything that reads the game goes through `PakSet`, so
+  a mod can replace or add any file. `pak::write_archive` writes the game's archive format (stored files, obfuscated table
+  starting with an empty root directory); `arx pack` / `arx mods -f` are the tools. The menu shows *Mods* only when the
+  folder has some; applying a choice restarts the program. **Read game files through `PakSet` only**, never straight from
+  the game directory, or mods will not reach that code.
+- **Items turn into other items** with `replaceme` (`StdHost`, tested): one of a stack changes, and the new item takes
+  the old one's place in the pack (or joins a stack of its kind), in a chest, on the hero or on the floor. That is how wine
+  leaves an empty bottle, a bottle is filled, and flour and water make dough; `arx game 1 "pickup bottle_wine_0002" "use
+  bottle_wine_0002" status` shows it. Only items are replaced so far (not characters or fixtures).
+- A blow or readying a weapon animates arms and chest only: the viewer plays the fighting stance under it
+  (`Animated::under`), or the legs freeze.
 - **Frame rate: never rewrite a mesh that did not change.** Every `Assets<Mesh>::get_mut` uploads that mesh again and costs
   0.01-0.02 ms inside Bevy, whatever its size; a level has ~3000 meshes. The torch light used to rewrite 1900 of them per
   tick (13 ms). Now each torch's effect on each vertex is precomputed (`LitChunk::lit_by`), only torches within 2200 units
@@ -257,7 +269,7 @@ Done since: footsteps from the engine's material tables (`SoundMap`), dragging i
 
 Missing: the map and spell pages of the book, combat cursors, active-spell and hunger icons, the HUD sliding away in free look,
 cinematic cameras for `speak -c`, spells, bows and arrows, NPC weapons drawn in hand, NPC footsteps, `usepath`, inventory weight limits,
-`replaceme`, level changes (`teleport -l`, needs state transfer), the 2D `.cin` cinematics (skipped: `cine_end` is sent at once), ladders, leaning, music/ambiance zones, fog, light flares, save games, credits and key bindings. About 60 script
+level changes (`teleport -l`, needs state transfer), the 2D `.cin` cinematics (skipped: `cine_end` is sent at once), ladders, leaning, music/ambiance zones, fog, light flares, save games, credits and key bindings. About 60 script
 commands are skipped (the interpreter ignores a command it does not know, line by line, and counts it in
 `Stats::unknown_commands`; `arx script` prints the most frequent ones). With jumping off, `arx walk N --no-jump` has no
 rescues in 21 of 23 levels; levels 10 and 20 have genuine drops where the player falls out of the world and is put back on

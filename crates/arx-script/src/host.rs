@@ -1604,6 +1604,82 @@ impl Host for StdHost {
                 }
                 CmdResult::Success
             }
+            "replaceme" => {
+                // An item turns into another: a bottle of wine drunk leaves an empty bottle, an empty bottle held under
+                // a tap becomes a bottle of water, flour and water make dough. One of a stack changes; the new thing
+                // takes the old one's place, in the pack, in a chest, on the hero or on the floor.
+                let name = a.get_word();
+                if a.world.entity(me).kind != EntityKind::Item {
+                    a.warn("replaceme: only items can be replaced yet");
+                    return Some(CmdResult::Failed);
+                }
+                let Some(new) = self.spawn_item(a, &name) else { return Some(CmdResult::Failed) };
+                let slot = self.player.slots.get(&me).copied();
+                let carried = self.player.inventory.contains(&me);
+                let container = self.containers.iter().find(|(_, items)| items.contains(&me)).map(|(c, _)| *c);
+                let equipped = self.player.is_equipped(me);
+                let was = self.state(me).cloned().unwrap_or_default();
+                let pos = a.world.entity(me).pos;
+                let removed = self.destroy_delayed(me, EntityKind::Item);
+                if equipped {
+                    if removed {
+                        self.unequip(a.world, me, true);
+                    }
+                    self.equip(a.world, new);
+                } else if carried {
+                    if removed {
+                        self.player.remove_item(me);
+                    }
+                    // Onto a stack of its kind if there is one, else where the old one was, else wherever there is room.
+                    let class = a.world.entity(new).class.clone();
+                    let stack = self.player.inventory.iter().any(|&i| a.world.entity(i).class == class && self.state(i).is_some_and(|t| t.stack_size > 1 && t.count < t.stack_size));
+                    let (w, h) = self.item_slots(&class);
+                    let old_place = slot.filter(|s| removed && !stack && self.player.area_free(s.bag, s.x, s.y, w, h, None));
+                    let player = a.world.player;
+                    if let Some(s) = old_place {
+                        self.player.inventory.push(new);
+                        self.player.slots.insert(new, crate::player::Slot { w, h, ..s });
+                        a.world.send_event(self, player, new, "inventoryin", Vec::new());
+                    } else {
+                        match self.carry(a.world, new) {
+                            Carry::Added => {
+                                a.world.send_event(self, player, new, "inventoryin", Vec::new());
+                            }
+                            Carry::Full => {
+                                // No room: it lies at the hero's feet.
+                                let at = player.map_or(pos, |p| a.world.entity(p).pos);
+                                self.modify(new, |s| {
+                                    s.in_inventory = false;
+                                    s.hidden = false;
+                                    s.collision = true;
+                                    s.moved_to = Some(at);
+                                });
+                                a.world.entity_mut(new).pos = at;
+                                self.note_dropped(new);
+                            }
+                            _ => {}
+                        }
+                    }
+                } else if let Some(owner) = container {
+                    let items = self.containers.entry(owner).or_default();
+                    if removed {
+                        items.retain(|&i| i != me);
+                    }
+                    items.push(new);
+                } else {
+                    // In the world: the new thing lies where the old one lay.
+                    self.modify(new, |s| {
+                        s.in_inventory = false;
+                        s.hidden = was.hidden;
+                        s.collision = was.collision;
+                        s.moved_to = Some(was.moved_to.unwrap_or(pos));
+                        s.rotation = was.rotation;
+                    });
+                    a.world.entity_mut(new).pos = was.moved_to.unwrap_or(pos);
+                    self.note_dropped(new);
+                }
+                if removed { CmdResult::AbortAccept } else { CmdResult::Success }
+            }
             "destroy" => {
                 let w = a.get_word();
                 let target = a.string_var(&w);
@@ -1667,6 +1743,84 @@ mod tests {
         let mut w = ScriptWorld::new();
         let id = w.add_entity(kind, class, 1, Some(Arc::new(Script::new(src.as_bytes()))), None);
         (w, StdHost::new(), id)
+    }
+
+    #[test]
+    fn items_turn_into_other_items_where_they_are() {
+        let mut w = ScriptWorld::new();
+        let mut h = StdHost::new();
+        let player = w.add_entity(EntityKind::Player, "graph/obj3d/interactive/player/player", 1, None, None);
+        w.player = Some(player);
+        let script = |src: &str| Some(Arc::new(Script::new(src.as_bytes())));
+        h.set_script_loader(Box::new(move |class: &str| match class.rsplit('/').next()? {
+            "bottle_wine" => script("on init {\n playerstacksize 10\n accept\n}\non inventoryuse {\n specialfx heal 5\n replaceme \"\\\\provisions\\\\bottle_empty\\\\bottle_empty\"\n accept\n}"),
+            "bottle_empty" => script("on init {\n playerstacksize 10\n accept\n}\non custom {\n if (^$param1 == \"fill_with_water\") {\n replaceme \"\\\\provisions\\\\bottle_water\\\\bottle_water\"\n accept\n }\n accept\n}"),
+            "bottle_water" => script("on init {\n playerstacksize 10\n accept\n}\non custom {\n if (^$param1 == \"empty\") {\n replaceme \"\\\\provisions\\\\bottle_empty\\\\bottle_empty\"\n accept\n }\n accept\n}"),
+            "flour" => script("on init {\n playerstacksize 10\n accept\n}\non combine {\n if (^$param1 isclass \"bottle_water\") {\n sendevent custom ^$param1 \"empty\"\n replaceme \"\\\\provisions\\\\bread_uncooked\\\\bread_uncooked\"\n accept\n }\n accept\n}"),
+            "bread_uncooked" => script("on init {\n accept\n}"),
+            _ => None,
+        }));
+        let give = |w: &mut ScriptWorld, h: &mut StdHost, name: &str, count: u32| {
+            let class = format!("graph/obj3d/interactive/items/provisions/{name}/{name}");
+            let script = h.script_loader.as_ref().and_then(|l| l(&class));
+            let id = w.add_entity(EntityKind::Item, &class, 1, script, None);
+            w.send_init(h, id);
+            h.modify(id, |s| s.count = count);
+            assert_eq!(h.carry(w, id), Carry::Added);
+            id
+        };
+        let class_of = |w: &ScriptWorld, id: EntityId| w.entity(id).class.rsplit('/').next().unwrap().to_owned();
+        let pack = |w: &ScriptWorld, h: &StdHost| {
+            let mut v: Vec<(String, u32)> = h.player.inventory.iter().filter(|&&i| !h.state(i).unwrap().destroyed).map(|&i| (class_of(w, i), h.state(i).unwrap().count)).collect();
+            v.sort();
+            v
+        };
+
+        // Two bottles of wine in one stack. Drinking one leaves one, and an empty bottle beside it.
+        let wine = give(&mut w, &mut h, "bottle_wine", 2);
+        h.player.life.current = 3.0;
+        w.send_event(&mut h, Some(player), wine, "inventoryuse", vec![]);
+        w.update(&mut h, 0.0);
+        assert_eq!(pack(&w, &h), [("bottle_empty".to_owned(), 1), ("bottle_wine".to_owned(), 1)]);
+        assert_eq!(h.player.life.current, 8.0);
+        // The last one: the empty bottle joins the first on its stack, and the wine is gone.
+        w.send_event(&mut h, Some(player), wine, "inventoryuse", vec![]);
+        w.update(&mut h, 0.0);
+        h.prune_inventory();
+        assert_eq!(pack(&w, &h), [("bottle_empty".to_owned(), 2)]);
+        assert!(h.state(wine).unwrap().destroyed);
+
+        // A single empty bottle filled with water becomes a bottle of water in the same place.
+        let empty = h.player.inventory[0];
+        h.modify(empty, |s| s.count = 1);
+        let place = h.player.slots[&empty];
+        w.send_event(&mut h, Some(player), empty, "custom", vec!["fill_with_water".into()]);
+        w.update(&mut h, 0.0);
+        h.prune_inventory();
+        assert_eq!(pack(&w, &h), [("bottle_water".to_owned(), 1)]);
+        let water = h.player.inventory[0];
+        assert_eq!((h.player.slots[&water].bag, h.player.slots[&water].x, h.player.slots[&water].y), (place.bag, place.x, place.y));
+
+        // Water on flour: dough, and the bottle is empty again.
+        let flour = give(&mut w, &mut h, "flour", 1);
+        let water_id = w.entity(water).id_string.clone();
+        w.send_event(&mut h, Some(player), flour, "combine", vec![water_id]);
+        w.update(&mut h, 0.0);
+        h.prune_inventory();
+        assert_eq!(pack(&w, &h), [("bottle_empty".to_owned(), 1), ("bread_uncooked".to_owned(), 1)]);
+
+        // One lying in the world is replaced where it lies, for the application to show.
+        let class = "graph/obj3d/interactive/items/provisions/bottle_water/bottle_water";
+        let script = h.script_loader.as_ref().and_then(|l| l(class));
+        let lying = w.add_entity(EntityKind::Item, class, 7, script, None);
+        w.entity_mut(lying).pos = [10.0, 20.0, 30.0];
+        w.send_init(&mut h, lying);
+        h.take_dropped();
+        w.send_event(&mut h, None, lying, "custom", vec!["empty".into()]);
+        let made = h.take_dropped();
+        assert_eq!(made.len(), 1);
+        assert_eq!((class_of(&w, made[0]), w.entity(made[0]).pos, h.state(made[0]).unwrap().moved_to), ("bottle_empty".to_owned(), [10.0, 20.0, 30.0], Some([10.0, 20.0, 30.0])));
+        assert!(h.state(lying).unwrap().destroyed && !h.state(made[0]).unwrap().in_inventory);
     }
 
     #[test]
