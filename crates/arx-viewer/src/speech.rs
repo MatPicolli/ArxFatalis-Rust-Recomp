@@ -296,6 +296,11 @@ pub fn update(
     }
     speech.notes.retain(|n| n.remaining > 0.0);
 
+    // Scripts ask whether somebody is speaking (`^speaking`) before starting another line.
+    for (who, speaking) in finished.iter().map(|l| (l.speaker, 0)).chain(speech.lines.iter().map(|l| (l.speaker, 1))).collect::<Vec<_>>() {
+        script.world.entity_mut(who).props.insert("^speaking".to_owned(), arx_script::Value::Int(speaking));
+    }
+
     // A line that ended (or was cut off) runs the rest of its `speak` command.
     for l in finished {
         if let Some(a) = l.audio {

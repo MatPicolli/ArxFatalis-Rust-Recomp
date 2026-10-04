@@ -1090,8 +1090,25 @@ impl NpcWorld {
         }
     }
 
+    /// Let the character's script read what it is after and how it is (`^target`, `^life`).
+    fn publish(&self, i: usize, world: &mut ScriptWorld) {
+        let n = &self.npcs[i];
+        let target = match n.target {
+            Target::Entity(e) if Some(e) == world.player => "player".to_owned(),
+            Target::Entity(e) => world.entity(e).id_string.clone(),
+            Target::Path => "path".to_owned(),
+            Target::None => "none".to_owned(),
+        };
+        let props = &mut world.entity_mut(n.id).props;
+        if props.get("^target").is_none_or(|v| *v != arx_script::Value::Text(target.clone())) {
+            props.insert("^target".to_owned(), arx_script::Value::Text(target));
+        }
+        props.insert("^life".to_owned(), arx_script::Value::Float(n.life));
+    }
+
     fn step(&mut self, i: usize, cx: &mut Ctx) {
         let id = self.npcs[i].id;
+        self.publish(i, cx.world);
         self.adopt_script_anim(i, cx);
 
         // Dead: only the death animation plays, and the body stays where it fell.
@@ -1351,6 +1368,7 @@ impl NpcWorld {
                     _ => None,
                 };
                 self.npcs[i].reached = false;
+                self.publish(i, cx.world);
                 cx.send(who, id, "losttarget", Vec::new());
             }
             // Start moving if standing: the walking animation drives the movement.
@@ -1376,6 +1394,7 @@ impl NpcWorld {
                 self.npcs[i].reached = true;
                 self.npcs[i].reached_at_ms = self.now_ms;
                 if sender != Some(id) {
+                    self.publish(i, cx.world);
                     cx.send(sender, id, "reachedtarget", Vec::new());
                 }
             }
@@ -1419,6 +1438,7 @@ impl NpcWorld {
                 n.reached_at_ms = self.now_ms;
                 if n.target != Target::Entity(id) {
                     n.target = Target::Entity(id);
+                    self.publish(i, cx.world);
                     cx.send(None, id, "reachedtarget", vec!["fake".to_owned()]);
                 }
             }

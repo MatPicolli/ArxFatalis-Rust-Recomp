@@ -539,6 +539,7 @@ fn run_level(args: Args, pak: PakSet) {
     .insert_resource(scripting::Pickables::default())
     .insert_resource(scripting::Obstacles::default())
     .insert_resource(npcs::Npcs::default())
+    .insert_resource(npcs::LevelZones::default())
     .insert_resource(player_body::PlayerBody::default())
     .insert_resource(player_body::Combat::default())
     .insert_resource(audio::Sounds::new(args.mute))
@@ -554,6 +555,7 @@ fn run_level(args: Args, pak: PakSet) {
         Update,
         ((
             scripting::tick,
+            npcs::zones,
             npcs::update,
             speech::debug_say,
             speech::update,
@@ -607,6 +609,7 @@ fn setup_level(
     mut obstacles: ResMut<scripting::Obstacles>,
     mut npcs: ResMut<npcs::Npcs>,
     mut body: ResMut<player_body::PlayerBody>,
+    mut zones: ResMut<npcs::LevelZones>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
@@ -686,6 +689,8 @@ fn setup_level(
                 if let Some(n) = npcs.0.as_mut() {
                     n.log = std::env::var("ARX_LOG_NPC").ok();
                 }
+                zones.0 = arx_level::zones::Zones::from_dlf(d, info.scene_pos);
+                eprintln!("zones: {}", zones.0.zones.len());
             }
             let collision = std::sync::Arc::new(collision);
             obstacles.world = Some(collision.clone());
@@ -799,7 +804,9 @@ fn fly_camera(
     ui.cursor_mode = !captured;
     if captured || mouse.pressed(MouseButton::Right) && !wants_cursor {
         fly.yaw -= motion.x * 0.003;
-        fly.pitch = (fly.pitch - motion.y * 0.003).clamp(-1.55, 1.55);
+        // Walking, the original lets you look 74.9 degrees down and 59 up; flying has no body to look into.
+        let (down, up) = if fly.walk { (-74.9f32.to_radians(), 59f32.to_radians()) } else { (-1.55, 1.55) };
+        fly.pitch = (fly.pitch - motion.y * 0.003).clamp(down, up);
     }
 
     if keys.just_pressed(KeyCode::KeyF) {

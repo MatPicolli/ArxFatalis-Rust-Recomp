@@ -146,7 +146,12 @@ fn main() -> Result<()> {
             }
             println!("{} groups, {} actions, {} selections", m.groups.len(), m.actions.len(), m.selections.len());
             for a in &m.actions { println!("  action {:?} at vertex {}", a.name, a.vertex); }
-            for sel in &m.selections { println!("  selection {:?}: {} vertices", sel.name, sel.vertices.len()); }
+            for a in &m.actions { println!("  action {:?} is at {:?}", a.name, m.vertices[a.vertex as usize].pos); }
+            for sel in &m.selections {
+                let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+                for &v in &sel.vertices { for k in 0..3 { lo[k] = lo[k].min(m.vertices[v as usize].pos[k]); hi[k] = hi[k].max(m.vertices[v as usize].pos[k]); } }
+                println!("  selection {:?}: {} vertices, bounds {lo:.0?} .. {hi:.0?}", sel.name, sel.vertices.len());
+            }
             println!("  groups: {}", m.groups.iter().enumerate().map(|(i, g)| format!("{i}:{} (origin {})", g.name, g.origin)).collect::<Vec<_>>().join(", "));
             let (mn, mx) = m.vertices.iter().fold(([f32::MAX; 3], [f32::MIN; 3]), |(mut a, mut b), v| {
                 for i in 0..3 { a[i] = a[i].min(v.pos[i]); b[i] = b[i].max(v.pos[i]); }

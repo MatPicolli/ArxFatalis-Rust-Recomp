@@ -136,7 +136,8 @@ impl ScriptWorld {
     ) -> EntityId {
         let id = self.entities.len() as EntityId;
         let stem = class.rsplit('/').next().unwrap_or(class).to_ascii_lowercase();
-        let id_string = format!("{stem}_{instance:04}");
+        // The hero is simply `player` (scripts compare `^sender` and event parameters with it).
+        let id_string = if kind == EntityKind::Player { "player".to_owned() } else { format!("{stem}_{instance:04}") };
         self.index.insert(id_string.clone(), id);
         if kind == EntityKind::Player {
             self.player = Some(id);

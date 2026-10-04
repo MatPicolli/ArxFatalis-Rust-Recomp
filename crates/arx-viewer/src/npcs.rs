@@ -59,3 +59,16 @@ pub fn log(time: Res<Time>, npcs: Res<Npcs>, s: Res<Scripting>, mut since: Local
         }
     }
 }
+
+/// The level's zones (named areas scripts watch).
+#[derive(Resource, Default)]
+pub struct LevelZones(pub arx_level::zones::Zones);
+
+/// Tell scripts who walked into or out of a zone.
+pub fn zones(mut zones: ResMut<LevelZones>, mut s: ResMut<Scripting>) {
+    let s = &mut *s;
+    if s.world.entities.is_empty() {
+        return;
+    }
+    zones.0.update(&mut s.world, &mut s.host);
+}

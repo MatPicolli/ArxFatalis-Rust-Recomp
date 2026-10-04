@@ -5,6 +5,7 @@ pub mod anchors;
 pub mod inventory;
 pub mod npc;
 pub mod player_combat;
+pub mod zones;
 
 use arx_formats::{PakSet, dlf::Dlf, ftl::Ftl};
 use arx_physics::{CollisionWorld, CylinderId, ObstacleId};
@@ -84,7 +85,7 @@ impl Scripts {
         }
         let load = |path: &str| pak.read(path).ok().map(|b| Arc::new(Script::new(&b)));
         // The hero has a script too: the animations its body plays, what it says when hurt, and so on.
-        let player_script = load("graph/obj3d/interactive/player/player.asl");
+        let player_script = if std::env::var_os("ARX_NO_PLAYER_SCRIPT").is_some() { None } else { load("graph/obj3d/interactive/player/player.asl") };
         let player = world.add_entity(EntityKind::Player, "graph/obj3d/interactive/player/player", 1, player_script, None);
         let mut ids = Vec::with_capacity(dlf.entities.len());
         for e in &dlf.entities {

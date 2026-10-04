@@ -46,6 +46,8 @@ pub struct PlayerBody {
     primary_attach: Option<usize>,
     left_attach: Option<usize>,
     shield_attach: Option<usize>,
+    /// The vertex the eyes are at (`view_attach`): the camera sits there, as in the original.
+    view_attach: Option<usize>,
 }
 
 #[derive(Resource, Default)]
@@ -90,7 +92,7 @@ pub fn spawn(
     }
     let arx = [feet.x, -feet.y, -feet.z];
     let mut stats = EntityStats::default();
-    let opts = SpawnOpts { hide_selection: Some("1st"), not_pickable: true, lenient_skeleton: true };
+    let opts = SpawnOpts { hide_selection: Some("1st"), not_pickable: true };
     let e = spawn_entity(commands, pak, lights, scripting, pickables, ecache, tcache, meshes, materials, images, BODY_CLASS, arx, [0.0; 3], 1, player, true, &mut stats, &opts);
     body.entity = e;
     eprintln!("player body: {e:?} stats {stats:?}");
@@ -100,6 +102,7 @@ pub fn spawn(
         body.primary_attach = find("primary_attach");
         body.left_attach = find("left_attach");
         body.shield_attach = find("shield_attach");
+        body.view_attach = find("view_attach");
     }
 }
 
@@ -131,7 +134,8 @@ fn legs_slot(fly: &Fly, keys: &ButtonInput<KeyCode>, fighting: bool, args_forwar
         };
     }
     if !moving {
-        return "wait";
+        // In first person the engine idles with the short wait (`player_wait_1st`), made to be seen from the eyes.
+        return "wait_short";
     }
     match (w, s, a, d, sneak) {
         (true, .., true) => "walk",
@@ -271,7 +275,7 @@ fn make_visual(
         (e.class.clone(), e.instance)
     };
     let mut stats = EntityStats::default();
-    let opts = SpawnOpts { hide_selection: None, not_pickable: true, lenient_skeleton: false };
+    let opts = SpawnOpts { hide_selection: None, not_pickable: true };
     let made = spawn_entity(
         commands, &arx.0, &lights.0, s, &mut caches.pickables.0, &mut caches.ecache, &mut caches.tcache, &mut caches.meshes, &mut caches.materials, &mut caches.images,
         &class, [0.0; 3], [0.0; 3], instance, item, true, &mut stats, &opts,
@@ -346,8 +350,9 @@ pub fn attach(
     mut script: ResMut<Scripting>,
     mut npcs: ResMut<Npcs>,
     mut caches: Caches,
-    bodies: Query<(&Transform, &Animated), Without<WeaponTag>>,
-    mut held: Query<(&mut Transform, &mut Visibility), With<WeaponTag>>,
+    bodies: Query<(&Transform, &Animated), (Without<WeaponTag>, Without<Camera3d>)>,
+    mut held: Query<(&mut Transform, &mut Visibility), (With<WeaponTag>, Without<Camera3d>)>,
+    mut camera: Single<&mut Transform, With<Camera3d>>,
 ) {
     let Some(body_entity) = body.entity else { return };
     let s = &mut *script;
@@ -362,6 +367,22 @@ pub fn attach(
     let flip = |v: Vec3| Vec3::from(to_bevy(v.to_array()));
     if std::env::var_os("ARX_LOG_BODY").is_some() {
         eprintln!("body at {:?}; slot {:?}/{:?}; weapon {} shield {}", body_tf.translation, body.base_slot, body.overlay_slot, body.weapon.is_some(), body.shield.is_some());
+    }
+
+    // The eyes: the camera sits at the body's `view_attach` vertex (so it bobs with the animation and is in front of
+    // the chest, not inside it), never more than 46 units off the body's axis.
+    if let Some(v) = body.view_attach
+        && fly.walk
+        && !s.host.player.is_dead()
+    {
+        let mut eye = body_tf.transform_point(flip(pose.vertices[v]));
+        let off = Vec2::new(eye.x - body_tf.translation.x, eye.z - body_tf.translation.z);
+        if off.length() > 46.0 {
+            let o = off * (46.0 / off.length());
+            eye.x = body_tf.translation.x + o.x;
+            eye.z = body_tf.translation.z + o.y;
+        }
+        camera.translation = eye;
     }
 
     // The weapon in the hand (only while it is drawn), and the shield on the left arm.

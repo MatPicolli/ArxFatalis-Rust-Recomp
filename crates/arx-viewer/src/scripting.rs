@@ -120,6 +120,10 @@ pub fn apply_state(
             let a = [b.angle[0] + st.rotation[0], b.angle[1] + st.rotation[1], b.angle[2] + st.rotation[2]];
             tf.rotation = arx_level::entity_rotation(a, b.npc);
         }
+        let has_animation = animated.is_some();
+        if std::env::var_os("ARX_LOG_ANIM").is_some() && prev.is_some_and(|(_, serial)| serial != st.anim_serial) {
+            eprintln!("anim: {} plays {:?} (animated model: {has_animation})", s.world.entity(r.0).id_string, st.playing.as_ref().map(|p| &p.slot));
+        }
         if let (Some(mut a), true) = (animated, prev.is_none_or(|(_, serial)| serial != st.anim_serial)) {
             if let Some(play) = &st.playing {
                 if let Some(path) = st.anims.get(&play.slot).cloned() {
@@ -169,7 +173,11 @@ pub fn interact(
     speech: Res<Speech>,
     npcs: Res<crate::npcs::Npcs>,
     mut s: ResMut<Scripting>,
+    mut frames: Local<u32>,
 ) {
+    // Headless testing aid: `ARX_PRESS_E=<frame>` presses E on that frame.
+    *frames += 1;
+    let scripted = std::env::var("ARX_PRESS_E").ok().and_then(|v| v.parse::<u32>().ok()) == Some(*frames);
     let s = &mut *s;
     let (origin, dir) = (cam.translation, cam.forward().as_vec3());
     let mut best: Option<(f32, EntityId)> = None;
@@ -195,7 +203,13 @@ pub fn interact(
         }
     }
     s.target = best.map(|(_, id)| id);
-    if !keys.just_pressed(KeyCode::KeyE) || ui.reading.is_some() {
+    if scripted && let Ok(name) = std::env::var("ARX_PRESS_E_ON") {
+        s.target = s.world.find(&name, s.player);
+    }
+    if scripted {
+        eprintln!("E pressed: looking at {:?}; reading {}", s.target.map(|t| s.world.entity(t).id_string.clone()), ui.reading.is_some());
+    }
+    if !(keys.just_pressed(KeyCode::KeyE) || scripted) || ui.reading.is_some() {
         return;
     }
     let Some(target) = s.target else { return };

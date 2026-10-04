@@ -295,6 +295,8 @@ pub struct StdHost {
     npc_requests: Vec<NpcRequest>,
     /// The weapon item each character wields (`setweapon`).
     pub npc_weapons: HashMap<EntityId, EntityId>,
+    /// Which entity watches each zone (`setcontrolledzone`), by lowercased zone name.
+    pub controlled_zones: HashMap<String, EntityId>,
 }
 
 impl StdHost {
@@ -912,6 +914,18 @@ impl Host for StdHost {
                 CmdResult::Success
             }
             "inventory" => self.inventory_command(a),
+            "setcontrolledzone" => {
+                let w = a.get_word();
+                let zone = a.string_var(&w).to_ascii_lowercase();
+                self.controlled_zones.insert(zone, me);
+                CmdResult::Success
+            }
+            "unsetcontrolledzone" => {
+                let w = a.get_word();
+                let zone = a.string_var(&w).to_ascii_lowercase();
+                self.controlled_zones.remove(&zone);
+                CmdResult::Success
+            }
             "setobjecttype" => {
                 let flags = a.get_flags();
                 let name = a.get_word();
@@ -1180,6 +1194,7 @@ impl Host for StdHost {
             }
             "setprice" => {
                 let v = a.get_float();
+                a.world.entity_mut(me).props.insert("^price".to_owned(), crate::Value::Float(v));
                 self.state_mut(me).price = v;
                 CmdResult::Success
             }

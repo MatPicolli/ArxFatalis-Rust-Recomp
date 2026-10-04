@@ -144,8 +144,6 @@ pub struct SpawnOpts {
     pub hide_selection: Option<&'static str>,
     /// Do not make it clickable.
     pub not_pickable: bool,
-    /// Accept animations that drive more bones than the model has (the hero's own do); the extra ones are ignored.
-    pub lenient_skeleton: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -286,6 +284,10 @@ pub fn spawn_entity(
         if f.vid.iter().any(|v| hidden_vertices.contains(&u32::from(*v))) {
             continue;
         }
+        // The stumps of limbs that can be cut off (`npc_gore`) stay hidden until they are (`ARX_INTERACTIVE_HideGore`).
+        if f.material.and_then(|m| ftl.textures.get(m as usize)).is_some_and(|t| t.to_ascii_lowercase().contains("gore")) {
+            continue;
+        }
         let material = if f.facetype == 0 { None } else { f.material };
         let ftype = f.facetype as u32;
         let kind = if ftype & poly::TRANS != 0 {
@@ -324,12 +326,11 @@ pub fn spawn_entity(
     let anim_path = playing_path.or_else(|| is_npc.then(|| st.anims.get("wait").cloned()).flatten());
     let looping = st.playing.as_ref().is_none_or(|p| p.looping);
     let anim = anim_path.and_then(|p| scripting.anim(pak, &p));
-    // Entities with any loaded animation get a skeleton so later `playanim` can move them.
-    let probe = anim.clone().or_else(|| st.anims.values().next().and_then(|p| scripting.anim(pak, p)));
-    let skeleton = probe.and_then(|a| {
-        let sk = ecache.skeletons.entry(model_path.clone()).or_insert_with(|| Arc::new(Skeleton::from_ftl(&ftl)));
-        (sk.bones.len() == a.group_count || (opts.lenient_skeleton && sk.bones.len() < a.group_count)).then(|| sk.clone())
-    });
+    // Entities with any loaded animation get a skeleton so later `playanim` can move them. Like the engine, an
+    // animation that drives more or fewer groups than the model has bones still plays on the ones they share (a
+    // lever's two animations need not agree, and checking only one of them used to leave some levers frozen).
+    let skeleton = (anim.is_some() || !st.anims.is_empty())
+        .then(|| ecache.skeletons.entry(model_path.clone()).or_insert_with(|| Arc::new(Skeleton::from_ftl(&ftl))).clone());
     let animated = skeleton.is_some();
     let mut mesh_srcs = Vec::new();
     let mut parent_children = Vec::new();

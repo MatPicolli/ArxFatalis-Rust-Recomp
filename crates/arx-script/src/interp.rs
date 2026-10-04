@@ -327,7 +327,14 @@ impl Args<'_> {
         if let Some(v) = self.world.entity(me).props.get(name).or_else(|| self.world.sys.get(name)) {
             return v.clone();
         }
-        Value::Text(String::new())
+        // What the game keeps per entity, before it has said anything about it: nobody speaks, nothing is targeted.
+        match rest {
+            "gameseconds" => Value::Int((self.world.now_ms / 1000.0) as i64),
+            "target" => Value::Text("none".to_owned()),
+            "speaking" | "life" | "mana" | "fighting" | "playercasting" | "inplayerinventory" | "poisoned" | "gore" | "demo" | "price" => Value::Int(0),
+            _ if rest.starts_with("playerspell_") || rest.starts_with("myspell_") || rest.starts_with("possess_") => Value::Int(0),
+            _ => Value::Text(String::new()),
+        }
     }
 
     /// Value of `name` as text: variables are looked up, anything else is a literal.
