@@ -18,6 +18,8 @@ pub struct LevelInfo {
     pub collision: arx_physics::CollisionWorld,
     /// The graph characters path-find on.
     pub anchors: Vec<arx_formats::fts::Anchor>,
+    /// The level's meshes with what is needed to light them again every frame (torches flicker).
+    pub chunks: Vec<crate::lighting::LitChunk>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -43,6 +45,10 @@ struct Builder {
     positions: Vec<[f32; 3]>,
     uvs: Vec<[f32; 2]>,
     colors: Vec<[f32; 4]>,
+    /// Per vertex: the smooth normal (zero for polygons that glow and take no light) and the baked colour as the
+    /// 0..255 values the engine adds dynamic light to.
+    normals: Vec<Vec3>,
+    baked: Vec<[f32; 3]>,
 }
 
 fn srgb_to_linear(c: u8) -> f32 {
@@ -52,7 +58,7 @@ fn srgb_to_linear(c: u8) -> f32 {
 
 /// Triangle with winding chosen so that its geometric normal agrees with the polygon's stored
 /// normal (the original engine culls by comparing that normal against the view direction).
-fn push_tri(b: &mut Builder, v: [&PolyVertex; 3], col: [[f32; 4]; 3], norm: Vec3) {
+fn push_tri(b: &mut Builder, v: [&PolyVertex; 3], col: [[f32; 4]; 3], norm: Vec3, lit: [(Vec3, [f32; 3]); 3]) {
     let p = v.map(|v| Vec3::from(to_bevy(v.pos)));
     let geo = (p[1] - p[0]).cross(p[2] - p[0]);
     let order = if norm != Vec3::ZERO && geo.dot(norm) < 0.0 { [0, 2, 1] } else { [0, 1, 2] };
@@ -60,6 +66,8 @@ fn push_tri(b: &mut Builder, v: [&PolyVertex; 3], col: [[f32; 4]; 3], norm: Vec3
         b.positions.push(p[i].to_array());
         b.uvs.push(v[i].uv);
         b.colors.push(col[i]);
+        b.normals.push(lit[i].0);
+        b.baked.push(lit[i].1);
     }
 }
 
@@ -107,11 +115,14 @@ pub fn spawn_level(
         let alpha = if kind == Kind::Blend { p.transval } else { 1.0 };
 
         let mut col = [[0.7, 0.7, 0.7, alpha]; 4];
+        let mut lit = [(Vec3::ZERO, [218.0f32; 3]); 4];
         for (k, c) in col.iter_mut().enumerate().take(n) {
             if p.flags & poly::GLOW != 0 || fullbright {
                 *c = [1.0, 1.0, 1.0, alpha];
+                lit[k] = (Vec3::ZERO, [255.0; 3]);
             } else if let Some(rgb) = llf.as_ref().and_then(|l| l.colors.get(base + k)) {
                 *c = [lut[rgb[0] as usize], lut[rgb[1] as usize], lut[rgb[2] as usize], alpha];
+                lit[k] = (Vec3::from(to_bevy(p.vertex_normals[k])).normalize_or_zero(), [f32::from(rgb[0]), f32::from(rgb[1]), f32::from(rgb[2])]);
             }
         }
 
@@ -119,14 +130,15 @@ pub fn spawn_level(
         let key = (p.tex, kind, double, p.tile.0 / CHUNK_TILES, p.tile.1 / CHUNK_TILES);
         let b = chunks.entry(key).or_default();
         let v = &p.verts;
-        push_tri(b, [&v[0], &v[1], &v[2]], [col[0], col[1], col[2]], Vec3::from(to_bevy(p.norm)));
+        push_tri(b, [&v[0], &v[1], &v[2]], [col[0], col[1], col[2]], Vec3::from(to_bevy(p.norm)), [lit[0], lit[1], lit[2]]);
         if n == 4 {
-            push_tri(b, [&v[3], &v[2], &v[1]], [col[3], col[2], col[1]], Vec3::from(to_bevy(p.norm2)));
+            push_tri(b, [&v[3], &v[2], &v[1]], [col[3], col[2], col[1]], Vec3::from(to_bevy(p.norm2)), [lit[3], lit[2], lit[1]]);
         }
     }
 
     let mut mat_cache: HashMap<(i32, Kind, bool), Option<Handle<StandardMaterial>>> = HashMap::new();
     let mut mesh_count = 0;
+    let mut lit_chunks = Vec::new();
     for ((tex, kind, double, _, _), b) in chunks {
         let mat = mat_cache
             .entry((tex, kind, double))
@@ -152,11 +164,17 @@ pub fn spawn_level(
             .clone();
         let Some(mat) = mat else { continue };
 
+        let chunk_positions: Vec<Vec3> = b.positions.iter().map(|p| Vec3::from(*p)).collect();
+        let alphas: Vec<f32> = b.colors.iter().map(|c| c[3]).collect();
         let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
         mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, b.positions);
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, b.uvs);
         mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, b.colors);
-        commands.spawn((Mesh3d(meshes.add(mesh)), MeshMaterial3d(mat)));
+        let handle = meshes.add(mesh);
+        commands.spawn((Mesh3d(handle.clone()), MeshMaterial3d(mat)));
+        if !fullbright {
+            lit_chunks.push(crate::lighting::LitChunk::new(handle, chunk_positions, b.normals, b.baked, alphas));
+        }
         mesh_count += 1;
     }
 
@@ -167,5 +185,6 @@ pub fn spawn_level(
         mesh_count,
         collision: arx_physics::CollisionWorld::from_fts(&fts),
         anchors: fts.anchors.clone(),
+        chunks: lit_chunks,
     })
 }

@@ -12,7 +12,7 @@ use bevy::{asset::RenderAssetUsages, mesh::PrimitiveTopology, prelude::*, render
 use std::{collections::HashMap, sync::Arc};
 
 /// `EERIE_LIGHT::extras` bits that matter for lighting.
-const EXTRAS_SEMIDYNAMIC: u32 = 1;
+
 const EXTRAS_STARTEXTINGUISHED: u32 = 4;
 
 /// Original engine constants (`scene/Light.cpp`).
@@ -30,11 +30,11 @@ pub struct StaticLight {
 }
 
 impl StaticLight {
-    /// Lights that illuminate objects: ignited and not semi-dynamic (those become dynamic lights).
+    /// Lights that illuminate objects: every one that is lit, the torches too (the engine adds those at run time).
     pub fn from_level(lights: &[Light], scene_pos: Vec3) -> Vec<StaticLight> {
         lights
             .iter()
-            .filter(|l| l.extras & (EXTRAS_SEMIDYNAMIC | EXTRAS_STARTEXTINGUISHED) == 0)
+            .filter(|l| l.extras & (EXTRAS_STARTEXTINGUISHED | crate::lighting::EXTRAS_OFF) == 0)
             .filter(|l| l.fall_end > l.fall_start)
             .map(|l| StaticLight {
                 pos: Vec3::from(to_bevy([l.pos[0] + scene_pos.x, l.pos[1] + scene_pos.y, l.pos[2] + scene_pos.z])),

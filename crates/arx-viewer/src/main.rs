@@ -19,6 +19,7 @@ mod player_body;
 mod hud_book;
 mod hud_ui;
 mod level;
+mod lighting;
 mod scripting;
 mod speech;
 mod steps;
@@ -542,6 +543,7 @@ fn run_level(args: Args, pak: PakSet) {
     .insert_resource(npcs::Npcs::default())
     .insert_resource(npcs::LevelZones::default())
     .insert_resource(cutscene::Stage::default())
+    .insert_resource(lighting::LevelLighting::default())
     .insert_resource(player_body::PlayerBody::default())
     .insert_resource(player_body::Combat::default())
     .insert_resource(audio::Sounds::new(args.mute))
@@ -585,6 +587,7 @@ fn run_level(args: Args, pak: PakSet) {
             hud_ui::mouse,
             drag::debug_throw,
             drag::step_bodies,
+            lighting::update,
             player_body::drive,
             hud_ui::draw,
             animated::animate,
@@ -649,7 +652,12 @@ fn setup_level(
 
     let t = std::time::Instant::now();
     match level::spawn_level(&mut commands, &arx.0, args.level, &mut cache, &mut meshes, &mut materials, &mut images) {
-        Ok(info) => {
+        Ok(mut info) => {
+            // Torches are not in the baked light: they are added every frame (and flicker).
+            let level_lights = arx.0.load_llf(args.level).map(|l| l.lights).unwrap_or_default();
+            let lighting = lighting::LevelLighting::new(std::mem::take(&mut info.chunks), &level_lights, info.scene_pos);
+            eprintln!("torches: {} of {} lights", lighting.torches.len(), level_lights.len());
+            commands.insert_resource(lighting);
             eprintln!(
                 "level {}: {} polygons in {} meshes, built in {:.1?}",
                 args.level, info.poly_count, info.mesh_count, t.elapsed()
@@ -745,8 +753,7 @@ fn setup_level(
             }
             match dlf {
                 Ok(d) if args.entities => {
-                    let lights = arx.0.load_llf(args.level).map(|l| l.lights).unwrap_or_default();
-                    let lights = entities::StaticLight::from_level(&lights, info.scene_pos);
+                    let lights = entities::StaticLight::from_level(&level_lights, info.scene_pos);
                     let t = std::time::Instant::now();
                     let stats = entities::spawn_entities(
                         &mut commands, &arx.0, &d, info.scene_pos, &lights, args.npcs,
