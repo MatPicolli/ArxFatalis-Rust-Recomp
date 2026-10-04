@@ -15,7 +15,7 @@ pub const PLAYER_FOV: f32 = 75.0;
 const BAR_HEIGHT: f32 = 100.0;
 
 #[derive(Resource, Default)]
-pub struct Stage(pub StageWorld);
+pub struct Stage(pub StageWorld, /** `--no-cutscenes`: scripts still run, but the view, the controls and the hero stay the player's. */ pub bool);
 
 #[derive(Component)]
 pub struct Bar {
@@ -60,7 +60,12 @@ pub fn update(time: Res<Time>, mut stage: ResMut<Stage>, mut npcs: ResMut<Npcs>,
     let dt_ms = time.delta_secs().min(0.1) * 1000.0;
     let log = std::env::var_os("ARX_LOG_STAGE").is_some();
     let before = s.host.stage.clone();
-    let effects = stage.0.update(&mut s.world, &mut s.host, npcs.0.as_mut(), dt_ms);
+    let mut effects = stage.0.update(&mut s.world, &mut s.host, npcs.0.as_mut(), dt_ms);
+    if stage.1 {
+        effects.clear();
+        let st = &mut s.host.stage;
+        (st.controls, st.cinemascope, st.interface_hidden, st.camera, st.fade) = (true, false, false, None, None);
+    }
     if log {
         for e in &effects {
             eprintln!("[{:.1}s] stage: {e:?}", s.world.now_ms / 1000.0);

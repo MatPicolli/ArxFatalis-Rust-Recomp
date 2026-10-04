@@ -15,6 +15,7 @@ mod entities;
 mod drag;
 mod hud;
 mod npcs;
+mod particles;
 mod player_body;
 mod hud_book;
 mod hud_ui;
@@ -128,6 +129,9 @@ struct Args {
     /// Level mode: give the player these items and use them (equip them), for headless testing of equipment
     #[arg(long, value_delimiter = ',')]
     equip: Vec<String>,
+    /// Level mode: let cutscenes run without taking the view or the controls (their scripts still run), for testing
+    #[arg(long)]
+    no_cutscenes: bool,
     /// Level mode: start with the weapon drawn, for headless testing of combat
     #[arg(long)]
     draw_weapon: bool,
@@ -457,6 +461,7 @@ struct LevelArgs {
     xp: i64,
     walk_forward: bool,
     throw_test: Option<String>,
+    no_cutscenes: bool,
     equip: Vec<String>,
     draw_weapon: bool,
     attack_test: bool,
@@ -518,6 +523,7 @@ fn run_level(args: Args, pak: PakSet) {
         xp: args.xp,
         walk_forward: args.walk_forward,
         throw_test: args.throw_test.clone(),
+        no_cutscenes: args.no_cutscenes,
         equip: args.equip.clone(),
         draw_weapon: args.draw_weapon,
         attack_test: args.attack_test,
@@ -542,14 +548,15 @@ fn run_level(args: Args, pak: PakSet) {
     .insert_resource(scripting::Obstacles::default())
     .insert_resource(npcs::Npcs::default())
     .insert_resource(npcs::LevelZones::default())
-    .insert_resource(cutscene::Stage::default())
+    .insert_resource(cutscene::Stage(Default::default(), args.no_cutscenes))
     .insert_resource(lighting::LevelLighting::default())
+    .insert_resource(particles::Particles::default())
     .insert_resource(player_body::PlayerBody::default())
     .insert_resource(player_body::Combat::default())
     .insert_resource(audio::Sounds::new(args.mute))
     .insert_resource(speech::Speech::new(locale, args.language.clone(), !args.no_subtitles, args.mute))
     .add_systems(Startup, (hud_ui::load_font, speech::spawn_ui).chain())
-    .add_systems(Startup, (steps::load, cutscene::spawn_ui))
+    .add_systems(Startup, (steps::load, cutscene::spawn_ui, particles::setup))
     .insert_resource(steps::StepSounds::default())
     .insert_resource(drag::ItemBodies::default())
     .insert_resource(hud_ui::UiFont::default())
@@ -587,7 +594,11 @@ fn run_level(args: Args, pak: PakSet) {
             hud_ui::mouse,
             drag::debug_throw,
             drag::step_bodies,
+        )
+            .chain(),
+        (
             lighting::update,
+            particles::update,
             player_body::drive,
             hud_ui::draw,
             animated::animate,
@@ -657,6 +668,11 @@ fn setup_level(
             let level_lights = arx.0.load_llf(args.level).map(|l| l.lights).unwrap_or_default();
             let lighting = lighting::LevelLighting::new(std::mem::take(&mut info.chunks), &level_lights, info.scene_pos);
             eprintln!("torches: {} of {} lights", lighting.torches.len(), level_lights.len());
+            if std::env::var_os("ARX_LOG_LIGHTS").is_some() {
+                for t in &lighting.torches {
+                    eprintln!("  torch at {:.0},{:.0},{:.0} (Arx) extras {:#x} lit {} reach {:.0}..{:.0} x{:.1} fire r{:.0} f{:.2} size {:.1} speed {:.1}", t.pos.x, -t.pos.y, -t.pos.z, t.extras, t.lit, t.fall_start, t.fall_end, t.intensity, t.ex_radius, t.ex_frequency, t.ex_size, t.ex_speed);
+                }
+            }
             commands.insert_resource(lighting);
             eprintln!(
                 "level {}: {} polygons in {} meshes, built in {:.1?}",
@@ -713,6 +729,7 @@ fn setup_level(
                 }
                 zones.0 = arx_level::zones::Zones::from_dlf(d, info.scene_pos);
                 stage.0 = arx_level::stage::StageWorld::from_dlf(d, info.scene_pos, &scripting.ids);
+                stage.1 = args.no_cutscenes;
                 eprintln!("zones: {}", zones.0.zones.len());
             }
             let collision = std::sync::Arc::new(collision);
