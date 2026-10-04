@@ -10,6 +10,8 @@ pub enum PickUp {
     Added,
     /// Merged into the stack of the same kind the player already carries (its entity).
     Stacked(EntityId),
+    /// Gold: this many coins went to the purse.
+    Gold(u64),
     /// Could not be picked up, and why.
     Refused(&'static str),
 }
@@ -31,8 +33,15 @@ pub fn pick_up(world: &mut ScriptWorld, host: &mut StdHost, player: EntityId, it
         return PickUp::Refused("cannot be touched");
     }
 
+    carried(world, host, player, item)
+}
+
+/// What happened when `item` was given to the player: tell the item if it now sits in the inventory.
+fn carried(world: &mut ScriptWorld, host: &mut StdHost, player: EntityId, item: EntityId) -> PickUp {
     match host.carry(world, item) {
         Carry::Stacked(target) => PickUp::Stacked(target),
+        Carry::Gold(coins) => PickUp::Gold(coins),
+        Carry::Full => PickUp::Refused("no room"),
         Carry::Added => {
             world.send_event(host, Some(player), item, "inventoryin", Vec::new());
             host.prune_inventory();
@@ -88,29 +97,37 @@ pub fn close_container(world: &mut ScriptWorld, host: &mut StdHost, player: Enti
 
 /// Take one item out of an open container (a chest, a corpse) into the player's inventory.
 pub fn take_from_container(world: &mut ScriptWorld, host: &mut StdHost, player: EntityId, container: EntityId, item: EntityId) -> Option<PickUp> {
-    let list = host.containers.get_mut(&container)?;
-    let at = list.iter().position(|&i| i == item)?;
-    list.remove(at);
-    Some(match host.carry(world, item) {
-        Carry::Stacked(target) => PickUp::Stacked(target),
-        Carry::Added => {
-            world.send_event(host, Some(player), item, "inventoryin", Vec::new());
-            host.prune_inventory();
-            PickUp::Added
-        }
-    })
+    let at = host.containers.get(&container)?.iter().position(|&i| i == item)?;
+    let result = carried(world, host, player, item);
+    if result != PickUp::Refused("no room") {
+        host.containers.get_mut(&container)?.remove(at);
+    }
+    Some(result)
+}
+
+/// Put a carried item into the open container (the player putting something away).
+pub fn store_in_container(world: &mut ScriptWorld, host: &mut StdHost, player: EntityId, container: EntityId, item: EntityId) -> bool {
+    if !host.containers.contains_key(&container) || !host.player.inventory.contains(&item) {
+        return false;
+    }
+    host.player.remove_item(item);
+    host.containers.entry(container).or_default().push(item);
+    world.send_event(host, Some(player), item, "inventoryout", Vec::new());
+    true
 }
 
 /// Take everything out of a container; returns how many entries were taken.
 pub fn take_all(world: &mut ScriptWorld, host: &mut StdHost, player: EntityId, container: EntityId) -> usize {
     let items = host.containers.get(&container).cloned().unwrap_or_default();
-    items.iter().filter(|&&i| take_from_container(world, host, player, container, i).is_some()).count()
+    items.iter().filter(|&&i| matches!(take_from_container(world, host, player, container, i), Some(r) if r != PickUp::Refused("no room"))).count()
 }
 
 /// Put a carried item back into the world at `pos` (Arx coordinates).
 pub fn drop_item(world: &mut ScriptWorld, host: &mut StdHost, player: EntityId, item: EntityId, pos: [f32; 3]) -> bool {
-    let Some(i) = host.player.inventory.iter().position(|&e| e == item) else { return false };
-    host.player.inventory.remove(i);
+    if !host.player.inventory.contains(&item) {
+        return false;
+    }
+    host.player.remove_item(item);
     world.entity_mut(item).pos = pos;
     host.modify(item, |s| {
         s.in_inventory = false;
@@ -214,6 +231,20 @@ mod tests {
     }
 
     #[test]
+    fn items_can_be_put_away_in_a_chest() {
+        let (mut w, mut h, player) = scene();
+        let chest = w.add_entity(EntityKind::Fix, "fix_inter/chest/chest", 1, Some(script("on init {\n inventory create\n accept\n}")), None);
+        w.send_init(&mut h, chest);
+        let pie = item(&mut w, &mut h, "items/provisions/applepie/applepie", 1, PIE);
+        assert!(!store_in_container(&mut w, &mut h, player, chest, pie), "not carried yet");
+        pick_up(&mut w, &mut h, player, pie);
+        assert!(store_in_container(&mut w, &mut h, player, chest, pie));
+        assert!(h.player.inventory.is_empty() && h.player.slots.is_empty());
+        assert_eq!(h.containers[&chest], [pie]);
+        assert_eq!(take_from_container(&mut w, &mut h, player, chest, pie), Some(PickUp::Added));
+    }
+
+    #[test]
     fn dropping_puts_the_item_back_in_the_world_where_asked() {
         let (mut w, mut h, player) = scene();
         let pie = item(&mut w, &mut h, "items/provisions/applepie/applepie", 1, PIE);
@@ -260,7 +291,8 @@ mod tests {
         assert_eq!(take_from_container(&mut w, &mut h, player, chest, held[0]), None, "already taken");
         assert_eq!(take_all(&mut w, &mut h, player, chest), 1);
         assert!(h.containers[&chest].is_empty());
-        assert_eq!(h.state(held[1]).map(|s| s.count), Some(25));
+        assert_eq!(h.player.gold, 25, "coins go to the purse, not the grid");
+        assert_eq!(h.player.inventory, [held[0]]);
         h.take_messages();
         close_container(&mut w, &mut h, player);
         assert_eq!((h.open_container, h.take_messages()), (None, vec!["lid_closed".to_owned()]));
@@ -283,5 +315,54 @@ mod tests {
         assert_eq!(h.player.inventory.len(), 1, "both pies share one stack");
         assert_eq!(h.state(h.player.inventory[0]).unwrap().count, 3);
         assert_eq!(h.take_messages(), ["got_pie"], "inventoryin ran for the new entry only");
+    }
+
+    #[test]
+    fn a_full_inventory_refuses_items_and_leaves_them_where_they_were() {
+        let (mut w, mut h, player) = scene();
+        let mut keys = Vec::new();
+        for n in 1..=(arx_script::BAG_WIDTH as i32 * arx_script::BAG_HEIGHT as i32 + 1) {
+            keys.push(item(&mut w, &mut h, "items/keys/key_base/key_base", n, KEY));
+        }
+        let (last, rest) = keys.split_last().unwrap();
+        for &k in rest {
+            assert_eq!(pick_up(&mut w, &mut h, player, k), PickUp::Added);
+        }
+        assert_eq!(h.player.inventory.len(), 48);
+        assert_eq!(pick_up(&mut w, &mut h, player, *last), PickUp::Refused("no room"));
+        assert!(!h.state(*last).unwrap().hidden, "the item stays in the world");
+        h.player.bags = 2;
+        assert_eq!(pick_up(&mut w, &mut h, player, *last), PickUp::Added, "a new bag makes room");
+        assert_eq!(h.player.slots[last].bag, 1);
+    }
+
+    #[test]
+    fn big_icons_take_several_slots_and_dropping_frees_them() {
+        let (mut w, mut h, player) = scene();
+        h.set_icon_size(Box::new(|class| if class.contains("sword") { Some((64, 96)) } else { Some((32, 32)) }));
+        let sword = item(&mut w, &mut h, "items/weapons/sword/sword", 1, KEY);
+        let key = item(&mut w, &mut h, "items/keys/key_base/key_base", 1, KEY);
+        assert_eq!(pick_up(&mut w, &mut h, player, sword), PickUp::Added);
+        let s = h.player.slots[&sword];
+        assert_eq!((s.w, s.h), (2, 3), "a 64x96 icon is 2x3 slots");
+        assert_eq!(pick_up(&mut w, &mut h, player, key), PickUp::Added);
+        assert_eq!((h.player.slots[&key].x, h.player.slots[&key].y), (2, 0), "next to the sword");
+        assert!(drop_item(&mut w, &mut h, player, sword, [0.0; 3]));
+        assert!(h.player.slots.get(&sword).is_none());
+        assert!(h.player.area_free(0, 0, 0, 2, 3, None));
+    }
+
+    #[test]
+    fn gold_goes_to_the_purse() {
+        let (mut w, mut h, player) = scene();
+        let coins = item(&mut w, &mut h, "items/jewelry/gold_coin/gold_coin", 1, "on init {
+ set_price 1
+ playerstacksize 999
+ accept
+}");
+        h.modify(coins, |s| s.count = 40);
+        assert_eq!(pick_up(&mut w, &mut h, player, coins), PickUp::Gold(40));
+        assert_eq!(h.player.gold, 40);
+        assert!(h.player.inventory.is_empty() && h.state(coins).unwrap().destroyed);
     }
 }

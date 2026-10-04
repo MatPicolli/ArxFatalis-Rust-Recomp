@@ -12,6 +12,7 @@ mod audio;
 mod convert;
 mod entities;
 mod hud;
+mod hud_ui;
 mod level;
 mod scripting;
 mod speech;
@@ -100,6 +101,13 @@ struct Args {
     /// Level mode: start with the inventory panel open
     #[arg(long)]
     show_inventory: bool,
+    /// Level mode: start with this much gold in the purse, for headless testing
+    #[arg(long, default_value_t = 0)]
+    gold: u64,
+    /// Level mode: size of the interface as a fraction of the largest that fits (the original's default is 0.5,
+    /// which is its 640x480 pixel size on most screens; 1.0, the default here, is the biggest that fits)
+    #[arg(long, default_value_t = 1.0)]
+    hud_scale: f32,
     /// Level mode: start with this much life (the maximum is 12 for a new hero), to see healing
     #[arg(long)]
     life: Option<f32>,
@@ -405,6 +413,8 @@ struct LevelArgs {
     pickup: Vec<String>,
     life: Option<f32>,
     open_container: Option<String>,
+    gold: u64,
+    show_inventory: bool,
 }
 
 #[derive(Resource)]
@@ -455,6 +465,8 @@ fn run_level(args: Args, pak: PakSet) {
         pickup: args.pickup.clone(),
         life: args.life,
         open_container: args.open_chest.clone(),
+        gold: args.gold,
+        show_inventory: args.show_inventory,
     })
     .insert_resource(entities::EntityCache::default())
     .insert_resource(Fly {
@@ -474,7 +486,8 @@ fn run_level(args: Args, pak: PakSet) {
     .insert_resource(audio::Sounds::new(args.mute))
     .insert_resource(speech::Speech::new(locale, args.language.clone(), !args.no_subtitles, args.mute))
     .add_systems(Startup, (speech::spawn_ui, hud::spawn))
-    .insert_resource(hud::Ui { open: args.show_inventory, ..default() })
+    .insert_resource(hud::Ui { hud_scale: args.hud_scale, ..default() })
+    .insert_resource(hud_ui::UiAssets::default())
     .add_systems(
         Update,
         (
@@ -489,7 +502,9 @@ fn run_level(args: Args, pak: PakSet) {
             hud::debug_pickup,
             hud::input,
             scripting::interact,
-            hud::update,
+            hud_ui::mouse,
+            hud::update_note,
+            hud_ui::draw,
             animated::animate,
             level_hud,
         )
@@ -660,23 +675,36 @@ fn fly_camera(
     mut cam: Single<&mut Transform, With<Camera3d>>,
     shot: Option<Res<Shot>>,
     mut script: ResMut<scripting::Scripting>,
+    mut ui: ResMut<hud::Ui>,
+    mut was_open: Local<bool>,
+    mut regrab: Local<bool>,
 ) {
     // Screenshot runs are scripted: ignore the real keyboard and mouse so they are reproducible.
     let live = shot.is_none();
     let keys: &ButtonInput<KeyCode> = if live { &keys } else { &ButtonInput::default() };
     let mouse: &ButtonInput<MouseButton> = if live { &mouse } else { &ButtonInput::default() };
     let motion = if live { motion.delta } else { Vec2::ZERO };
-    // Click to capture the mouse for look; Escape releases it. Right-drag also looks around.
-    if mouse.just_pressed(MouseButton::Left) {
+    // Click to capture the mouse for look; Escape releases it. Right-drag also looks around. While the backpack or
+    // a chest is open (or the mouse is released) the cursor works the interface, which draws the original cursor.
+    let wants_cursor = ui.open || script.host.open_container.is_some();
+    if wants_cursor && !*was_open {
+        *regrab = cursor.grab_mode != CursorGrabMode::None;
+        cursor.grab_mode = CursorGrabMode::None;
+    }
+    if !wants_cursor && *was_open && *regrab {
         cursor.grab_mode = CursorGrabMode::Locked;
-        cursor.visible = false;
+    }
+    *was_open = wants_cursor;
+    if mouse.just_pressed(MouseButton::Left) && !wants_cursor && !ui.over_hud {
+        cursor.grab_mode = CursorGrabMode::Locked;
     }
     if keys.just_pressed(KeyCode::Escape) {
         cursor.grab_mode = CursorGrabMode::None;
-        cursor.visible = true;
     }
+    cursor.visible = false;
     let captured = cursor.grab_mode != CursorGrabMode::None;
-    if captured || mouse.pressed(MouseButton::Right) {
+    ui.cursor_mode = !captured;
+    if captured || mouse.pressed(MouseButton::Right) && !wants_cursor {
         fly.yaw -= motion.x * 0.003;
         fly.pitch = (fly.pitch - motion.y * 0.003).clamp(-1.55, 1.55);
     }
@@ -752,8 +780,13 @@ fn level_hud(
     args: Res<LevelArgs>,
     script: Res<scripting::Scripting>,
     speech: Res<speech::Speech>,
+    ui: Res<hud::Ui>,
     mut hud: Single<&mut Text, With<Hud>>,
 ) {
+    if !ui.debug {
+        hud.0.clear();
+        return;
+    }
     // Report the position in Arx coordinates so it can be fed back through --cam.
     let mode = if fly.walk { "walking" } else { "flying" };
     let help = if fly.walk {

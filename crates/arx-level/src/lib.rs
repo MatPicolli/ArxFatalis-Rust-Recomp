@@ -71,6 +71,10 @@ impl Scripts {
             }));
         }
         {
+            let pak = pak.clone();
+            host.set_icon_size(Box::new(move |class| item_icon_size(&pak, class)));
+        }
+        {
             // Item scripts, for `inventory add`.
             let pak = pak.clone();
             host.set_script_loader(Box::new(move |class| pak.read(&format!("{class}.asl")).ok().map(|b| Arc::new(Script::new(&b)))));
@@ -100,6 +104,14 @@ impl Scripts {
         world.update(&mut host, 0.0);
         Scripts { world, host, ids, player }
     }
+}
+
+/// Size in pixels of an item's inventory icon (`<class>[icon].bmp`), read from the bitmap header.
+pub fn item_icon_size(pak: &PakSet, class: &str) -> Option<(u32, u32)> {
+    let bytes = pak.read(&format!("{class}[icon].bmp")).ok()?;
+    let w = i32::from_le_bytes(bytes.get(18..22)?.try_into().ok()?);
+    let h = i32::from_le_bytes(bytes.get(22..26)?.try_into().ok()?);
+    Some((w.unsigned_abs(), h.unsigned_abs()))
 }
 
 /// Radius and height of the cylinder that stands for a character in collisions, from its model's vertices

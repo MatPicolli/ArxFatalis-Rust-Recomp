@@ -1,4 +1,5 @@
-//! The player's on-screen state: life and mana bars, the inventory panel and its controls.
+//! The player's interface state, its keyboard controls and the paper panel for notes. The original HUD itself
+//! (gauges, icons, inventory panels, cursor) is drawn by [`crate::hud_ui`].
 
 use crate::convert::to_bevy;
 use crate::scripting::Scripting;
@@ -8,9 +9,24 @@ use arx_level::inventory;
 use arx_script::EntityId;
 use bevy::prelude::*;
 
-#[derive(Resource, Default)]
+/// Fully slid out of view, in unscaled pixels (the bag slides up from the bottom edge).
+pub const BAG_HIDDEN: f32 = 110.0;
+/// Where the chest panel hides to the left (unscaled pixels).
+pub const PANEL_HIDDEN: f32 = -160.0;
+
+/// An item being dragged with the mouse.
+#[derive(Clone, Copy)]
+pub struct Drag {
+    pub item: EntityId,
+    /// Where the cursor grabbed the icon, relative to its top-left corner (pixels).
+    pub grab: Vec2,
+}
+
+#[derive(Resource)]
 pub struct Ui {
+    /// The backpack panel is open.
     pub open: bool,
+    /// Entry highlighted for the keyboard (index into the carried list).
     pub selected: usize,
     /// Item chosen to be used on something: another item, or what the player looks at (`E`).
     pub held: Option<EntityId>,
@@ -18,69 +34,55 @@ pub struct Ui {
     pub container_selected: usize,
     /// Something being read (a note, a sign, a book): what kind and what it says.
     pub reading: Option<(arx_script::NoteKind, String)>,
+    /// Which bag of the inventory is shown.
+    pub bag: u8,
+    /// Slide position of the backpack panel (0 = fully up, [`BAG_HIDDEN`] = away).
+    pub bag_slide: f32,
+    /// Slide position of the chest panel (0 = fully in, [`PANEL_HIDDEN`] = away).
+    pub panel_slide: f32,
+    pub drag: Option<Drag>,
+    /// The last click on an item, to recognise double clicks.
+    pub last_click: Option<(EntityId, f64)>,
+    /// The mouse cursor is free to use the interface (the world is not being looked around).
+    pub cursor_mode: bool,
+    /// The cursor is over some part of the interface (set by the interface each frame).
+    pub over_hud: bool,
+    /// Scale of the interface relative to the original's 640x480 layout.
+    pub scale: f32,
+    pub hud_scale: f32,
+    /// The keyboard chose the highlighted item (cleared by the mouse).
+    pub kbd: bool,
+    /// The developer overlay (position, help line) is shown (`F3`).
+    pub debug: bool,
 }
 
-#[derive(Component)]
-pub struct LifeFill;
-#[derive(Component)]
-pub struct ManaFill;
-#[derive(Component)]
-pub struct StatsText;
-#[derive(Component)]
-pub struct InventoryText;
-#[derive(Component)]
-pub struct ContainerText;
+impl Default for Ui {
+    fn default() -> Self {
+        Ui {
+            open: false,
+            selected: 0,
+            held: None,
+            container_selected: 0,
+            reading: None,
+            bag: 0,
+            bag_slide: BAG_HIDDEN,
+            panel_slide: PANEL_HIDDEN,
+            drag: None,
+            last_click: None,
+            cursor_mode: false,
+            over_hud: false,
+            scale: 1.0,
+            hud_scale: 0.5,
+            kbd: false,
+            debug: false,
+        }
+    }
+}
+
 #[derive(Component)]
 pub struct NoteTextUi;
 
-const BAR_WIDTH: f32 = 220.0;
-const BAR_HEIGHT: f32 = 16.0;
-
-fn bar(commands: &mut Commands, left: Option<f32>, right: Option<f32>, fill: impl Component, color: Color) {
-    commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                bottom: Val::Px(18.0),
-                left: left.map_or(Val::Auto, Val::Px),
-                right: right.map_or(Val::Auto, Val::Px),
-                width: Val::Px(BAR_WIDTH),
-                height: Val::Px(BAR_HEIGHT),
-                ..default()
-            },
-            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.6)),
-        ))
-        .with_children(|p| {
-            p.spawn((fill, Node { width: Val::Percent(100.0), height: Val::Percent(100.0), ..default() }, BackgroundColor(color)));
-        });
-}
-
 pub fn spawn(mut commands: Commands) {
-    bar(&mut commands, Some(18.0), None, LifeFill, Color::srgb(0.75, 0.1, 0.1));
-    bar(&mut commands, None, Some(18.0), ManaFill, Color::srgb(0.15, 0.3, 0.85));
-    commands.spawn((
-        StatsText,
-        Text::new(""),
-        TextFont { font_size: FontSize::Px(14.0), ..default() },
-        TextColor(Color::WHITE),
-        Node { position_type: PositionType::Absolute, bottom: Val::Px(38.0), left: Val::Px(18.0), ..default() },
-    ));
-    commands.spawn((
-        InventoryText,
-        Text::new(""),
-        TextFont { font_size: FontSize::Px(17.0), ..default() },
-        TextColor(Color::srgb(0.95, 0.92, 0.8)),
-        BackgroundColor(Color::srgba(0.05, 0.04, 0.03, 0.8)),
-        Visibility::Hidden,
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(90.0),
-            right: Val::Px(18.0),
-            width: Val::Px(380.0),
-            padding: UiRect::all(Val::Px(12.0)),
-            ..default()
-        },
-    ));
     commands.spawn((
         NoteTextUi,
         Text::new(""),
@@ -98,22 +100,6 @@ pub fn spawn(mut commands: Commands) {
             ..default()
         },
     ));
-    commands.spawn((
-        ContainerText,
-        Text::new(""),
-        TextFont { font_size: FontSize::Px(17.0), ..default() },
-        TextColor(Color::srgb(0.85, 0.95, 0.85)),
-        BackgroundColor(Color::srgba(0.03, 0.05, 0.04, 0.8)),
-        Visibility::Hidden,
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(90.0),
-            left: Val::Px(18.0),
-            width: Val::Px(380.0),
-            padding: UiRect::all(Val::Px(12.0)),
-            ..default()
-        },
-    ));
 }
 
 /// The text shown for an entity: its localised name, or its id if the scripts never named it.
@@ -124,8 +110,15 @@ pub fn display_name(s: &Scripting, speech: &Speech, id: EntityId) -> String {
     }
 }
 
-/// Headless testing aid (`--pickup ids`, `--life n`): set up the player shortly after start-up.
-pub fn debug_pickup(mut frames: Local<u32>, args: Res<crate::LevelArgs>, mut s: ResMut<Scripting>) {
+/// Where something dropped by the player lands: a little in front of their feet (Arx coordinates).
+pub fn drop_position(fly: &Fly, cam: &Transform) -> [f32; 3] {
+    let forward = Vec3::new(cam.forward().x, 0.0, cam.forward().z).normalize_or_zero();
+    let feet = if fly.walk { fly.player.feet } else { fly.pos - Vec3::Y * arx_physics::EYE_HEIGHT };
+    to_bevy((feet + forward * 90.0).into())
+}
+
+/// Headless testing aid (`--pickup ids`, `--life n`, `--open-chest id`): set up the player shortly after start-up.
+pub fn debug_pickup(mut frames: Local<u32>, args: Res<crate::LevelArgs>, mut s: ResMut<Scripting>, mut ui: ResMut<Ui>) {
     *frames += 1;
     if *frames != 20 {
         return;
@@ -147,10 +140,17 @@ pub fn debug_pickup(mut frames: Local<u32>, args: Res<crate::LevelArgs>, mut s: 
             None => eprintln!("no such entity: {name}"),
         }
     }
+    if args.gold > 0 {
+        s.host.player.gold += args.gold;
+    }
+    if args.show_inventory {
+        ui.open = true;
+    }
 }
 
-/// Inventory keys: `I` opens it; then Up/Down choose, Enter uses (or combines with the held item), `H` holds
-/// an item to use on what you look at, `G` drops.
+/// Keyboard: `I` opens the backpack; Up/Down choose, Enter uses (or combines with the held item), `H` holds an item
+/// to use on what you look at, `G` drops. With a chest open it has the keys instead: Up/Down, Enter takes, `T` takes
+/// all, Backspace closes. (The mouse does all of this too; see [`crate::hud_ui`].)
 pub fn input(
     keys: Res<ButtonInput<KeyCode>>,
     fly: Res<Fly>,
@@ -160,6 +160,9 @@ pub fn input(
     speech: Res<Speech>,
 ) {
     let s = &mut *s;
+    if keys.just_pressed(KeyCode::F3) {
+        ui.debug = !ui.debug;
+    }
     // Things to read (notes, signs) come first; any of these keys puts them away.
     for note in s.host.take_notes() {
         ui.reading = Some((note.kind, speech.text(&note.text)));
@@ -175,6 +178,7 @@ pub fn input(
     }
     // An open container (chest, corpse) has the keyboard until it is closed or the player walks away.
     if let Some(container) = s.host.open_container {
+        ui.open = true; // so there is somewhere to put things
         let (p, q) = (s.world.entity(s.player).pos, s.world.entity(container).pos);
         let far = (p[0] - q[0]).hypot(p[2] - q[2]) > 450.0;
         let player = s.player;
@@ -193,14 +197,10 @@ pub fn input(
         if keys.just_pressed(KeyCode::Enter)
             && let Some(&item) = list.get(ui.container_selected)
         {
-            let name = display_name(s, &speech, item);
-            if inventory::take_from_container(&mut s.world, &mut s.host, player, container, item).is_some() {
-                s.host.push_message(format!("Took {name}"));
-            }
+            take(s, &speech, container, item);
         }
         if keys.just_pressed(KeyCode::KeyT) && !list.is_empty() {
-            let n = inventory::take_all(&mut s.world, &mut s.host, player, container);
-            s.host.push_message(format!("Took {n} things"));
+            take_all(s, container);
         }
         return;
     }
@@ -210,9 +210,11 @@ pub fn input(
     let len = s.host.player.inventory.len();
     if keys.just_pressed(KeyCode::ArrowDown) && len > 0 {
         ui.selected = (ui.selected + 1) % len;
+        ui.kbd = true;
     }
     if keys.just_pressed(KeyCode::ArrowUp) && len > 0 {
         ui.selected = (ui.selected + len - 1) % len;
+        ui.kbd = true;
     }
     let Some(&item) = s.host.player.inventory.get(ui.selected) else { return };
     let player = s.player;
@@ -230,9 +232,7 @@ pub fn input(
         }
     }
     if keys.just_pressed(KeyCode::KeyG) {
-        let forward = Vec3::new(cam.forward().x, 0.0, cam.forward().z).normalize_or_zero();
-        let feet = if fly.walk { fly.player.feet } else { fly.pos - Vec3::Y * arx_physics::EYE_HEIGHT };
-        let at = to_bevy((feet + forward * 90.0).into());
+        let at = drop_position(&fly, &cam);
         let name = display_name(s, &speech, item);
         if inventory::drop_item(&mut s.world, &mut s.host, player, item, at) {
             s.host.push_message(format!("Dropped {name}"));
@@ -246,69 +246,33 @@ pub fn input(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn update(
-    ui: Res<Ui>,
-    s: Res<Scripting>,
-    speech: Res<Speech>,
-    mut life: Single<&mut Node, (With<LifeFill>, Without<ManaFill>)>,
-    mut mana: Single<&mut Node, (With<ManaFill>, Without<LifeFill>)>,
-    mut stats: Single<&mut Text, (With<StatsText>, Without<InventoryText>, Without<ContainerText>, Without<NoteTextUi>)>,
-    mut inv: Single<(&mut Text, &mut Visibility), (With<InventoryText>, Without<StatsText>, Without<ContainerText>, Without<NoteTextUi>)>,
-    mut cont: Single<(&mut Text, &mut Visibility), (With<ContainerText>, Without<StatsText>, Without<InventoryText>, Without<NoteTextUi>)>,
-    mut note: Single<(&mut Text, &mut Visibility), (With<NoteTextUi>, Without<StatsText>, Without<InventoryText>, Without<ContainerText>)>,
-) {
-    {
-        let (text, vis) = &mut *note;
-        match &ui.reading {
-            Some((_, body)) => {
-                **vis = Visibility::Inherited;
-                text.0 = format!("{body}\n\n(Enter to put away)");
-            }
-            None => **vis = Visibility::Hidden,
+/// Take one item out of a container, telling the player how it went.
+pub fn take(s: &mut Scripting, speech: &Speech, container: EntityId, item: EntityId) {
+    let name = display_name(s, speech, item);
+    let player = s.player;
+    match inventory::take_from_container(&mut s.world, &mut s.host, player, container, item) {
+        Some(inventory::PickUp::Gold(n)) => s.host.push_message(format!("{n} gold")),
+        Some(inventory::PickUp::Refused(_)) => s.host.push_message("Your inventory is full".to_owned()),
+        Some(_) => s.host.push_message(format!("Took {name}")),
+        None => {}
+    }
+}
+
+pub fn take_all(s: &mut Scripting, container: EntityId) {
+    let player = s.player;
+    let n = inventory::take_all(&mut s.world, &mut s.host, player, container);
+    let left = s.host.containers.get(&container).map_or(0, Vec::len);
+    s.host.push_message(if left > 0 { "Your inventory is full".to_owned() } else { format!("Took {n} things") });
+}
+
+/// Show the paper panel while something is being read.
+pub fn update_note(ui: Res<Ui>, mut note: Single<(&mut Text, &mut Visibility), With<NoteTextUi>>) {
+    let (text, vis) = &mut *note;
+    match &ui.reading {
+        Some((_, body)) => {
+            **vis = Visibility::Inherited;
+            text.0 = format!("{body}\n\n(Enter to put away)");
         }
+        None => **vis = Visibility::Hidden,
     }
-    {
-        let (text, vis) = &mut *cont;
-        match s.host.open_container {
-            Some(c) => {
-                **vis = Visibility::Inherited;
-                let items = s.host.containers.get(&c).cloned().unwrap_or_default();
-                let mut out = format!("{}   (Up/Down choose, Enter take, T take all, Backspace close)\n", display_name(&s, &speech, c));
-                if items.is_empty() {
-                    out.push_str("\n  empty");
-                }
-                for (i, &id) in items.iter().enumerate() {
-                    let count = s.host.state(id).map_or(1, |st| st.count);
-                    let n = if count > 1 { format!(" x{count}") } else { String::new() };
-                    out.push_str(&format!("\n{} {}{n}", if i == ui.container_selected { ">" } else { " " }, display_name(&s, &speech, id)));
-                }
-                text.0 = out;
-            }
-            None => **vis = Visibility::Hidden,
-        }
-    }
-    let p = &s.host.player;
-    life.width = Val::Percent(p.life.fraction() * 100.0);
-    mana.width = Val::Percent(p.mana.fraction() * 100.0);
-    stats.0 = format!(
-        "Life {:.0}/{:.0}     Mana {:.0}/{:.0}     Hunger {:.0}%     [I] inventory",
-        p.life.current, p.life.max, p.mana.current, p.mana.max, p.hunger
-    );
-    let (text, vis) = &mut *inv;
-    **vis = if ui.open { Visibility::Inherited } else { Visibility::Hidden };
-    if !ui.open {
-        return;
-    }
-    let mut out = String::from("Inventory   (Up/Down choose, Enter use, H hold, G drop)\n");
-    if p.inventory.is_empty() {
-        out.push_str("\n  empty - walk up to an item and press E");
-    }
-    for (i, &id) in p.inventory.iter().enumerate() {
-        let count = s.host.state(id).map_or(1, |st| st.count);
-        let held = if ui.held == Some(id) { "  [held: press E on something]" } else { "" };
-        let n = if count > 1 { format!(" x{count}") } else { String::new() };
-        out.push_str(&format!("\n{} {}{n}{held}", if i == ui.selected { ">" } else { " " }, display_name(&s, &speech, id)));
-    }
-    text.0 = out;
 }

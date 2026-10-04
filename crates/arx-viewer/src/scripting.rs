@@ -182,7 +182,9 @@ pub fn interact(
         EntityKind::Item => {
             let name = crate::hud::display_name(s, &speech, target);
             match inventory::pick_up(&mut s.world, &mut s.host, player, target) {
+                inventory::PickUp::Refused("no room") => s.host.push_message("Your inventory is full".to_owned()),
                 inventory::PickUp::Refused(_) => {}
+                inventory::PickUp::Gold(n) => s.host.push_message(format!("{n} gold")),
                 _ => s.host.push_message(format!("Picked up {name}")),
             }
         }

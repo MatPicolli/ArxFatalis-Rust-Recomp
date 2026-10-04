@@ -482,7 +482,11 @@ fn main() -> Result<()> {
                         if let Some(c) = s.host.open_container { println!("  open container: {}", name(&s, c)); }
                         let p = &s.host.player;
                         println!("  life {}/{}  mana {}/{}  hunger {}", p.life.current, p.life.max, p.mana.current, p.mana.max, p.hunger);
-                        for &i in &p.inventory { println!("  carrying {} x{}", name(&s, i), s.host.state(i).map_or(0, |x| x.count)); }
+                        println!("  gold {}  bags {}", p.gold, p.bags);
+                        for &i in &p.inventory {
+                            let slot = p.slots.get(&i).map_or(String::new(), |l| format!("  bag {} slot ({},{}) {}x{}", l.bag, l.x, l.y, l.w, l.h));
+                            println!("  carrying {} x{}{slot}", name(&s, i), s.host.state(i).map_or(0, |x| x.count));
+                        }
                     }
                     _ => println!("  unknown step"),
                 }

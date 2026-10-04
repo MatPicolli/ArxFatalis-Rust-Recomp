@@ -31,7 +31,7 @@ Format and behaviour knowledge comes from the GPLv3 project **ArxLibertatis**
 | `arx-script` | `.asl` interpreter (events, variables, goto/gosub, timers, event queue) and `StdHost` for visual/sound commands |
 | `arx-level` | glue: runs a level's scripts, builds entity obstacles, `entity_rotation`, `inventory` (pick up / use / combine / drop) |
 | `arx-cli` (`arx`) | inspection/verification tools (see below) |
-| `arx-viewer` | Bevy app: model/texture browser and the walkable level viewer |
+| `arx-viewer` | Bevy app: model/texture browser and the walkable level viewer; `hud.rs` is the interface state and keys, `hud_ui.rs` draws the original HUD |
 
 Dependency direction: `formats` <- `physics`, `script` <- `level` <- `cli`, `viewer`.
 
@@ -108,7 +108,7 @@ cargo run -p arx-viewer -- level 1 --cam 8650,2945,8550 --look 0,-89 --fly --sho
 ```
 
 ```bash
-cargo run -p arx-viewer -- level 1 --pickup food_fish_0006,key_base_0005 --show-inventory --life 5 --shot shots/e.png   # HUD bars + inventory
+cargo run -p arx-viewer -- level 1 --pickup food_fish_0006,key_base_0005 --gold 241 --show-inventory --life 5 --shot shots/e.png   # the HUD
 cargo run -p arx-viewer -- level 1 --focus chest_metal_0051 --open-chest chest_metal_0051 --shot shots/f.png   # container panel
 cargo run -p arx-viewer -- level 1 --focus goblin_base_0051 --say goblin_base_0051:goblinlord_forbidden --mute --shot shots/d.png   # subtitle test
 ```
@@ -139,6 +139,17 @@ sets the screenshot frame (large levels need ~60 frames before everything appear
 - Containers: engine clicks on a chest/corpse send `inventory2_open` (a `refuse` keeps it locked and the script
   complains), not `action`; `inventory add` item paths use doubled backslashes (`PROVISIONS\\\\GARLIC\\\\GARLIC`).
   `inventory addfromscene` moves an existing level item into the chest (the goblin outpost key is in a chest).
+- **The HUD** (`arx-viewer/src/hud_ui.rs`, from `ArxLibertatis/src/gui/Hud.cpp` and `gui/hud/*`): everything is in the
+  original's 640x480 pixels times `interface_scale` (`getInterfaceScale`: 0.5 of the largest scale that fits, whole or
+  half steps, so 1.0 at 720p; the viewer defaults to `--hud-scale 1.0`). `geometry()` is the single source of truth for
+  positions (tests pin them): health 33x80 at the bottom-left (+2px so the texture's gap is hidden), mana bottom-right,
+  icons stacked up from the mana gauge 3px apart (backpack, book, purse), bag `hero_inventory` 562x121 at
+  `(W/2 - 320 + 35, H - 101 + slide)` with slots at `+(7, 6)` and 32px pitch, chest panel 115x378 at the top-left with
+  items at `(2 + 32x, 13 + 32y)`. UI bitmaps are `.bmp` with black as transparent; the filled red gauge is grey and is
+  tinted red by the engine. Digits come from `font10x10_inventory` (digit `n` at x = 11n + 1.5, 10x10), drawn right to
+  left. Item icons are `<class>[icon].bmp` next to the model; an item's slot size is its icon size / 32, rounded up, 1 to 3
+  (`StdHost::item_slots`). The player grid (`PlayerState::slots`) is 16x3 per bag filled column by column; gold items
+  (`.../gold_coin/gold_coin`) go to `PlayerState::gold`. The HUD is rebuilt as plain UI image nodes every frame.
 - Level 9 does not exist. Many levels' saved start is not on a real floor; the viewer starts at the nearest entity
   when the saved start is more than 250 units off its floor.
 
@@ -148,11 +159,14 @@ Done: PAK/FTL/FTS/LLF/DLF/TEA/WAV readers, level rendering with baked lighting, 
 lighting, skeletal animation (CPU skinning), walkable player with collision, script interpreter running every
 entity's start-up (all 23 levels), doors/levers/portcullises (animation, collision, sound), spatial sound,
 localised names, voiced dialogue with subtitles (`speak`, `playspeech`) and `herosay` notifications, player life/mana/
-hunger with HUD bars, item pickup with stacking, an inventory panel (use, hold, drop), eating/healing, and keys that
+hunger, the original HUD (gauges, backpack/book/purse icons, grid inventory with item icons, chest panel, crosshair and
+cursors), item pickup with stacking, eating/healing, and keys that
 unlock doors and chests (`combine`), original-faithful player movement (run/sneak/crouch/jump, ceilings, fall damage), NPC and
 fixture collision, chests and corpses as containers, readable notices (`note`) and `rotate`.
 
-Missing: cinematic cameras for `speak -c`, NPC behaviour (`behavior`, `settarget`), combat, spells, equipment and weapons, inventory grid/weight limits,
+Missing: the spell book / character sheet / map (the book icon only says so), equipment slots and weapons in the HUD,
+the hit-strength gauge and combat cursors, active-spell and hunger icons, the HUD sliding away in free look,
+cinematic cameras for `speak -c`, NPC behaviour (`behavior`, `settarget`), combat, spells, equipment and weapons, inventory grid/weight limits,
 `replaceme`, level changes (`teleport -l`, `worldfade`, needs state transfer), ladders, leaning, XP/levels/skills and character creation, footsteps/music/ambiance zones, fog and dynamic/flickering lights, menus and save games. About 60 script
 commands are skipped (the interpreter ignores a command it does not know, line by line, and counts it in
 `Stats::unknown_commands`; `arx script` prints the most frequent ones). With jumping off, `arx walk N --no-jump` has no

@@ -3,7 +3,7 @@
 //! by the interpreter (the rest of their line is ignored), so gameplay-only commands cost nothing.
 
 use crate::interp::{Args, CmdResult, Host, has_flag};
-use crate::player::PlayerState;
+use crate::player::{MAX_BAGS, PlayerState};
 use crate::text::Script;
 use crate::world::{EntityId, EntityKind, ScriptWorld, Timer};
 use std::{collections::HashMap, sync::Arc};
@@ -42,6 +42,8 @@ pub struct EntityState {
     pub price: f32,
     /// Carried by the player (and so not in the world).
     pub in_inventory: bool,
+    /// Containers: the background picture of their panel (`inventory skin`), e.g. `ingame_inventory_chest_metal`.
+    pub inventory_skin: String,
     /// Turned by `rotate`: degrees added to the angles the level gave it (pitch, yaw, roll).
     pub rotation: [f32; 3],
     /// Moved by the game (dropped by the player), in Arx coordinates; the renderer places the entity here.
@@ -68,6 +70,7 @@ impl Default for EntityState {
             weight: 0.0,
             price: 0.0,
             in_inventory: false,
+            inventory_skin: String::new(),
             rotation: [0.0; 3],
             moved_to: None,
         }
@@ -164,6 +167,18 @@ pub enum Carry {
     Added,
     /// Merged into the stack of the same kind the player already carries (its entity).
     Stacked(EntityId),
+    /// Gold: added to the purse (this many coins) and the item is gone.
+    Gold(u64),
+    /// No room for it in the inventory; nothing changed.
+    Full,
+}
+
+/// Size in pixels of an item's inventory icon, by class (the grid size is derived from it).
+pub type IconSize = Box<dyn Fn(&str) -> Option<(u32, u32)> + Send + Sync>;
+
+/// Is this item class gold coins (which go to the purse instead of the grid)?
+pub fn is_gold_class(class: &str) -> bool {
+    class.ends_with("/gold_coin/gold_coin")
 }
 
 /// Returns the length in milliseconds of the animation file at a virtual path.
@@ -179,6 +194,7 @@ pub struct StdHost {
     /// The player's life, mana, hunger and inventory.
     pub player: PlayerState,
     script_loader: Option<ScriptLoader>,
+    icon_size: Option<IconSize>,
     /// What chests, corpses and characters hold (`inventory add`): item entities not in the world.
     pub containers: HashMap<EntityId, Vec<EntityId>>,
     /// The container the player is looking into (`inventory open`).
@@ -196,11 +212,34 @@ impl StdHost {
         self.script_loader = Some(f);
     }
 
-    /// Put `item` into the player's inventory: it joins a carried stack of the same kind that has room (up to
-    /// its `playerstacksize`), or becomes a new entry. The item leaves the world.
+    /// Tell the host how big item icons are, so the inventory grid can give each item its room.
+    pub fn set_icon_size(&mut self, f: IconSize) {
+        self.icon_size = Some(f);
+    }
+
+    /// Slots an item of this class takes in a bag: its icon size in 32-pixel cells, 1 to 3 each way.
+    pub fn item_slots(&self, class: &str) -> (u8, u8) {
+        let (w, h) = self.icon_size.as_ref().and_then(|f| f(class)).unwrap_or((32, 32));
+        let cells = |px: u32| ((px + 31) / 32).clamp(1, 3) as u8;
+        (cells(w), cells(h))
+    }
+
+    /// Put `item` into the player's inventory: gold goes to the purse; anything else joins a carried stack of
+    /// the same kind that has room (up to its `playerstacksize`), or takes a free place in the grid. The item
+    /// leaves the world. `Full` if there is no room.
     pub fn carry(&mut self, world: &ScriptWorld, item: EntityId) -> Carry {
         let st = self.state(item).cloned().unwrap_or_default();
         let class = &world.entity(item).class;
+        if is_gold_class(class) {
+            let coins = u64::from(st.price.max(1.0) as u32) * u64::from(st.count.max(1));
+            self.player.gold += coins;
+            self.modify(item, |s| {
+                s.count = 0;
+                s.destroyed = true;
+                s.collision = false;
+            });
+            return Carry::Gold(coins);
+        }
         let target = self.player.inventory.iter().copied().find(|&i| {
             &world.entity(i).class == class && self.state(i).is_some_and(|t| t.stack_size > 1 && t.count < t.stack_size)
         });
@@ -219,6 +258,14 @@ impl StdHost {
                 return Carry::Stacked(target);
             }
         }
+        let (w, h) = self.item_slots(class);
+        let Some(slot) = self.player.find_free(w, h) else {
+            // The stack was merged as far as it went; what is left stays where it was.
+            if remaining != st.count {
+                self.modify(item, |s| s.count = remaining);
+            }
+            return Carry::Full;
+        };
         self.modify(item, |s| {
             s.count = remaining;
             s.in_inventory = true;
@@ -227,6 +274,7 @@ impl StdHost {
             s.moved_to = None;
         });
         self.player.inventory.push(item);
+        self.player.slots.insert(item, slot);
         Carry::Added
     }
 
@@ -272,7 +320,11 @@ impl StdHost {
                 self.destroy_container(me);
                 self.containers.insert(me, Vec::new());
             }
-            "skin" => a.skip_word(),
+            "skin" => {
+                let w = a.get_word();
+                let skin = a.string_var(&w).to_ascii_lowercase();
+                self.state_mut(me).inventory_skin = skin;
+            }
             "destroy" => self.destroy_container(me),
             "open" => {
                 if has_container(self, a.world) {
@@ -385,7 +437,11 @@ impl StdHost {
     /// Forget inventory entries that have been destroyed (eaten, ...).
     pub fn prune_inventory(&mut self) {
         let states = &self.states;
-        self.player.inventory.retain(|&i| states.get(i as usize).is_none_or(|s| !s.destroyed));
+        let gone: Vec<EntityId> =
+            self.player.inventory.iter().copied().filter(|&i| states.get(i as usize).is_some_and(|s| s.destroyed)).collect();
+        for id in gone {
+            self.player.remove_item(id);
+        }
     }
 
     /// What `destroy` / `eatme` do to an entity: one item leaves a stack, anything else is destroyed. Returns
@@ -611,6 +667,10 @@ impl Host for StdHost {
                 CmdResult::Success
             }
             "inventory" => self.inventory_command(a),
+            "addbag" => {
+                self.player.bags = (self.player.bags + 1).min(MAX_BAGS);
+                CmdResult::Success
+            }
             "rotate" => {
                 let delta = [a.get_float(), a.get_float(), a.get_float()];
                 let st = self.state_mut(me);
