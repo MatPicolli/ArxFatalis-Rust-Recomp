@@ -132,8 +132,10 @@ pub fn drop_item(world: &mut ScriptWorld, host: &mut StdHost, player: EntityId, 
     host.modify(item, |s| {
         s.in_inventory = false;
         s.hidden = false;
+        s.collision = true;
         s.moved_to = Some(pos);
     });
+    host.note_dropped(item);
     world.send_event(host, Some(player), item, "inventoryout", Vec::new());
     true
 }
@@ -254,6 +256,8 @@ mod tests {
         let st = h.state(pie).unwrap();
         assert!(!st.hidden && !st.in_inventory);
         assert_eq!(st.moved_to, Some([10.0, 20.0, 30.0]));
+        assert_eq!(h.take_dropped(), [pie], "the renderer is told to give it a model");
+        assert!(h.take_dropped().is_empty());
         assert_eq!(w.entity(pie).pos, [10.0, 20.0, 30.0]);
         assert!(h.player.inventory.is_empty());
         assert_eq!(h.take_messages(), ["dropped"]);

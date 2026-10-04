@@ -12,6 +12,7 @@ mod audio;
 mod convert;
 mod entities;
 mod hud;
+mod hud_book;
 mod hud_ui;
 mod level;
 mod scripting;
@@ -98,6 +99,16 @@ struct Args {
     /// Level mode: open this chest (an entity id such as `chest_metal_0051`) shortly after start-up
     #[arg(long)]
     open_chest: Option<String>,
+    /// Level mode: put these entities straight into the inventory (even ones that are inside chests or NPCs),
+    /// then drop them in front of the player after a moment, for headless testing
+    #[arg(long, value_delimiter = ',')]
+    give_and_drop: Vec<String>,
+    /// Level mode: open the player's book at start-up (`stats`, the default, or `quests`)
+    #[arg(long, num_args = 0..=1, default_missing_value = "stats")]
+    show_book: Option<String>,
+    /// Level mode: start with this much experience (levels up the hero), for headless testing
+    #[arg(long, default_value_t = 0)]
+    xp: i64,
     /// Level mode: start with the inventory panel open
     #[arg(long)]
     show_inventory: bool,
@@ -299,7 +310,7 @@ fn load_current(
                 bounds = Some(m.bounds);
                 commands.spawn((
                     Shown,
-                    animated::Animated { skeleton, anim, meshes: m.meshes, elapsed_us: 0, looping: true },
+                    animated::Animated { skeleton, anim, meshes: m.meshes, elapsed_us: 0, looping: true, root_motion: false },
                 ));
             }
             bounds
@@ -415,6 +426,9 @@ struct LevelArgs {
     open_container: Option<String>,
     gold: u64,
     show_inventory: bool,
+    give_and_drop: Vec<String>,
+    show_book: Option<String>,
+    xp: i64,
 }
 
 #[derive(Resource)]
@@ -467,8 +481,13 @@ fn run_level(args: Args, pak: PakSet) {
         open_container: args.open_chest.clone(),
         gold: args.gold,
         show_inventory: args.show_inventory,
+        give_and_drop: args.give_and_drop.clone(),
+        show_book: args.show_book.clone(),
+        xp: args.xp,
     })
     .insert_resource(entities::EntityCache::default())
+    .insert_resource(entities::SpawnedEntities::default())
+    .insert_resource(entities::LevelLights::default())
     .insert_resource(Fly {
         pos: Vec3::ZERO,
         yaw: 0.0,
@@ -485,7 +504,8 @@ fn run_level(args: Args, pak: PakSet) {
     .insert_resource(scripting::Obstacles::default())
     .insert_resource(audio::Sounds::new(args.mute))
     .insert_resource(speech::Speech::new(locale, args.language.clone(), !args.no_subtitles, args.mute))
-    .add_systems(Startup, (speech::spawn_ui, hud::spawn))
+    .add_systems(Startup, (hud_ui::load_font, speech::spawn_ui).chain())
+    .insert_resource(hud_ui::UiFont::default())
     .insert_resource(hud::Ui { hud_scale: args.hud_scale, ..default() })
     .insert_resource(hud_ui::UiAssets::default())
     .add_systems(
@@ -494,6 +514,7 @@ fn run_level(args: Args, pak: PakSet) {
             scripting::tick,
             speech::debug_say,
             speech::update,
+            entities::spawn_dropped,
             scripting::apply_state,
             scripting::auto_use,
             scripting::sync_obstacles,
@@ -503,7 +524,6 @@ fn run_level(args: Args, pak: PakSet) {
             hud::input,
             scripting::interact,
             hud_ui::mouse,
-            hud::update_note,
             hud_ui::draw,
             animated::animate,
             level_hud,
@@ -525,6 +545,7 @@ fn setup_level(
     mut ecache: ResMut<entities::EntityCache>,
     mut scripting: ResMut<scripting::Scripting>,
     mut pickables: ResMut<scripting::Pickables>,
+    mut spawned: ResMut<entities::SpawnedEntities>,
     mut obstacles: ResMut<scripting::Obstacles>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -643,10 +664,11 @@ fn setup_level(
                     let t = std::time::Instant::now();
                     let stats = entities::spawn_entities(
                         &mut commands, &arx.0, &d, info.scene_pos, &lights, args.npcs,
-                        &mut scripting, &mut pickables.0,
+                        &mut scripting, &mut pickables.0, &mut spawned,
                         &mut ecache, &mut cache, &mut meshes, &mut materials, &mut images,
                     );
                     eprintln!("entities: {stats:?} with {} static lights, built in {:.1?}", lights.len(), t.elapsed());
+                    commands.insert_resource(entities::LevelLights(lights));
                 }
                 Ok(_) => {}
                 Err(e) => eprintln!("no entities: {e}"),
@@ -686,7 +708,7 @@ fn fly_camera(
     let motion = if live { motion.delta } else { Vec2::ZERO };
     // Click to capture the mouse for look; Escape releases it. Right-drag also looks around. While the backpack or
     // a chest is open (or the mouse is released) the cursor works the interface, which draws the original cursor.
-    let wants_cursor = ui.open || script.host.open_container.is_some();
+    let wants_cursor = ui.open || ui.book.is_some() || ui.reading.is_some() || script.host.open_container.is_some();
     if wants_cursor && !*was_open {
         *regrab = cursor.grab_mode != CursorGrabMode::None;
         cursor.grab_mode = CursorGrabMode::None;

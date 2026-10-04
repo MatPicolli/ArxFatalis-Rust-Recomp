@@ -93,7 +93,19 @@ impl Skeleton {
         self.pose_at(anim, frame, t)
     }
 
+    /// Like [`Skeleton::pose`] for something that is not a character: the animation's root translation is applied
+    /// too (the original ignores it for NPCs, whose movement it drives instead).
+    pub fn pose_object(&self, anim: &Tea, time_us: i64) -> Vec<Vec3> {
+        let (frame, t) = anim.locate(time_us);
+        let root = if anim.frames.len() > 1 { anim.root_translation(frame, t) } else { Vec3::ZERO };
+        self.pose_with_root(anim, frame, t, root)
+    }
+
     pub fn pose_at(&self, anim: &Tea, frame: usize, t: f32) -> Vec<Vec3> {
+        self.pose_with_root(anim, frame, t, Vec3::ZERO)
+    }
+
+    fn pose_with_root(&self, anim: &Tea, frame: usize, t: f32, root: Vec3) -> Vec<Vec3> {
         let animated = anim.frames.len() > 1;
 
         // Local transform of each bone.
@@ -123,7 +135,7 @@ impl Skeleton {
                 }
                 None => {
                     quat[j] = init_rot[j];
-                    trans[j] = init_trans[j];
+                    trans[j] = init_trans[j] + root;
                     scale[j] = init_scale[j] + Vec3::ONE;
                 }
             }
@@ -141,6 +153,31 @@ impl Skeleton {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gate_rises_by_its_root_translation_while_a_character_does_not() {
+        use crate::tea::{GroupAnim, KeyFrame};
+        let key = |t: i64, y: f32| KeyFrame { num_frame: 0, time_us: t, translate: Vec3::new(0.0, y, 0.0), rotate: Quat::IDENTITY, step_sound: false };
+        let g = GroupAnim { rotate: Quat::IDENTITY, translate: Vec3::ZERO, zoom: Vec3::ZERO };
+        let anim = Tea {
+            name: String::new(),
+            frames: vec![key(0, 0.0), key(1_000_000, -200.0)],
+            group_count: 1,
+            groups: vec![g; 2],
+            void_groups: vec![true],
+            duration_us: 1_000_000,
+        };
+        let sk = Skeleton {
+            bones: vec![Bone { parent: None, origin: Vec3::ZERO, rest_offset: Vec3::ZERO }],
+            vertex_bone: vec![0, 0],
+            vertex_local: vec![Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, -10.0, 0.0)],
+        };
+        let half = sk.pose_object(&anim, 500_000);
+        assert!((half[0] - Vec3::new(1.0, -100.0, 0.0)).length() < 1e-3, "{:?}", half[0]);
+        let end = sk.pose_object(&anim, 1_000_000);
+        assert!((end[1] - Vec3::new(0.0, -210.0, 0.0)).length() < 1e-3, "{:?}", end[1]);
+        assert!((sk.pose(&anim, 1_000_000)[0] - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-4, "characters stay in place");
+    }
 
     #[test]
     fn slerp_endpoints_and_midpoint() {

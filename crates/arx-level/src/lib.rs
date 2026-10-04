@@ -92,6 +92,7 @@ impl Scripts {
             ids.push(id);
         }
 
+        host.publish_player(&mut world);
         for &id in &ids {
             world.send_event(&mut host, None, id, "load", Vec::new());
         }

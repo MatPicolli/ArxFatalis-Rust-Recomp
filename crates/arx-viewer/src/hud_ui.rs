@@ -12,11 +12,12 @@
 //! place that knows where things are, so drawing and mouse handling cannot disagree.
 
 use crate::hud::{BAG_HIDDEN, Drag, PANEL_HIDDEN, Ui, display_name, drop_position};
+use crate::hud_book::{self, BookPage, Derived, NoteKind};
 use crate::scripting::Scripting;
 use crate::speech::Speech;
 use crate::{Arx, Fly};
 use arx_level::inventory;
-use arx_script::{BAG_HEIGHT, BAG_WIDTH, EntityId, is_gold_class};
+use arx_script::{Attribute, BAG_HEIGHT, BAG_WIDTH, EntityId, Skill, is_gold_class, xp_for_level};
 use bevy::{
     asset::RenderAssetUsages,
     image::ImageSampler,
@@ -36,6 +37,32 @@ const BAG_SIZE: Vec2 = Vec2::new(562.0, 121.0);
 #[derive(Component)]
 pub struct HudNode;
 
+/// The game's own font (`misc/arx*.ttf`), which the original uses for everything it writes.
+#[derive(Resource, Default)]
+pub struct UiFont(pub Handle<Font>);
+
+pub fn load_font(mut commands: Commands, arx: Res<Arx>, mut fonts: ResMut<Assets<Font>>) {
+    let found = ["misc/arx_english.ttf", "misc/arx_default.ttf", "misc/arx.ttf", "misc/arx_base.ttf"]
+        .iter()
+        .find_map(|p| arx.0.read(p).ok().map(|b| b.into_owned()));
+    let handle = match found {
+        Some(bytes) => fonts.add(Font::from_bytes(bytes)),
+        None => Handle::default(),
+    };
+    commands.insert_resource(UiFont(handle));
+}
+
+/// The original shrinks its text a little less than the interface (`smallTextScale`).
+fn text_scale(s: f32) -> f32 {
+    if s > 2.0 {
+        s * 0.85
+    } else if s > 1.0 {
+        s * 0.7 + 0.3
+    } else {
+        s
+    }
+}
+
 #[derive(Clone)]
 pub struct UiTex {
     pub handle: Handle<Image>,
@@ -51,12 +78,16 @@ pub struct UiAssets {
 
 fn load(arx: &Arx, images: &mut Assets<Image>, path: &str) -> Option<UiTex> {
     let bytes = arx.0.read(path).ok()?;
-    let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Bmp).ok()?;
+    let is_bmp = path.ends_with(".bmp");
+    let format = if is_bmp { image::ImageFormat::Bmp } else { image::ImageFormat::Jpeg };
+    let img = image::load_from_memory_with_format(&bytes, format).ok()?;
     let (w, h) = (img.width(), img.height());
     let mut rgba = img.into_rgba8().into_raw();
-    for px in rgba.chunks_exact_mut(4) {
-        if px[..3] == [0, 0, 0] {
-            px[3] = 0;
+    if is_bmp {
+        for px in rgba.chunks_exact_mut(4) {
+            if px[..3] == [0, 0, 0] {
+                px[3] = 0;
+            }
         }
     }
     let mut image = Image::new(
@@ -72,8 +103,14 @@ fn load(arx: &Arx, images: &mut Assets<Image>, path: &str) -> Option<UiTex> {
 
 impl UiAssets {
     fn get(&mut self, arx: &Arx, images: &mut Assets<Image>, name: &str) -> Option<UiTex> {
-        let path = format!("graph/interface/{name}.bmp");
-        self.cache.entry(path.clone()).or_insert_with(|| load(arx, images, &path)).clone()
+        // Most interface bitmaps are .bmp; a few are .jpg.
+        for ext in ["bmp", "jpg"] {
+            let path = format!("graph/interface/{name}.{ext}");
+            if let Some(t) = self.cache.entry(path.clone()).or_insert_with(|| load(arx, images, &path)).clone() {
+                return Some(t);
+            }
+        }
+        None
     }
 
     /// An item's inventory icon. Gold shows more coins the more there is; items without an icon get the question mark.
@@ -125,6 +162,7 @@ pub struct Geo {
     pub backpack: Rect,
     pub book: Rect,
     pub purse: Rect,
+    pub level_up: Rect,
     /// Top-left of the backpack panel's slot (0, 0).
     pub bag_slots: Vec2,
     pub bag: Rect,
@@ -144,6 +182,7 @@ pub fn geometry(w: f32, h: f32, ui: &Ui) -> Geo {
     let backpack = icon(mana.min.y);
     let book = icon(backpack.min.y);
     let purse = icon(book.min.y);
+    let level_up = icon(purse.min.y);
     let anchor = Vec2::new(w / 2.0 - 320.0 * s + 35.0 * s, h - 101.0 * s + ui.bag_slide * s);
     let bag = rect(anchor.x, anchor.y - 5.0 * s, BAG_SIZE.x * s, BAG_SIZE.y * s);
     let arrows = anchor + Vec2::new((BAG_SIZE.x - 35.0) * s, 22.0 * s);
@@ -155,6 +194,7 @@ pub fn geometry(w: f32, h: f32, ui: &Ui) -> Geo {
         backpack,
         book,
         purse,
+        level_up,
         bag_slots: anchor + Vec2::new(7.0, 6.0) * s,
         bag,
         arrow_up: rect(arrows.x, arrows.y, 32.0 * s, 32.0 * s),
@@ -211,19 +251,32 @@ fn container_layout(s: &Scripting, container: EntityId) -> Vec<(EntityId, u8, u8
 /// Draw list for a frame.
 enum Item {
     Image { tex: Handle<Image>, at: Rect, part: Option<Rect>, tint: Color },
+    /// A line of text with a dark backing (tooltips).
     Text { text: String, at: Vec2, size: f32, color: Color },
+    /// Text in a box `width` wide; `centered` puts the middle of the text at `at.x` (no backing).
+    Para { text: String, at: Vec2, width: f32, size: f32, color: Color, centered: bool },
 }
 
-#[derive(Default)]
-struct Canvas(Vec<Item>);
+struct Canvas {
+    items: Vec<Item>,
+    font: Handle<Font>,
+}
 
 impl Canvas {
+    fn new(font: Handle<Font>) -> Self {
+        Canvas { items: Vec::new(), font }
+    }
+
+    fn para(&mut self, text: impl Into<String>, at: Vec2, width: f32, size: f32, color: Color, centered: bool) {
+        self.items.push(Item::Para { text: text.into(), at, width, size, color, centered });
+    }
+
     fn image(&mut self, tex: &UiTex, at: Rect) {
         self.tinted(tex, at, Color::WHITE);
     }
 
     fn tinted(&mut self, tex: &UiTex, at: Rect, tint: Color) {
-        self.0.push(Item::Image { tex: tex.handle.clone(), at, part: None, tint });
+        self.items.push(Item::Image { tex: tex.handle.clone(), at, part: None, tint });
     }
 
     /// Draw an icon that is `pixels` big at `scale`, top-left at `pos`.
@@ -241,7 +294,7 @@ impl Canvas {
             n /= 10;
             x -= 10.0 * scale;
             let u = digit * 11.0 + 1.5;
-            self.0.push(Item::Image {
+            self.items.push(Item::Image {
                 tex: font.handle.clone(),
                 at: rect(x, right_top.y, 10.0 * scale, 10.0 * scale),
                 part: Some(Rect::new(u, 1.5, u + 10.0, 11.5)),
@@ -251,16 +304,28 @@ impl Canvas {
     }
 
     fn flush(self, commands: &mut Commands) {
-        for item in self.0 {
+        let font = self.font;
+        for item in self.items {
             match item {
                 Item::Image { tex, at, part, tint } => {
                     commands.spawn((HudNode, node(at), ImageNode { image: tex, color: tint, rect: part, ..default() }));
+                }
+                Item::Para { text, at, width, size, color, centered } => {
+                    let left = if centered { at.x - width / 2.0 } else { at.x };
+                    commands.spawn((
+                        HudNode,
+                        Text::new(text),
+                        TextFont { font: font.clone().into(), font_size: FontSize::Px(size), ..default() },
+                        TextColor(color),
+                        TextLayout::justify(if centered { Justify::Center } else { Justify::Left }),
+                        Node { position_type: PositionType::Absolute, left: Val::Px(left), top: Val::Px(at.y), width: Val::Px(width), ..default() },
+                    ));
                 }
                 Item::Text { text, at, size, color } => {
                     commands.spawn((
                         HudNode,
                         Text::new(text),
-                        TextFont { font_size: FontSize::Px(size), ..default() },
+                        TextFont { font: font.clone().into(), font_size: FontSize::Px(size), ..default() },
                         TextColor(color),
                         BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.7)),
                         Node { position_type: PositionType::Absolute, left: Val::Px(at.x), top: Val::Px(at.y), padding: UiRect::axes(Val::Px(4.0), Val::Px(1.0)), ..default() },
@@ -287,6 +352,127 @@ fn bright() -> Color {
     Color::linear_rgb(1.9, 1.9, 1.9)
 }
 
+/// A note, or the quest log, laid out on screen.
+pub struct NoteGeo {
+    pub kind: NoteKind,
+    pub pages: Vec<String>,
+    pub area: Rect,
+    /// Where the left page's text goes.
+    pub text: Rect,
+    pub prev: Rect,
+    pub next: Rect,
+    pub has_buttons: bool,
+}
+
+/// Lay `text` out as a note of `kind` with its top-left at `origin` (`Note::calculateLayout`).
+fn note_geometry(text: &str, kind: NoteKind, origin: Vec2, s: f32) -> NoteGeo {
+    let r = text_scale(s) / s;
+    let layout = hud_book::layout_note(text, kind, 9.0 * r, 22.0 * r);
+    let size = layout.kind.size();
+    let ta = layout.kind.text_area();
+    let has_buttons = matches!(layout.kind, NoteKind::Book | NoteKind::Quests);
+    let corner = Vec2::splat(64.0);
+    let at = |off: Vec2| Rect::from_corners(origin + off * s, origin + (off + corner) * s);
+    NoteGeo {
+        kind: layout.kind,
+        pages: layout.pages,
+        area: Rect::from_corners(origin, origin + size * s),
+        text: Rect::from_corners(origin + ta.min * s, origin + ta.max * s),
+        prev: at(Vec2::new(8.0, size.y - corner.y - 6.0)),
+        next: at(Vec2::new(size.x - corner.x - 15.0, size.y - corner.y - 6.0)),
+        has_buttons,
+    }
+}
+
+/// Where a note being read sits: centred near the top of the screen.
+fn reading_geometry(ui: &Ui, w: f32) -> Option<NoteGeo> {
+    let (kind, text) = ui.reading.as_ref()?;
+    let kind: NoteKind = (*kind).into();
+    let size = kind.size() * ui.scale;
+    Some(note_geometry(text, kind, Vec2::new(w / 2.0 - size.x / 2.0, 47.0 * ui.scale), ui.scale))
+}
+
+fn quest_text(s: &Scripting, speech: &Speech) -> String {
+    s.host.player.quests.iter().filter_map(|k| speech.locale.get(k)).collect::<Vec<_>>().join("\n\n")
+}
+
+/// Draw a note's background, its text (a left and a right page) and its page buttons.
+#[allow(clippy::too_many_arguments)]
+fn draw_note(
+    c: &mut Canvas,
+    assets: &mut UiAssets,
+    arx: &Arx,
+    images: &mut Assets<Image>,
+    geo: &NoteGeo,
+    page: usize,
+    s: f32,
+    corners: (&str, &str),
+    hover: &dyn Fn(Rect) -> bool,
+) {
+    if let Some(bg) = assets.get(arx, images, &format!("book/{}", geo.kind.background())) {
+        c.image(&bg, geo.area);
+    }
+    let size = 18.0 * text_scale(s);
+    let ink = Color::BLACK;
+    let page = page.min(geo.pages.len().saturating_sub(1)) & !1;
+    if let Some(text) = geo.pages.get(page) {
+        c.para(text.clone(), geo.text.min, geo.text.width(), size, ink, false);
+    }
+    if let Some(text) = geo.pages.get(page + 1) {
+        let x = geo.text.max.x + 20.0 * s;
+        c.para(text.clone(), Vec2::new(x, geo.text.min.y), geo.text.width(), size, ink, false);
+    }
+    if geo.has_buttons {
+        if page >= 2
+            && let Some(t) = assets.get(arx, images, &format!("book/{}", corners.0))
+        {
+            c.tinted(&t, geo.prev, if hover(geo.prev) { bright() } else { Color::WHITE });
+        }
+        if page + 2 < geo.pages.len()
+            && let Some(t) = assets.get(arx, images, &format!("book/{}", corners.1))
+        {
+            c.tinted(&t, geo.next, if hover(geo.next) { bright() } else { Color::WHITE });
+        }
+    }
+}
+
+/// What clicking the character sheet or the bookmarks did.
+fn book_click(ui: &mut Ui, s: &mut Scripting, bk: Rect, pos: Vec2, right: bool) {
+    let sc = ui.scale;
+    let local = |v: Vec2| Rect::from_corners(bk.min + v * sc, bk.min + (v + Vec2::splat(32.0)) * sc);
+    if ui.book != Some(BookPage::Stats) && local(hud_book::bookmark(0)).contains(pos) {
+        ui.book = Some(BookPage::Stats);
+        return;
+    }
+    if ui.book != Some(BookPage::Quests) && local(hud_book::bookmark(3)).contains(pos) {
+        ui.book = Some(BookPage::Quests);
+        ui.quest_page = 0;
+        return;
+    }
+    if ui.book != Some(BookPage::Stats) {
+        return;
+    }
+    let player = &mut s.host.player;
+    for a in Attribute::ALL {
+        if local(hud_book::attribute_icon(a)).contains(pos) {
+            let ok = if right { player.refund_attribute(a) } else { player.spend_attribute(a) };
+            if !ok {
+                s.host.push_message("No point to move".to_owned());
+            }
+            return;
+        }
+    }
+    for k in Skill::ALL {
+        if local(hud_book::skill_icon(k)).contains(pos) {
+            let ok = if right { player.refund_skill(k) } else { player.spend_skill(k) };
+            if !ok {
+                s.host.push_message("No point to move".to_owned());
+            }
+            return;
+        }
+    }
+}
+
 /// Mouse use of the interface: backpack and book icons, the bag (drag items around, double click to use, drop on
 /// another item or on the world to use it there), the chest panel (click an item to take it).
 #[allow(clippy::too_many_arguments)]
@@ -310,10 +496,48 @@ pub fn mouse(
     let Some(pos) = window.cursor_position().filter(|_| shot.is_none()) else { return };
     let player = s.player;
 
+    // A note being read takes the mouse first; clicking its page corners turns pages, clicking elsewhere puts it away.
+    if let Some(geo) = reading_geometry(&ui, w) {
+        ui.over_hud = true;
+        if buttons.just_pressed(MouseButton::Left) {
+            if geo.has_buttons && geo.prev.contains(pos) && ui.note_page >= 2 {
+                ui.note_page -= 2;
+            } else if geo.has_buttons && geo.next.contains(pos) && ui.note_page + 2 < geo.pages.len() {
+                ui.note_page += 2;
+            } else if geo.area.contains(pos) {
+                ui.reading = None;
+            }
+        }
+        return;
+    }
+    // The player's book.
+    if let Some(page) = ui.book {
+        let bk = hud_book::book_rect(w, h, ui.scale);
+        ui.over_hud = true;
+        let right = buttons.just_pressed(MouseButton::Right);
+        if buttons.just_pressed(MouseButton::Left) || right {
+            book_click(&mut ui, s, bk, pos, right);
+        }
+        if page == BookPage::Quests && buttons.just_pressed(MouseButton::Left) {
+            let geo = note_geometry(&quest_text(s, &speech), NoteKind::Quests, bk.min, ui.scale);
+            if geo.prev.contains(pos) && ui.quest_page >= 2 {
+                ui.quest_page -= 2;
+            } else if geo.next.contains(pos) && ui.quest_page + 2 < geo.pages.len() {
+                ui.quest_page += 2;
+            }
+        }
+        // Clicking the book icon again (or the level-up icon) closes / keeps it.
+        if buttons.just_pressed(MouseButton::Left) && g.book.contains(pos) {
+            ui.book = None;
+        }
+        return;
+    }
+
     // Is the cursor on part of the interface?
     let in_bag = g.bag_visible(&ui) && g.bag.contains(pos);
     let in_panel = s.host.open_container.is_some() && g.panel_visible(&ui) && g.panel.contains(pos);
     ui.over_hud = in_bag || in_panel || [g.backpack, g.book, g.health, g.mana].iter().any(|r| r.contains(pos)) || (s.host.player.gold > 0 && g.purse.contains(pos));
+    ui.over_hud |= g.level_up.contains(pos) && (s.host.player.attribute_points > 0 || s.host.player.skill_points > 0);
 
     // Which bag slot is under the cursor?
     let cell = |g: &Geo| {
@@ -325,8 +549,8 @@ pub fn mouse(
         ui.kbd = false;
         if g.backpack.contains(pos) {
             ui.open = !ui.open;
-        } else if g.book.contains(pos) {
-            s.host.push_message("The spell book is not available yet".to_owned());
+        } else if g.book.contains(pos) || (g.level_up.contains(pos) && (s.host.player.attribute_points > 0 || s.host.player.skill_points > 0)) {
+            ui.book = Some(BookPage::Stats);
         } else if g.health.contains(pos) {
             let n = s.host.player.life.current as i64;
             s.host.push_message(n.to_string());
@@ -422,6 +646,8 @@ pub fn draw(
     s: Res<Scripting>,
     speech: Res<Speech>,
     shot: Option<Res<crate::Shot>>,
+    font: Res<UiFont>,
+    buttons: Res<ButtonInput<MouseButton>>,
 ) {
     for e in &old {
         commands.entity(e).despawn();
@@ -443,7 +669,7 @@ pub fn draw(
     ui.panel_slide += (target - ui.panel_slide).clamp(-step, step);
 
     let g = geometry(w, h, &ui);
-    let mut c = Canvas::default();
+    let mut c = Canvas::new(font.0.clone());
     let cursor = window.cursor_position().filter(|_| shot.is_none());
     let hover = |r: Rect| cursor.is_some_and(|p| r.contains(p));
     let mut tooltip: Option<(String, Vec2)> = None;
@@ -454,7 +680,7 @@ pub fn draw(
             let amount = amount.clamp(0.0, 1.0);
             let shown = Rect::new(at.min.x, at.min.y + at.height() * (1.0 - amount), at.max.x, at.max.y);
             let part = Rect::new(0.0, filled.size.y * (1.0 - amount), filled.size.x, filled.size.y);
-            c.0.push(Item::Image { tex: filled.handle, at: shown, part: Some(part), tint });
+            c.items.push(Item::Image { tex: filled.handle, at: shown, part: Some(part), tint });
             c.image(&empty, at);
         }
     };
@@ -463,7 +689,13 @@ pub fn draw(
     gauge(&mut c, &mut assets, &mut images, "blue", g.mana, p.mana.fraction(), Color::WHITE);
 
     // --- the icons above the mana gauge.
-    for (name, at, shown) in [("icons/backpack", g.backpack, true), ("icons/book", g.book, true), ("inventory/gold", g.purse, p.gold > 0)] {
+    let points = p.attribute_points > 0 || p.skill_points > 0;
+    for (name, at, shown) in [
+        ("icons/backpack", g.backpack, true),
+        ("icons/book", g.book, true),
+        ("inventory/gold", g.purse, p.gold > 0),
+        ("icons/lvl_up", g.level_up, points),
+    ] {
         if !shown {
             continue;
         }
@@ -551,6 +783,120 @@ pub fn draw(
         tooltip.get_or_insert((display_name(&s, &speech, container), Vec2::new(g.panel.min.x + 4.0 * g.s, 0.0)));
     }
 
+    // --- the player's book and notes.
+    let mut flyover: Option<String> = None;
+    if let Some(page) = ui.book {
+        let bk = hud_book::book_rect(w, h, g.s);
+        let local = |v: Vec2| bk.min + v * g.s;
+        let local_rect = |v: Vec2, size: Vec2| Rect::from_corners(local(v), local(v + size));
+        let bg = match page {
+            BookPage::Stats => "book/character_sheet/char_sheet_book",
+            BookPage::Quests => "book/questbook",
+        };
+        if let Some(tex) = assets.get(&arx, &mut images, bg) {
+            c.image(&tex, bk);
+        }
+        // Bookmarks to the other pages.
+        for (slot, name, target) in [(0, "book/bookmark_char", BookPage::Stats), (3, "book/bookmark_quest", BookPage::Quests)] {
+            if page != target
+                && let Some(tex) = assets.get(&arx, &mut images, name)
+            {
+                let at = local_rect(hud_book::bookmark(slot), Vec2::splat(32.0));
+                c.tinted(&tex, at, if hover(at) { bright() } else { Color::WHITE });
+            }
+        }
+        let size = 18.0 * text_scale(g.s);
+        match page {
+            BookPage::Stats => {
+                let text = |c: &mut Canvas, at: Vec2, width: f32, s: String| c.para(s, local(at) - Vec2::new(0.0, 0.0), width * g.s, size, Color::BLACK, true);
+                let lvl = speech.locale.get("system_charsheet_player_lvl").unwrap_or("Level");
+                let xp = speech.locale.get("system_charsheet_player_xp").unwrap_or("XP");
+                text(&mut c, Vec2::new(301.0, 10.0), 120.0, format!("{lvl} {:>3}", p.level));
+                text(&mut c, Vec2::new(413.0, 10.0), 120.0, format!("{xp} {:>8}", p.xp));
+                let full = p.full_skills();
+                for a in Attribute::ALL {
+                    text(&mut c, hud_book::attribute_value(a), 60.0, format!("{:>3}", p.attribute(a)));
+                    let icon = local_rect(hud_book::attribute_icon(a), Vec2::splat(32.0));
+                    if hover(icon) {
+                        flyover = speech.locale.get(hud_book::attribute_help_key(a)).map(str::to_owned);
+                        if buttons.pressed(MouseButton::Left)
+                            && let Some(t) = assets.get(&arx, &mut images, &format!("book/character_sheet/buttons_carac/{}", hud_book::attribute_pressed_icon(a)))
+                        {
+                            c.image(&t, icon);
+                        }
+                    }
+                }
+                for k in Skill::ALL {
+                    text(&mut c, hud_book::skill_value(k), 60.0, format!("{:>3.0}", full.get(k)));
+                    let icon = local_rect(hud_book::skill_icon(k), Vec2::splat(32.0));
+                    if hover(icon) {
+                        flyover = speech.locale.get(hud_book::skill_help_key(k)).map(str::to_owned);
+                        if buttons.pressed(MouseButton::Left)
+                            && let Some(t) = assets.get(&arx, &mut images, &format!("book/character_sheet/buttons_carac/{}", hud_book::skill_pressed_icon(k)))
+                        {
+                            c.image(&t, icon);
+                        }
+                    }
+                }
+                let misc = p.misc();
+                for d in Derived::ALL {
+                    let value = match d {
+                        Derived::ArmorClass => misc.armor_class,
+                        Derived::ResistMagic => misc.resist_magic,
+                        Derived::ResistPoison => misc.resist_poison,
+                        Derived::Life => p.life.max,
+                        Derived::Mana => p.mana.max,
+                        Derived::Damage => misc.damages,
+                    };
+                    text(&mut c, d.value_at(), 60.0, format!("{}", value.ceil() as i64));
+                    let area = d.area();
+                    if hover(local_rect(area.min, area.size())) {
+                        flyover = speech.locale.get(d.help_key()).map(str::to_owned);
+                    }
+                }
+                if hover(local_rect(Vec2::new(366.0, 10.0), Vec2::new(87.0, 20.0))) {
+                    let left = (xp_for_level(p.level + 1) - p.xp).max(0);
+                    flyover = Some(format!("{} {left:>8}", speech.locale.get("system_charsheet_xpoints").unwrap_or("XP to the next level")));
+                }
+                if (p.attribute_points > 0 || p.skill_points > 0) && flyover.is_none() {
+                    flyover = Some(format!("{} attribute and {} skill points to hand out", p.attribute_points, p.skill_points));
+                }
+            }
+            BookPage::Quests => {
+                let geo = note_geometry(&quest_text(&s, &speech), NoteKind::Quests, bk.min, g.s);
+                let page_no = ui.quest_page.min(geo.pages.len().saturating_sub(1)) & !1;
+                let texts = geo.pages.clone();
+                // The quest book is drawn on its own background above, so only text and page buttons here.
+                let ink = Color::BLACK;
+                if let Some(t) = texts.get(page_no) {
+                    c.para(t.clone(), geo.text.min, geo.text.width(), size, ink, false);
+                }
+                if let Some(t) = texts.get(page_no + 1) {
+                    c.para(t.clone(), Vec2::new(geo.text.max.x + 20.0 * g.s, geo.text.min.y), geo.text.width(), size, ink, false);
+                }
+                if page_no >= 2
+                    && let Some(t) = assets.get(&arx, &mut images, "book/left_corner_original")
+                {
+                    c.tinted(&t, geo.prev, if hover(geo.prev) { bright() } else { Color::WHITE });
+                }
+                if page_no + 2 < texts.len()
+                    && let Some(t) = assets.get(&arx, &mut images, "book/right_corner_original")
+                {
+                    c.tinted(&t, geo.next, if hover(geo.next) { bright() } else { Color::WHITE });
+                }
+                if texts.iter().all(String::is_empty) {
+                    c.para("Nothing to remember yet.", local(Vec2::new(40.0, 30.0)), 200.0 * g.s, size, ink, false);
+                }
+            }
+        }
+    }
+    if let Some(geo) = reading_geometry(&ui, w) {
+        draw_note(&mut c, &mut assets, &arx, &mut images, &geo, ui.note_page, g.s, ("left_corner", "right_corner"), &hover);
+    }
+    if let Some(text) = flyover {
+        c.para(text, Vec2::new(w / 2.0, 4.0), w * 0.82, 18.0 * text_scale(g.s), Color::srgb(232.0 / 255.0, 204.0 / 255.0, 143.0 / 255.0), true);
+    }
+
     // --- what the cursor carries, the tooltip, and the cursor itself.
     if let (Some(d), Some(pos)) = (ui.drag, cursor) {
         let class = s.world.entity(d.item).class.clone();
@@ -559,7 +905,7 @@ pub fn draw(
             c.sized(&tex, pos - d.grab, g.s, Color::WHITE);
         }
     } else if let Some((text, at)) = tooltip {
-        c.0.push(Item::Text { text, at: at + Vec2::new(14.0, 18.0) * g.s, size: 15.0, color: Color::srgb(0.95, 0.92, 0.8) });
+        c.items.push(Item::Text { text, at: at + Vec2::new(14.0, 18.0) * g.s, size: 15.0 * text_scale(g.s), color: Color::srgb(0.95, 0.92, 0.8) });
     }
     if ui.cursor_mode
         && let Some(pos) = cursor
@@ -572,7 +918,7 @@ pub fn draw(
         // What the crosshair is on.
         if let Some(target) = s.target {
             let at = Vec2::new(w, h) / 2.0 + Vec2::new(14.0, 14.0) * g.s;
-            c.0.push(Item::Text { text: display_name(&s, &speech, target), at, size: 15.0, color: Color::srgb(0.95, 0.92, 0.8) });
+            c.items.push(Item::Text { text: display_name(&s, &speech, target), at, size: 15.0 * text_scale(g.s), color: Color::srgb(0.95, 0.92, 0.8) });
         }
         // Looking around: the crosshair, half transparent in the middle of the screen.
         let size = tex.size * g.s;

@@ -84,6 +84,7 @@ pub fn tick(time: Res<Time>, fly: Res<Fly>, mut s: ResMut<Scripting>) {
     let feet = if fly.walk { fly.player.feet } else { fly.pos - Vec3::Y * arx_physics::EYE_HEIGHT };
     let player = s.player;
     s.world.entity_mut(player).pos = [feet.x, -feet.y, -feet.z];
+    s.host.publish_player(&mut s.world);
     s.world.update(&mut s.host, time.delta_secs_f64().min(0.1) * 1000.0);
 }
 

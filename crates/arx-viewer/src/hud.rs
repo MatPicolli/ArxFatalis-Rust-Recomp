@@ -54,6 +54,11 @@ pub struct Ui {
     pub kbd: bool,
     /// The developer overlay (position, help line) is shown (`F3`).
     pub debug: bool,
+    /// The open page of the player's book.
+    pub book: Option<crate::hud_book::BookPage>,
+    /// First page (always even) of the note or quest log shown.
+    pub note_page: usize,
+    pub quest_page: usize,
 }
 
 impl Default for Ui {
@@ -75,31 +80,11 @@ impl Default for Ui {
             hud_scale: 0.5,
             kbd: false,
             debug: false,
+            book: None,
+            note_page: 0,
+            quest_page: 0,
         }
     }
-}
-
-#[derive(Component)]
-pub struct NoteTextUi;
-
-pub fn spawn(mut commands: Commands) {
-    commands.spawn((
-        NoteTextUi,
-        Text::new(""),
-        TextFont { font_size: FontSize::Px(20.0), ..default() },
-        TextColor(Color::srgb(0.18, 0.12, 0.06)),
-        TextLayout::justify(Justify::Left),
-        BackgroundColor(Color::srgb(0.82, 0.75, 0.58)),
-        Visibility::Hidden,
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Percent(14.0),
-            left: Val::Percent(28.0),
-            width: Val::Percent(44.0),
-            padding: UiRect::all(Val::Px(26.0)),
-            ..default()
-        },
-    ));
 }
 
 /// The text shown for an entity: its localised name, or its id if the scripts never named it.
@@ -114,17 +99,43 @@ pub fn display_name(s: &Scripting, speech: &Speech, id: EntityId) -> String {
 pub fn drop_position(fly: &Fly, cam: &Transform) -> [f32; 3] {
     let forward = Vec3::new(cam.forward().x, 0.0, cam.forward().z).normalize_or_zero();
     let feet = if fly.walk { fly.player.feet } else { fly.pos - Vec3::Y * arx_physics::EYE_HEIGHT };
-    to_bevy((feet + forward * 90.0).into())
+    let mut at = feet + forward * 90.0;
+    // It lands on the floor there.
+    if let Some(floor) = fly.world.as_ref().and_then(|w| w.floor_height(at.x, at.z, feet.y + 80.0)) {
+        at.y = floor;
+    }
+    to_bevy(at.into())
 }
 
 /// Headless testing aid (`--pickup ids`, `--life n`, `--open-chest id`): set up the player shortly after start-up.
-pub fn debug_pickup(mut frames: Local<u32>, args: Res<crate::LevelArgs>, mut s: ResMut<Scripting>, mut ui: ResMut<Ui>) {
+pub fn debug_pickup(
+    mut frames: Local<u32>,
+    args: Res<crate::LevelArgs>,
+    fly: Res<Fly>,
+    cam: Single<&Transform, With<Camera3d>>,
+    mut s: ResMut<Scripting>,
+    mut ui: ResMut<Ui>,
+) {
     *frames += 1;
+    let s = &mut *s;
+    let player = s.player;
+    if *frames == 40 {
+        for name in &args.give_and_drop {
+            if let Some(id) = s.world.find(name, player) {
+                let at = drop_position(&fly, &cam);
+                eprintln!("drop {name}: {}", inventory::drop_item(&mut s.world, &mut s.host, player, id, at));
+            }
+        }
+        return;
+    }
     if *frames != 20 {
         return;
     }
-    let s = &mut *s;
-    let player = s.player;
+    for name in &args.give_and_drop {
+        if let Some(id) = s.world.find(name, player) {
+            eprintln!("give {name}: {:?}", s.host.carry(&s.world, id));
+        }
+    }
     if let Some(life) = args.life {
         s.host.player.life.current = life.clamp(0.0, s.host.player.life.max);
     }
@@ -146,6 +157,12 @@ pub fn debug_pickup(mut frames: Local<u32>, args: Res<crate::LevelArgs>, mut s: 
     if args.show_inventory {
         ui.open = true;
     }
+    if args.xp > 0 {
+        s.host.player.add_xp(args.xp);
+    }
+    if let Some(page) = &args.show_book {
+        ui.book = Some(if page == "quests" { crate::hud_book::BookPage::Quests } else { crate::hud_book::BookPage::Stats });
+    }
 }
 
 /// Keyboard: `I` opens the backpack; Up/Down choose, Enter uses (or combines with the held item), `H` holds an item
@@ -163,9 +180,14 @@ pub fn input(
     if keys.just_pressed(KeyCode::F3) {
         ui.debug = !ui.debug;
     }
+    if keys.just_pressed(KeyCode::KeyB) && ui.reading.is_none() {
+        ui.book = if ui.book.is_some() { None } else { Some(crate::hud_book::BookPage::Stats) };
+    }
     // Things to read (notes, signs) come first; any of these keys puts them away.
     for note in s.host.take_notes() {
         ui.reading = Some((note.kind, speech.text(&note.text)));
+        ui.note_page = 0;
+        ui.book = None;
     }
     if ui.reading.is_some() {
         if keys.any_just_pressed([KeyCode::Escape, KeyCode::Enter, KeyCode::Space, KeyCode::KeyE, KeyCode::Backspace]) {
@@ -263,16 +285,4 @@ pub fn take_all(s: &mut Scripting, container: EntityId) {
     let n = inventory::take_all(&mut s.world, &mut s.host, player, container);
     let left = s.host.containers.get(&container).map_or(0, Vec::len);
     s.host.push_message(if left > 0 { "Your inventory is full".to_owned() } else { format!("Took {n} things") });
-}
-
-/// Show the paper panel while something is being read.
-pub fn update_note(ui: Res<Ui>, mut note: Single<(&mut Text, &mut Visibility), With<NoteTextUi>>) {
-    let (text, vis) = &mut *note;
-    match &ui.reading {
-        Some((_, body)) => {
-            **vis = Visibility::Inherited;
-            text.0 = format!("{body}\n\n(Enter to put away)");
-        }
-        None => **vis = Visibility::Hidden,
-    }
 }

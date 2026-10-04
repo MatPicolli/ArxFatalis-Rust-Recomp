@@ -97,11 +97,11 @@ pub struct SubtitleUi;
 #[derive(Component)]
 pub struct NotesUi;
 
-pub fn spawn_ui(mut commands: Commands) {
+pub fn spawn_ui(mut commands: Commands, font: Res<crate::hud_ui::UiFont>) {
     commands.spawn((
         SubtitleUi,
         Text::new(""),
-        TextFont { font_size: FontSize::Px(22.0), ..default() },
+        TextFont { font: font.0.clone().into(), font_size: FontSize::Px(22.0), ..default() },
         TextColor(Color::srgb(1.0, 0.96, 0.8)),
         TextLayout::justify(Justify::Center),
         TextShadow::default(),
@@ -117,7 +117,7 @@ pub fn spawn_ui(mut commands: Commands) {
     commands.spawn((
         NotesUi,
         Text::new(""),
-        TextFont { font_size: FontSize::Px(20.0), ..default() },
+        TextFont { font: font.0.clone().into(), font_size: FontSize::Px(20.0), ..default() },
         TextColor(Color::srgb(0.85, 0.95, 1.0)),
         TextLayout::justify(Justify::Center),
         TextShadow::default(),

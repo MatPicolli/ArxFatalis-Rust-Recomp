@@ -195,6 +195,16 @@ impl Tea {
         result
     }
 
+    /// The whole object's translation at a point between two keyframes (Arx coordinates, object space): how a
+    /// gate rises or a trapdoor drops, while its bones stay put.
+    pub fn root_translation(&self, frame: usize, t: f32) -> Vec3 {
+        match (self.frames.get(frame), self.frames.get(frame + 1)) {
+            (Some(a), Some(b)) => a.translate.lerp(b.translate, t),
+            (Some(a), None) => a.translate,
+            _ => Vec3::ZERO,
+        }
+    }
+
     /// Time to play at, for a looping animation that has been running for `elapsed_us`.
     pub fn looped_time(&self, elapsed_us: i64) -> i64 {
         elapsed_us.rem_euclid(self.duration_us)

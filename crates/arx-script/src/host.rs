@@ -200,6 +200,8 @@ pub struct StdHost {
     /// The container the player is looking into (`inventory open`).
     pub open_container: Option<EntityId>,
     notes: Vec<NoteRequest>,
+    /// Items the player put back into the world, for the renderer to give a model (see `take_dropped`).
+    dropped: Vec<EntityId>,
 }
 
 impl StdHost {
@@ -306,6 +308,7 @@ impl StdHost {
             s.hidden = true;
             s.collision = false;
         });
+        a.world.send_event(self, None, id, "load", Vec::new());
         a.world.send_init(self, id);
         Some(id)
     }
@@ -400,9 +403,26 @@ impl StdHost {
         std::mem::take(&mut self.speech)
     }
 
+    /// Remember that the player put `item` into the world.
+    pub fn note_dropped(&mut self, item: EntityId) {
+        self.dropped.push(item);
+    }
+
+    /// Items put into the world since the last call.
+    pub fn take_dropped(&mut self) -> Vec<EntityId> {
+        std::mem::take(&mut self.dropped)
+    }
+
     /// Things scripts asked the player to read since the last call.
     pub fn take_notes(&mut self) -> Vec<NoteRequest> {
         std::mem::take(&mut self.notes)
+    }
+
+    /// Let scripts read the player's stats (`^player_life`, `^player_skill_mecanism`, ...).
+    pub fn publish_player(&self, world: &mut ScriptWorld) {
+        for (name, v) in self.player.script_vars() {
+            world.sys.insert(name, crate::Value::Float(v));
+        }
     }
 
     /// Queue a speech event as if a script had asked for it (test aid).
@@ -667,6 +687,23 @@ impl Host for StdHost {
                 CmdResult::Success
             }
             "inventory" => self.inventory_command(a),
+            "addxp" => {
+                let points = a.get_float() as i64;
+                let gained = self.player.add_xp(points);
+                if let Some(player) = a.world.player {
+                    for _ in 0..gained {
+                        a.world.send_event(self, None, player, "level_up", Vec::new());
+                    }
+                }
+                CmdResult::Success
+            }
+            "quest" => {
+                let w = a.get_word();
+                let key = speech_key(&a.string_var(&w));
+                self.player.quests.push(key);
+                self.messages.push("Quest book updated".to_owned());
+                CmdResult::Success
+            }
             "addbag" => {
                 self.player.bags = (self.player.bags + 1).min(MAX_BAGS);
                 CmdResult::Success

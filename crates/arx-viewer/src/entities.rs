@@ -115,6 +115,14 @@ struct Builder {
     colors: Vec<[f32; 4]>,
 }
 
+/// The entities that have a model in the scene (the rest are, for now, in inventories or chests).
+#[derive(Resource, Default)]
+pub struct SpawnedEntities(pub std::collections::HashSet<arx_script::EntityId>);
+
+/// The level's lights, for lighting what is spawned later (dropped items).
+#[derive(Resource, Default)]
+pub struct LevelLights(pub Vec<StaticLight>);
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_entities(
     commands: &mut Commands,
@@ -125,6 +133,7 @@ pub fn spawn_entities(
     include_npcs: bool,
     scripting: &mut Scripting,
     pickables: &mut Vec<Pickable>,
+    spawned: &mut SpawnedEntities,
     ecache: &mut EntityCache,
     tcache: &mut TextureCache,
     meshes: &mut Assets<Mesh>,
@@ -132,164 +141,231 @@ pub fn spawn_entities(
     images: &mut Assets<Image>,
 ) -> EntityStats {
     let mut stats = EntityStats::default();
-    let fullbright = std::env::var_os("ARX_FULLBRIGHT").is_some();
     for (index, e) in dlf.entities.iter().enumerate() {
         let script_id = scripting.ids[index];
-        // What the entity's scripts did to it during start-up.
-        let st = scripting.host.state(script_id).cloned().unwrap_or_default();
-        if is_hidden(&e.class) || st.destroyed || (!include_npcs && e.class.contains("/npc/")) {
-            stats.hidden += 1;
-            continue;
-        }
-        let model_class = st.mesh.as_deref().unwrap_or(&e.class);
-        let model_path = format!("game/{model_class}.ftl");
-        let model = ecache
-            .models
-            .entry(model_path.clone())
-            .or_insert_with(|| {
-                let bytes = pak.read(&model_path).ok()?;
-                Ftl::parse(&bytes).map_err(|err| eprintln!("{model_path}: {err}")).ok().map(Arc::new)
-            })
-            .clone();
-        let Some(ftl) = model else {
-            stats.no_model += 1;
-            continue;
-        };
-
-        let scale = st.scale;
         let world_arx = [e.pos[0] + scene_pos.x, e.pos[1] + scene_pos.y, e.pos[2] + scene_pos.z];
-        let translation = Vec3::from(to_bevy(world_arx));
-        let rotation = entity_rotation(e.angle, e.class.contains("/npc/"));
-        let ambient = if e.class.contains("/npc/") || e.class.contains("/items/") {
-            NPC_ITEMS_AMBIENT_255
-        } else {
-            DEFAULT_AMBIENT_255
-        };
-        let near = select_lights(lights, translation);
-
-        let mut groups: HashMap<(Option<u16>, Kind, bool), Builder> = HashMap::new();
-        for f in &ftl.faces {
-            let material = if f.facetype == 0 { None } else { f.material };
-            let ftype = f.facetype as u32;
-            let kind = if ftype & poly::TRANS != 0 {
-                match trans_kind(f.transval) {
-                    Some(k) => k,
-                    None => continue,
-                }
-            } else {
-                Kind::Opaque
-            };
-            let alpha = if kind == Kind::Blend { f.transval } else { 1.0 };
-            let b = groups.entry((material, kind, ftype & poly::DOUBLESIDED != 0)).or_default();
-            let local = f.vid.map(|i| Vec3::from(to_bevy(ftl.vertices[i as usize].pos)));
-            let flat = (local[1] - local[0]).cross(local[2] - local[0]).normalize_or_zero();
-            for k in 0..3 {
-                let v = &ftl.vertices[f.vid[k] as usize];
-                let stored = Vec3::from(to_bevy(v.norm));
-                let n_local = if stored.length_squared() > 0.25 { stored.normalize() } else { flat };
-                let world_pos = translation + rotation * (local[k] * scale);
-                let lit = if fullbright { Vec3::splat(255.0) } else { light_vertex(&near, ambient, world_pos, rotation * n_local) };
-                b.src.push(f.vid[k] as u32);
-                b.positions.push(local[k].to_array());
-                b.uvs.push([f.u[k], f.v[k]]);
-                b.colors.push([
-                    srgb_to_linear(lit.x),
-                    srgb_to_linear(lit.y),
-                    srgb_to_linear(lit.z),
-                    alpha,
-                ]);
-            }
+        let (class, angle, instance) = (e.class.as_str(), e.angle, e.instance);
+        if spawn_entity(
+            commands, pak, lights, scripting, pickables, ecache, tcache, meshes, materials, images,
+            class, world_arx, angle, instance, script_id, include_npcs, &mut stats,
+        ) {
+            spawned.0.insert(script_id);
         }
-
-        // The animation to start with: whatever the scripts are playing, else NPCs idle (WAIT).
-        let is_npc = e.class.contains("/npc/");
-        let playing_path = st.playing.as_ref().and_then(|p| st.anims.get(&p.slot)).cloned();
-        let anim_path = playing_path.or_else(|| is_npc.then(|| st.anims.get("wait").cloned()).flatten());
-        let looping = st.playing.as_ref().is_none_or(|p| p.looping);
-        let anim = anim_path.and_then(|p| scripting.anim(pak, &p));
-        // Entities with any loaded animation get a skeleton so later `playanim` can move them.
-        let probe = anim.clone().or_else(|| st.anims.values().next().and_then(|p| scripting.anim(pak, p)));
-        let skeleton = probe.and_then(|a| {
-            let sk = ecache.skeletons.entry(model_path.clone()).or_insert_with(|| Arc::new(Skeleton::from_ftl(&ftl)));
-            (sk.bones.len() == a.group_count).then(|| sk.clone())
-        });
-        let animated = skeleton.is_some();
-        let mut mesh_srcs = Vec::new();
-        let mut parent_children = Vec::new();
-        for ((material, kind, double), b) in groups {
-            let tex_name = material.and_then(|m| ftl.textures.get(m as usize)).filter(|t| !t.is_empty());
-            let key = (tex_name.cloned().unwrap_or_default(), kind, double);
-            let mat = ecache
-                .materials
-                .entry(key)
-                .or_insert_with(|| {
-                    let info = tex_name.and_then(|t| load_texture(pak, t, tcache, images));
-                    let keyed = info.as_ref().is_some_and(|i| i.keyed);
-                    let alpha_mode = match kind {
-                        Kind::Opaque if keyed => AlphaMode::Mask(0.5),
-                        Kind::Opaque => AlphaMode::Opaque,
-                        Kind::Blend => AlphaMode::Blend,
-                        Kind::Add => AlphaMode::Add,
-                        Kind::Multiply => AlphaMode::Multiply,
-                    };
-                    Some(materials.add(StandardMaterial {
-                        base_color_texture: info.map(|i| i.handle),
-                        unlit: true,
-                        alpha_mode,
-                        cull_mode: if double { None } else { Some(Face::Back) },
-                        double_sided: double,
-                        ..default()
-                    }))
-                })
-                .clone();
-            let Some(mat) = mat else { continue };
-            let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
-            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, b.positions);
-            mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, b.uvs);
-            mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, b.colors);
-            stats.meshes += 1;
-            let handle = meshes.add(mesh);
-            if animated {
-                mesh_srcs.push(MeshSrc { handle: handle.clone(), src: b.src });
-            }
-            parent_children.push((Mesh3d(handle), MeshMaterial3d(mat)));
-        }
-        let visibility = if st.hidden { Visibility::Hidden } else { Visibility::Inherited };
-        let mut parent = commands.spawn((
-            Transform { translation, rotation, scale: Vec3::splat(scale) },
-            visibility,
-            ScriptRef(script_id),
-            BaseAngle { angle: e.angle, npc: e.class.contains("/npc/") },
-        ));
-        parent.with_children(|p| {
-            for bundle in parent_children {
-                if animated {
-                    p.spawn((bundle, no_cull()));
-                } else {
-                    p.spawn(bundle);
-                }
-            }
-        });
-        if let Some(skeleton) = skeleton {
-            // Desynchronise identical NPCs.
-            let offset = anim.as_ref().map_or(0, |a| (e.instance as i64).wrapping_mul(7_919_000).rem_euclid(a.duration_us));
-            parent.insert(Animated { skeleton, anim, meshes: mesh_srcs, elapsed_us: offset, looping });
-            stats.animated += 1;
-        }
-
-        // Bounding sphere for picking.
-        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-        for v in &ftl.vertices {
-            let p = Vec3::from(to_bevy(v.pos));
-            lo = lo.min(p);
-            hi = hi.max(p);
-        }
-        pickables.push(Pickable {
-            id: script_id,
-            offset: rotation * ((lo + hi) * 0.5 * scale),
-            radius: ((hi - lo).length() * 0.5 * scale).max(20.0),
-        });
-        stats.spawned += 1;
     }
     stats
+}
+
+/// Give a model to items the player put back into the world that have none yet (things that came out of chests),
+/// so they can be seen and picked up again. Items that were in the level already just move (see `apply_state`).
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_dropped(
+    mut commands: Commands,
+    arx: Res<crate::Arx>,
+    lights: Res<LevelLights>,
+    mut scripting: ResMut<Scripting>,
+    mut pickables: ResMut<crate::scripting::Pickables>,
+    mut spawned: ResMut<SpawnedEntities>,
+    mut ecache: ResMut<EntityCache>,
+    mut tcache: ResMut<TextureCache>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    for id in scripting.host.take_dropped() {
+        if spawned.0.contains(&id) {
+            continue;
+        }
+        let Some(at) = scripting.host.state(id).and_then(|st| st.moved_to) else { continue };
+        let (class, instance) = {
+            let e = scripting.world.entity(id);
+            (e.class.clone(), e.instance)
+        };
+        let mut stats = EntityStats::default();
+        if spawn_entity(
+            &mut commands, &arx.0, &lights.0, &mut scripting, &mut pickables.0, &mut ecache, &mut tcache,
+            &mut meshes, &mut materials, &mut images, &class, at, [0.0; 3], instance, id, true, &mut stats,
+        ) {
+            spawned.0.insert(id);
+        }
+    }
+}
+
+/// Put one entity's model in the scene (its mesh, lit per vertex, animated if its scripts loaded animations) and make
+/// it pickable. `false` if it is hidden, destroyed or has no model.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_entity(
+    commands: &mut Commands,
+    pak: &PakSet,
+    lights: &[StaticLight],
+    scripting: &mut Scripting,
+    pickables: &mut Vec<Pickable>,
+    ecache: &mut EntityCache,
+    tcache: &mut TextureCache,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+    class: &str,
+    world_arx: [f32; 3],
+    angle: [f32; 3],
+    instance: i32,
+    script_id: arx_script::EntityId,
+    include_npcs: bool,
+    stats: &mut EntityStats,
+) -> bool {
+    let fullbright = std::env::var_os("ARX_FULLBRIGHT").is_some();
+    // What the entity's scripts did to it during start-up.
+    let st = scripting.host.state(script_id).cloned().unwrap_or_default();
+    if is_hidden(class) || st.destroyed || (!include_npcs && class.contains("/npc/")) {
+        stats.hidden += 1;
+        return false;
+    }
+    let model_class = st.mesh.as_deref().unwrap_or(class);
+    let model_path = format!("game/{model_class}.ftl");
+    let model = ecache
+        .models
+        .entry(model_path.clone())
+        .or_insert_with(|| {
+            let bytes = pak.read(&model_path).ok()?;
+            Ftl::parse(&bytes).map_err(|err| eprintln!("{model_path}: {err}")).ok().map(Arc::new)
+        })
+        .clone();
+    let Some(ftl) = model else {
+        stats.no_model += 1;
+        return false;
+    };
+
+    let scale = st.scale;
+    let translation = Vec3::from(to_bevy(world_arx));
+    let rotation = entity_rotation(angle, class.contains("/npc/"));
+    let ambient = if class.contains("/npc/") || class.contains("/items/") {
+        NPC_ITEMS_AMBIENT_255
+    } else {
+        DEFAULT_AMBIENT_255
+    };
+    let near = select_lights(lights, translation);
+
+    let mut groups: HashMap<(Option<u16>, Kind, bool), Builder> = HashMap::new();
+    for f in &ftl.faces {
+        let material = if f.facetype == 0 { None } else { f.material };
+        let ftype = f.facetype as u32;
+        let kind = if ftype & poly::TRANS != 0 {
+            match trans_kind(f.transval) {
+                Some(k) => k,
+                None => continue,
+            }
+        } else {
+            Kind::Opaque
+        };
+        let alpha = if kind == Kind::Blend { f.transval } else { 1.0 };
+        let b = groups.entry((material, kind, ftype & poly::DOUBLESIDED != 0)).or_default();
+        let local = f.vid.map(|i| Vec3::from(to_bevy(ftl.vertices[i as usize].pos)));
+        let flat = (local[1] - local[0]).cross(local[2] - local[0]).normalize_or_zero();
+        for k in 0..3 {
+            let v = &ftl.vertices[f.vid[k] as usize];
+            let stored = Vec3::from(to_bevy(v.norm));
+            let n_local = if stored.length_squared() > 0.25 { stored.normalize() } else { flat };
+            let world_pos = translation + rotation * (local[k] * scale);
+            let lit = if fullbright { Vec3::splat(255.0) } else { light_vertex(&near, ambient, world_pos, rotation * n_local) };
+            b.src.push(f.vid[k] as u32);
+            b.positions.push(local[k].to_array());
+            b.uvs.push([f.u[k], f.v[k]]);
+            b.colors.push([
+                srgb_to_linear(lit.x),
+                srgb_to_linear(lit.y),
+                srgb_to_linear(lit.z),
+                alpha,
+            ]);
+        }
+    }
+
+    // The animation to start with: whatever the scripts are playing, else NPCs idle (WAIT).
+    let is_npc = class.contains("/npc/");
+    let playing_path = st.playing.as_ref().and_then(|p| st.anims.get(&p.slot)).cloned();
+    let anim_path = playing_path.or_else(|| is_npc.then(|| st.anims.get("wait").cloned()).flatten());
+    let looping = st.playing.as_ref().is_none_or(|p| p.looping);
+    let anim = anim_path.and_then(|p| scripting.anim(pak, &p));
+    // Entities with any loaded animation get a skeleton so later `playanim` can move them.
+    let probe = anim.clone().or_else(|| st.anims.values().next().and_then(|p| scripting.anim(pak, p)));
+    let skeleton = probe.and_then(|a| {
+        let sk = ecache.skeletons.entry(model_path.clone()).or_insert_with(|| Arc::new(Skeleton::from_ftl(&ftl)));
+        (sk.bones.len() == a.group_count).then(|| sk.clone())
+    });
+    let animated = skeleton.is_some();
+    let mut mesh_srcs = Vec::new();
+    let mut parent_children = Vec::new();
+    for ((material, kind, double), b) in groups {
+        let tex_name = material.and_then(|m| ftl.textures.get(m as usize)).filter(|t| !t.is_empty());
+        let key = (tex_name.cloned().unwrap_or_default(), kind, double);
+        let mat = ecache
+            .materials
+            .entry(key)
+            .or_insert_with(|| {
+                let info = tex_name.and_then(|t| load_texture(pak, t, tcache, images));
+                let keyed = info.as_ref().is_some_and(|i| i.keyed);
+                let alpha_mode = match kind {
+                    Kind::Opaque if keyed => AlphaMode::Mask(0.5),
+                    Kind::Opaque => AlphaMode::Opaque,
+                    Kind::Blend => AlphaMode::Blend,
+                    Kind::Add => AlphaMode::Add,
+                    Kind::Multiply => AlphaMode::Multiply,
+                };
+                Some(materials.add(StandardMaterial {
+                    base_color_texture: info.map(|i| i.handle),
+                    unlit: true,
+                    alpha_mode,
+                    cull_mode: if double { None } else { Some(Face::Back) },
+                    double_sided: double,
+                    ..default()
+                }))
+            })
+            .clone();
+        let Some(mat) = mat else { continue };
+        let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, b.positions);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, b.uvs);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, b.colors);
+        stats.meshes += 1;
+        let handle = meshes.add(mesh);
+        if animated {
+            mesh_srcs.push(MeshSrc { handle: handle.clone(), src: b.src });
+        }
+        parent_children.push((Mesh3d(handle), MeshMaterial3d(mat)));
+    }
+    let visibility = if st.hidden { Visibility::Hidden } else { Visibility::Inherited };
+    let mut parent = commands.spawn((
+        Transform { translation, rotation, scale: Vec3::splat(scale) },
+        visibility,
+        ScriptRef(script_id),
+        BaseAngle { angle: angle, npc: class.contains("/npc/") },
+    ));
+    parent.with_children(|p| {
+        for bundle in parent_children {
+            if animated {
+                p.spawn((bundle, no_cull()));
+            } else {
+                p.spawn(bundle);
+            }
+        }
+    });
+    if let Some(skeleton) = skeleton {
+        // Desynchronise identical NPCs.
+        let offset = anim.as_ref().map_or(0, |a| (instance as i64).wrapping_mul(7_919_000).rem_euclid(a.duration_us));
+        parent.insert(Animated { skeleton, anim, meshes: mesh_srcs, elapsed_us: offset, looping, root_motion: !class.contains("/npc/") });
+        stats.animated += 1;
+    }
+
+    // Bounding sphere for picking.
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for v in &ftl.vertices {
+        let p = Vec3::from(to_bevy(v.pos));
+        lo = lo.min(p);
+        hi = hi.max(p);
+    }
+    pickables.push(Pickable {
+        id: script_id,
+        offset: rotation * ((lo + hi) * 0.5 * scale),
+        radius: ((hi - lo).length() * 0.5 * scale).max(20.0),
+    });
+    stats.spawned += 1;
+    true
 }
