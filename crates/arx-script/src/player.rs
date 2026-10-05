@@ -224,6 +224,10 @@ pub struct PlayerState {
     pub fighting: bool,
     /// Which of the four faces the hero has (chosen at character creation).
     pub skin: u8,
+    /// The runes the hero has learnt (`rune -a aam`), by name.
+    pub runes: std::collections::BTreeSet<String>,
+    /// Armour class a running spell adds (or takes away).
+    pub spell_armor: f32,
 }
 
 impl Default for PlayerState {
@@ -251,6 +255,8 @@ impl Default for PlayerState {
             mods: EquipMods::default(),
             fighting: false,
             skin: 0,
+            runes: Default::default(),
+            spell_armor: 0.0,
         }
     }
 }
@@ -343,7 +349,7 @@ impl PlayerState {
         };
         let m = &self.mods;
         Misc {
-            armor_class: (base.armor_class + m.modifier("armor_class", base.armor_class)).max(0.0),
+            armor_class: (base.armor_class + m.modifier("armor_class", base.armor_class) + self.spell_armor).max(0.0),
             resist_magic: (base.resist_magic + m.modifier("resist_magic", base.resist_magic)).max(0.0),
             resist_poison: (base.resist_poison + m.modifier("resist_poison", base.resist_poison)).max(0.0),
             critical_hit: (base.critical_hit + m.modifier("critical_hit", base.critical_hit)).max(0.0),

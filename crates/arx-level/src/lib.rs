@@ -3,6 +3,7 @@
 
 pub mod anchors;
 pub mod inventory;
+pub mod magic;
 pub mod model;
 pub mod npc;
 pub mod player_combat;

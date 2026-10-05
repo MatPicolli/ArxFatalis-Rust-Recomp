@@ -180,6 +180,7 @@ pub fn pick_ray(pickables: &Pickables, s: &Scripting, origin: Vec3, dir: Vec3, r
 /// otherwise pick up items, talk to people, and send `action` to everything else.
 pub fn interact(
     keys: Res<ButtonInput<KeyCode>>,
+    buttons: Res<ButtonInput<MouseButton>>,
     cam: Single<&Transform, (With<Camera3d>, Without<crate::book_hero::BookCamera>)>,
     pickables: Res<Pickables>,
     mut ui: ResMut<crate::hud::Ui>,
@@ -222,16 +223,21 @@ pub fn interact(
     if scripted {
         eprintln!("E pressed: looking at {:?}; reading {}", s.target.map(|t| s.world.entity(t).id_string.clone()), ui.reading.is_some());
     }
-    if !(keys.just_pressed(KeyCode::KeyE) || scripted) || ui.reading.is_some() || !s.host.stage.controls {
+    // With an item in the hand and the mouse turning the view, a click uses it on what the crosshair is on.
+    let use_held = ui.held.is_some() && !ui.cursor_mode && buttons.just_pressed(MouseButton::Left);
+    if !(keys.just_pressed(KeyCode::KeyE) || scripted || use_held) || ui.reading.is_some() || !s.host.stage.controls {
+        return;
+    }
+    if use_held && s.target.is_none() {
+        ui.held = None;
         return;
     }
     let Some(target) = s.target else { return };
     let player = s.player;
     if let Some(held) = ui.held {
         inventory::combine(&mut s.world, &mut s.host, player, held, target);
-        if !s.host.player.inventory.contains(&held) {
-            ui.held = None;
-        }
+        // Used once, as in the original: choose it again to use it on something else.
+        ui.held = None;
         return;
     }
     // A dead character is searched like a chest.

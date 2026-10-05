@@ -357,6 +357,14 @@ impl NpcWorld {
         out
     }
 
+    /// The hero's blow lands on something that is not a character (a door, a wooden grid, a crate): it is told (`hit`,
+    /// with the damage and the kind of weapon) and its script decides what breaks.
+    pub fn player_strike_object(&mut self, world: &mut ScriptWorld, host: &mut StdHost, env: &Env, target: EntityId, ratio: f32, at: Vec3) -> Option<Impact> {
+        let player = world.player?;
+        let mut cx = Ctx { world, host, env, dt_ms: 0.0 };
+        Some(self.compute_damages(&mut cx, player, target, ratio, at))
+    }
+
     /// Hurt a character directly (a trap, a spell, a script): `damage` life, from `source`.
     pub fn hurt(&mut self, world: &mut ScriptWorld, host: &mut StdHost, env: &Env, target: EntityId, damage: f32, source: Option<EntityId>) -> f32 {
         let mut cx = Ctx { world, host, env, dt_ms: 0.0 };

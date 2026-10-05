@@ -23,6 +23,7 @@ mod hud_book;
 mod hud_ui;
 mod level;
 mod lighting;
+mod magic;
 mod menu;
 mod scripting;
 mod shadows;
@@ -181,6 +182,12 @@ struct Args {
     /// The folder mods are dropped into (folders or `.pak` archives; see the README)
     #[arg(long, env = "ARX_MODS", default_value = "mods")]
     mods_dir: PathBuf,
+    /// Level mode: teach the hero these runes at start-up (`all`, or names such as `aam,yok`), for testing
+    #[arg(long, value_delimiter = ',')]
+    runes: Vec<String>,
+    /// Level mode: cast the spell these runes make shortly after start-up (`aam,yok`), for headless testing
+    #[arg(long, value_delimiter = ',')]
+    cast: Vec<String>,
     /// Save a screenshot to this file after a few frames, then exit
     #[arg(long)]
     shot: Option<PathBuf>,
@@ -496,6 +503,8 @@ struct LevelArgs {
     draw_weapon: bool,
     attack_test: bool,
     attrs: Vec<i32>,
+    runes: Vec<String>,
+    cast: Vec<String>,
 }
 
 #[derive(Resource)]
@@ -603,6 +612,8 @@ fn run_level(args: Args, pak: PakSet, mods: Vec<arx_formats::mods::Mod>) {
         draw_weapon: args.draw_weapon,
         attack_test: args.attack_test,
         attrs: args.attrs.clone(),
+        runes: args.runes.clone(),
+        cast: args.cast.clone(),
     })
     .insert_resource(entities::EntityCache::default())
     .insert_resource(entities::SpawnedEntities::default())
@@ -631,6 +642,7 @@ fn run_level(args: Args, pak: PakSet, mods: Vec<arx_formats::mods::Mod>) {
     .insert_resource(lighting::LevelLighting::default())
     .insert_resource(perf::Perf::default())
     .insert_resource(book_hero::BookHero::default())
+    .insert_resource(magic::Magic::default())
     .insert_resource(particles::Particles::default())
     .insert_resource(shadows::Shadows::default())
     .insert_resource(player_body::PlayerBody::default())
@@ -667,6 +679,7 @@ fn run_level(args: Args, pak: PakSet, mods: Vec<arx_formats::mods::Mod>) {
         )
             .chain(),
         (
+            timed!(magic::input, "magic::input"),
             timed!(fly_camera, "fly_camera"),
             timed!(steps::footsteps, "steps::footsteps"),
             timed!(steps::ui_sounds, "steps::ui_sounds"),
@@ -684,6 +697,8 @@ fn run_level(args: Args, pak: PakSet, mods: Vec<arx_formats::mods::Mod>) {
         (
             timed!(lighting::update, "lighting::update"),
             timed!(particles::update, "particles::update"),
+            timed!(magic::update, "magic::update"),
+            timed!(magic::draw, "magic::draw"),
             timed!(player_body::drive, "player_body::drive"),
             timed!(book_hero::update, "book_hero::update"),
             timed!(hud_ui::draw, "hud_ui::draw"),
@@ -915,7 +930,8 @@ fn fly_camera(
     let (window, cursor) = &mut *window;
     let keys: &ButtonInput<KeyCode> = if live { &keys } else { &ButtonInput::default() };
     let mouse: &ButtonInput<MouseButton> = if live { &mouse } else { &ButtonInput::default() };
-    let motion = if live { motion.delta } else { Vec2::ZERO };
+    // (While `Ctrl` is held the mouse draws runes: it neither turns the view nor captures itself.)
+    let motion = if live && !ui.casting { motion.delta } else { Vec2::ZERO };
     // Click to capture the mouse for look; Escape releases it. Right-drag also looks around. While the backpack or
     // a chest is open (or the mouse is released) the cursor works the interface, which draws the original cursor.
     let wants_cursor = ui.open || ui.book.is_some() || ui.reading.is_some() || script.host.open_container.is_some();
@@ -927,7 +943,7 @@ fn fly_camera(
         cursor.grab_mode = CursorGrabMode::Locked;
     }
     *was_open = wants_cursor;
-    if mouse.just_pressed(MouseButton::Left) && !wants_cursor && !ui.over_hud && ui.hover_item.is_none() {
+    if mouse.just_pressed(MouseButton::Left) && !wants_cursor && !ui.over_hud && ui.hover_item.is_none() && !ui.casting {
         cursor.grab_mode = CursorGrabMode::Locked;
     }
     // A window that is not in front has no business holding the mouse.

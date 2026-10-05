@@ -195,7 +195,7 @@ pub fn drive(
     let dead = s.host.player.is_dead();
 
     // Combat controls: Tab draws or puts away the weapon; the left button winds up and strikes.
-    let attack_held = live && mouse.pressed(MouseButton::Left) && !ui.cursor_mode && !dead && fly.walk && s.host.stage.controls;
+    let attack_held = live && mouse.pressed(MouseButton::Left) && !ui.cursor_mode && !ui.casting && !dead && fly.walk && s.host.stage.controls;
     let mut updates = Vec::new();
     if live && keys.just_pressed(KeyCode::Tab) && !dead && fly.walk && !ui.open && ui.book.is_none() {
         updates.push(combat.state.toggle(&mut s.host, player));
@@ -557,6 +557,31 @@ pub fn attach(
         let ratio = combat.state.strike_ratio;
         let mut hit = std::mem::take(&mut body.hit);
         let impacts = npcs.player_strike(&mut s.world, &mut s.host, &env, &spheres, ratio, &mut hit);
+        // Things that are not alive: a door, the wooden grid of the cell, a crate. Whatever of them the blade reaches
+        // is struck once per swing and hears `hit`.
+        let mut struck: Vec<EntityId> = Vec::new();
+        for p in &caches.pickables.0 {
+            if hit.contains(&p.id) || s.world.entity(p.id).kind != arx_script::EntityKind::Fix {
+                continue;
+            }
+            if s.host.state(p.id).is_none_or(|st| st.hidden || st.destroyed) {
+                continue;
+            }
+            let centre = Vec3::from(to_bevy(s.world.entity(p.id).pos)) + p.offset;
+            if centres.iter().any(|&(c, r)| c.distance(centre) <= r + p.radius * 0.85) {
+                struck.push(p.id);
+            }
+        }
+        for target in struck {
+            hit.push(target);
+            let at = Vec3::from(s.world.entity(target).pos);
+            if npcs.player_strike_object(&mut s.world, &mut s.host, &env, target, ratio, at).is_some() {
+                combat.state.landed();
+                if std::env::var_os("ARX_LOG_BODY").is_some() {
+                    eprintln!("blow on {}", s.world.entity(target).id_string);
+                }
+            }
+        }
         body.hit = hit;
         if !impacts.is_empty() {
             combat.state.landed();

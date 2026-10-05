@@ -124,6 +124,8 @@ pub struct EntityState {
     pub invulnerable: bool,
     /// Casts a shadow on the floor (`setshadow off` removes it).
     pub shadow: bool,
+    /// Another inventory picture than the class's own (`tweak icon`): a file name beside the item's model.
+    pub icon: Option<String>,
     /// What scripts changed about the model's looks, in order (`tweak`).
     pub tweaks: Vec<Tweak>,
     /// Bumped whenever the model itself changes (`usemesh`, `tweak`), so the renderer can build it again.
@@ -175,6 +177,7 @@ impl Default for EntityState {
             cam_translate: [0.0; 3],
             invulnerable: false,
             shadow: true,
+            icon: None,
             tweaks: Vec::new(),
             model_serial: 0,
             player_tweak_mesh: None,
@@ -376,6 +379,7 @@ pub type AnimDuration = Box<dyn Fn(&str) -> Option<f64> + Send + Sync>;
 
 #[derive(Default)]
 pub struct StdHost {
+    loosened: Vec<EntityId>,
     /// The hero's entity, once known (the host is told by whoever has the world).
     pub player_entity: Option<EntityId>,
     states: Vec<EntityState>,
@@ -617,6 +621,11 @@ impl StdHost {
     /// Remember that the player put `item` into the world.
     pub fn note_dropped(&mut self, item: EntityId) {
         self.dropped.push(item);
+    }
+
+    /// Things scripts set loose to fall and tumble since the last call (`activatephysics`).
+    pub fn take_loosened(&mut self) -> Vec<EntityId> {
+        std::mem::take(&mut self.loosened)
     }
 
     /// Items put into the world since the last call.
@@ -913,7 +922,11 @@ impl Host for StdHost {
                         Tweak::Skin { from, to }
                     }
                     "icon" => {
-                        a.skip_word();
+                        // Another picture in the inventory (`rune_yok[icon]`): a file beside the item's own.
+                        let w = a.get_word();
+                        let icon = a.string_var(&w).to_ascii_lowercase();
+                        let icon = icon.strip_suffix("[icon]").unwrap_or(&icon).to_owned();
+                        self.state_mut(me).icon = Some(icon);
                         return Some(CmdResult::Success);
                     }
                     "remove" => Tweak::Remove,
@@ -1602,6 +1615,28 @@ impl Host for StdHost {
                         a.skip_command();
                     }
                 }
+                CmdResult::Success
+            }
+            "rune" => {
+                // `rune -a aam` teaches the hero a rune, `rune -r aam` takes it away, `rune all` gives every one.
+                let flags = a.get_flags();
+                let name = a.get_word().to_ascii_lowercase();
+                let name = if name == "citrius" { "cetrius".to_owned() } else { name };
+                const RUNES: [&str; 20] = ["aam", "cetrius", "comunicatum", "cosum", "folgora", "fridd", "kaom", "mega", "morte", "movis", "nhi", "rhaa", "spacium", "stregum", "taar", "tempus", "tera", "vista", "vitae", "yok"];
+                if name == "all" {
+                    self.player.runes.extend(RUNES.iter().map(|r| (*r).to_owned()));
+                } else if !RUNES.contains(&name.as_str()) {
+                    a.warn(&format!("unknown rune name: {name}"));
+                    return Some(CmdResult::Failed);
+                } else if has_flag(&flags, 'r') {
+                    self.player.runes.remove(&name);
+                } else if has_flag(&flags, 'a') {
+                    self.player.runes.insert(name);
+                }
+                CmdResult::Success
+            }
+            "activatephysics" => {
+                self.loosened.push(me);
                 CmdResult::Success
             }
             "replaceme" => {

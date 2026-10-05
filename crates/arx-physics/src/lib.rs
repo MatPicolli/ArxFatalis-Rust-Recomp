@@ -821,6 +821,8 @@ pub struct Player {
     walked: f32,
     steps: u32,
     jumped: bool,
+    /// How much faster than usual the body moves (1 = as usual; the `speed` spell raises it).
+    pub speed: f32,
     /// Move exactly as the original does: a jump that rises 130 units in a fifth of a second and then floats down,
     /// three times the running speed in the air, a dead stop on landing, and a crouch that takes 0.7 s before the
     /// body is any lower. Off by default: the owner of this project asked for a jump with ordinary gravity that
@@ -860,6 +862,7 @@ impl Player {
             walked: 0.0,
             steps: 0,
             jumped: false,
+            speed: 1.0,
             classic: false,
         }
     }
@@ -1059,7 +1062,7 @@ impl Player {
         }
         if input.dir != Vec2::ZERO {
             let push = self.push_scale(&input) * self.landing_recovery();
-            self.vel_h += input.dir * push * dt_ms * 1000.0;
+            self.vel_h += input.dir * push * self.speed * dt_ms * 1000.0;
         }
 
         // Vertical: gravity, unless on the ground or rising.

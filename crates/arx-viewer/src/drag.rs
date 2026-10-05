@@ -76,6 +76,15 @@ pub fn release_in_world(
 
 /// Move thrown and dropped items until they rest; whatever the player picks up meanwhile is let be.
 pub fn step_bodies(time: Res<Time>, fly: Res<Fly>, mut bodies: ResMut<ItemBodies>, mut s: ResMut<Scripting>) {
+    // What scripts set loose (the pieces of a smashed grid) starts to fall from where it is, with a little shove.
+    for (n, id) in s.host.take_loosened().into_iter().enumerate() {
+        if bodies.0.iter().any(|(b, _)| *b == id) || s.host.state(id).is_some_and(|st| st.in_inventory || st.destroyed) {
+            continue;
+        }
+        let at = Vec3::from(to_bevy(s.world.entity(id).pos));
+        let turn = n as f32 * 2.4;
+        bodies.0.push((id, ItemBody::thrown(at + Vec3::Y * 2.0, Vec3::new(turn.cos() * 60.0, 90.0, turn.sin() * 60.0))));
+    }
     let Some(world) = fly.world.as_ref() else { return };
     let dt = time.delta_secs();
     let s = &mut *s;

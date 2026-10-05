@@ -71,6 +71,8 @@ pub struct Ui {
     pub quest_page: usize,
     /// Character creation: only the book's character sheet is shown, and it stays open.
     pub creating: bool,
+    /// `Ctrl` is held: the mouse draws runes and does nothing else.
+    pub casting: bool,
 }
 
 impl Default for Ui {
@@ -99,7 +101,18 @@ impl Default for Ui {
             note_page: 0,
             quest_page: 0,
             creating: false,
+            casting: false,
         }
+    }
+}
+
+/// The class whose inventory picture an item shows: its own, or the one its script chose (`tweak icon`, as every
+/// rune stone does).
+pub fn icon_class(s: &Scripting, id: EntityId) -> String {
+    let class = &s.world.entity(id).class;
+    match s.host.state(id).and_then(|st| st.icon.as_ref()) {
+        Some(icon) => format!("{}/{icon}", class.rsplit_once('/').map_or("", |(dir, _)| dir)),
+        None => class.clone(),
     }
 }
 

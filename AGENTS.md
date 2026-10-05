@@ -215,6 +215,20 @@ sets the screenshot frame (large levels need ~60 frames before everything appear
   controls to a cutscene puts the weapon away (`PutPlayerInNormalStance`), or the outside body T-poses its arms.
 - The captured mouse is re-centred every frame and released when the window loses focus; while it is captured the
   interface gets no cursor position (a hidden cursor used to click whatever it was parked on).
+- **Magic** (`arx-level/src/magic.rs`, `arx-viewer/src/magic.rs`): runes are the engine's direction strings
+  (`Rune::strokes`), but recognition is our own by the owner's wish: the stroke and every rune's ideal path (at several
+  proportions) are resampled to 48 points, centred, scaled by the longer side, and compared by point distance + heading +
+  path length; the best wins if under `ACCEPT` and clearly ahead of the next rune. A test draws 3000 shaky runes (>96 %
+  right, <0.4 % mistaken) and refuses circles, spirals and zigzags: keep it passing when tuning. The spell table, mana
+  costs, spell level and effect numbers are the engine's. `ActiveSpells::cast` pays mana and queues `spellcast` (name,
+  level) to every entity, which scripts act on; ignit/douse flip `Torch::lit`, magic missile is a flying sphere that
+  calls `NpcWorld::hurt`, heal/armor/lower_armor/speed run in `ActiveSpells`. The other 43 spells only notify scripts.
+  `--runes all --cast aam,yok` and `ARX_LOG_MAGIC=1` test it headlessly. Runes are learnt with `rune -a <name>`.
+- **Hitting things**: the hero's blade also strikes fixtures whose pickable sphere it reaches (`player_strike_object` ->
+  `hit` with damage and weapon kind); the cell's `jail_wood_grid` breaks that way. `activatephysics` sets items loose to
+  fall (`StdHost::take_loosened`). A double click on an item in the pack uses it and then keeps it in the hand
+  (`Ui::held`, the original's COMBINE): the next click, on an item or on something in the world, sends `combine`.
+  `tweak icon` changes an item's inventory picture (`hud::icon_class`), which is what tells the rune stones apart.
 - **Mods** (`arx-formats/src/mods.rs`, README "Mods"): folders or `.pak` archives in `mods/` (ignored by git) layered over
   the game's files in alphabetical order by `PakSet::apply_mods`; everything that reads the game goes through `PakSet`, so
   a mod can replace or add any file. `pak::write_archive` writes the game's archive format (stored files, obfuscated table
@@ -268,7 +282,7 @@ character creation.
 Done since: footsteps from the engine's material tables (`SoundMap`), dragging items in the 3D world and throwing them, NPC path-finding / walking / patrolling / perception / melee, equipment (slots, `setequip` modifiers, `equip`), the hero's first-person body and weapon animations, the hit-strength gauge, blows and damage, characters that die and give experience.
 
 Missing: the map and spell pages of the book, combat cursors, active-spell and hunger icons, the HUD sliding away in free look,
-cinematic cameras for `speak -c`, spells, bows and arrows, NPC weapons drawn in hand, NPC footsteps, `usepath`, inventory weight limits,
+cinematic cameras for `speak -c`, most spell effects (see Magic), precasting, NPC spell casting (`spellcast`), bows and arrows, NPC weapons drawn in hand, NPC footsteps, `usepath`, inventory weight limits,
 level changes (`teleport -l`, needs state transfer), the 2D `.cin` cinematics (skipped: `cine_end` is sent at once), ladders, leaning, music/ambiance zones, fog, light flares, save games, credits and key bindings. About 60 script
 commands are skipped (the interpreter ignores a command it does not know, line by line, and counts it in
 `Stats::unknown_commands`; `arx script` prints the most frequent ones). With jumping off, `arx walk N --no-jump` has no

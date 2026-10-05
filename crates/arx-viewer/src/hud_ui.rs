@@ -115,7 +115,7 @@ impl UiAssets {
     }
 
     /// An item's inventory icon. Gold shows more coins the more there is; items without an icon get the question mark.
-    fn icon(&mut self, arx: &Arx, images: &mut Assets<Image>, class: &str, count: u32) -> Option<UiTex> {
+    pub fn icon(&mut self, arx: &Arx, images: &mut Assets<Image>, class: &str, count: u32) -> Option<UiTex> {
         let path = if is_gold_class(class) {
             let n = match count {
                 0..=3 => count.max(1) as usize - 1,
@@ -515,7 +515,7 @@ pub fn mouse(
     let g = geometry(w, h, &ui);
     // Screenshot runs ignore the real mouse.
     // While the mouse turns the view there is no cursor: where the hidden one happens to be must not click anything.
-    let Some(pos) = window.cursor_position().filter(|_| shot.is_none() && ui.cursor_mode) else { return };
+    let Some(pos) = window.cursor_position().filter(|_| shot.is_none() && ui.cursor_mode && !ui.casting) else { return };
     let player = s.player;
     // The ray from the camera through the cursor: what lies under it in the world.
     let ray = if ui.cursor_mode { camera.0.viewport_to_world(camera.1, pos).ok() } else { None };
@@ -579,6 +579,28 @@ pub fn mouse(
         (rel.x >= 0.0 && rel.y >= 0.0 && rel.x < BAG_WIDTH as f32 && rel.y < BAG_HEIGHT as f32).then(|| (rel.x as u8, rel.y as u8))
     };
 
+    // An item chosen with a double click is used on the next thing clicked, in the pack or in the world (the
+    // original's "combine"): a key on a door, water on flour, a lockpick on a chest.
+    if buttons.just_pressed(MouseButton::Left)
+        && let Some(held) = ui.held.filter(|h| s.host.player.inventory.contains(h))
+    {
+        let in_bag_now = g.bag_visible(&ui) && g.bag.contains(pos);
+        let target = if in_bag_now {
+            cell(&g).and_then(|(x, y)| s.host.player.item_at(ui.bag, x, y))
+        } else if !ui.over_hud {
+            ray.and_then(|r| crate::scripting::pick_ray(&pickables, s, r.origin, *r.direction, crate::drag::PICK_REACH)).map(|(_, id)| id)
+        } else {
+            None
+        };
+        ui.held = None;
+        if let Some(target) = target.filter(|&t| t != held) {
+            inventory::combine(&mut s.world, &mut s.host, player, held, target);
+            ui.sfx.push("interface_invstd");
+            s.host.prune_inventory();
+        }
+        return;
+    }
+
     if buttons.just_pressed(MouseButton::Left) {
         ui.kbd = false;
         if g.backpack.contains(pos) {
@@ -607,6 +629,10 @@ pub fn mouse(
                 if ui.last_click.is_some_and(|(id, t)| id == item && now - t < DOUBLE_CLICK) {
                     ui.last_click = None;
                     inventory::use_item(&mut s.world, &mut s.host, player, item);
+                    // Still in the pack after that (not eaten, not put on): it is now in the hand, to use on something.
+                    if s.host.player.inventory.contains(&item) && s.host.state(item).is_some_and(|st| !st.destroyed) {
+                        ui.held = Some(item);
+                    }
                 } else {
                     ui.last_click = Some((item, now));
                     ui.drag = Some(Drag { item, grab: pos - top_left, from_world: false, spawned: false });
@@ -824,7 +850,7 @@ pub fn draw(
             }
             let st = s.host.state(item);
             let count = st.map_or(1, |st| st.count);
-            let Some(tex) = assets.icon(&arx, &mut images, &s.world.entity(item).class, count) else { continue };
+            let Some(tex) = assets.icon(&arx, &mut images, &crate::hud::icon_class(&s, item), count) else { continue };
             let at = g.slot_rect(slot.x, slot.y, slot.w, slot.h);
             let lit = hover(at) || (ui.kbd && selected == Some(item)) || ui.held == Some(item);
             let icon = c.sized(&tex, at.min, g.s, if lit { bright() } else { Color::WHITE });
@@ -860,7 +886,7 @@ pub fn draw(
         let font = assets.get(&arx, &mut images, "font/font10x10_inventory");
         for (item, x, y, iw, ih) in container_layout(&s, container) {
             let count = s.host.state(item).map_or(1, |st| st.count);
-            let Some(tex) = assets.icon(&arx, &mut images, &s.world.entity(item).class, count) else { continue };
+            let Some(tex) = assets.icon(&arx, &mut images, &crate::hud::icon_class(&s, item), count) else { continue };
             let at = g.panel_slot_rect(x, y, iw, ih);
             let lit = hover(at);
             let icon = c.sized(&tex, at.min, g.s, if lit { bright() } else { Color::WHITE });
@@ -958,7 +984,7 @@ pub fn draw(
                 for slot in arx_script::EquipSlot::ALL {
                     let Some(item) = p.equipped_in(slot) else { continue };
                     let area = local_rect(hud_book::equipment_area(slot).min, hud_book::equipment_area(slot).size());
-                    let class = s.world.entity(item).class.clone();
+                    let class = crate::hud::icon_class(&s, item);
                     if let Some(icon) = assets.icon(&arx, &mut images, &class, 1) {
                         // Fit the icon in the area without stretching it.
                         let fit = (area.width() / icon.size.x).min(area.height() / icon.size.y).min(g.s * 2.0);
@@ -1031,13 +1057,24 @@ pub fn draw(
 
     // --- what the cursor carries, the tooltip, and the cursor itself.
     if let (Some(d), Some(pos), true) = (ui.drag, cursor, ui.over_hud) {
-        let class = s.world.entity(d.item).class.clone();
+        let class = crate::hud::icon_class(&s, d.item);
         let count = s.host.state(d.item).map_or(1, |st| st.count);
         if let Some(tex) = assets.icon(&arx, &mut images, &class, count) {
             c.sized(&tex, pos - d.grab, g.s, Color::WHITE);
         }
     } else if let Some((text, at)) = tooltip {
         c.items.push(Item::Text { text, at: at + Vec2::new(14.0, 18.0) * g.s, size: 15.0 * text_scale(g.s), color: Color::srgb(0.95, 0.92, 0.8) });
+    }
+    // The item in the hand, waiting to be used on something: beside the cursor, or beside the crosshair.
+    if let Some(held) = ui.held.filter(|h| p.inventory.contains(h)) {
+        let class = crate::hud::icon_class(&s, held);
+        let at = match cursor {
+            Some(pos) if ui.cursor_mode => pos + Vec2::new(18.0, 14.0) * g.s,
+            _ => Vec2::new(w, h) / 2.0 + Vec2::new(18.0, -40.0) * g.s,
+        };
+        if let Some(tex) = assets.icon(&arx, &mut images, &class, 1) {
+            c.sized(&tex, at, g.s * 0.75, Color::srgba(1.0, 1.0, 1.0, 0.85));
+        }
     }
     if ui.cursor_mode
         && let Some(pos) = cursor

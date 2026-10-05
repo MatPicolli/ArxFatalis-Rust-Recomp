@@ -62,6 +62,17 @@ Model/texture controls: Left/Right = prev/next, PgUp/PgDn = +-25, Home = first, 
 
 The game starts on the original's main menu (`gui/MainMenu.cpp`: its background, font and positions), and `Esc` brings it back as the pause menu; while it is open nothing in the level moves and its sounds are paused. *New quest* opens character creation: the book's character sheet with 16 attribute and 18 skill points to hand out (left click spends, right click takes back), *Quick generation* (first the average hero, then random ones, as in the original), the hero's face, and *Done* once every point is spent, which starts the level's intro. *Options* has full screen, VSync, field of view, HUD size, subtitles, master/effects/speech volume, mouse sensitivity and inverted mouse; they take effect at once and are kept in `%APPDATA%\arx-fatalis-rust\options.cfg`. Loading, saving and the credits are shown but do nothing yet. With a game running, *New quest* asks first and then starts the program again on character creation.
 
+## Magic
+
+Hold **Ctrl**, draw a rune with the left mouse button held, and let the button go: the rune is named aloud and its stone appears on screen. Draw the next rune the same way, then let go of Ctrl to cast what the runes make (Aam Yok lights the torches around you, Nhi Yok puts them out, Aam Taar is a magic missile, Mega Vitae heals, Mega Kaom is armour, Mega Movis speed). You need the runes (use a rune stone from the backpack to learn it) and the mana; spells are as strong as a tenth of casting skill plus mind, and mana comes back slowly by itself.
+
+Runes are drawn as the rune stones show them, but the recognition is not the original's: instead of demanding an exact list of directions it compares your stroke with every rune's shape as a whole, so wobbles, rounded corners and uneven strokes are fine, while a scribble is still refused. All 49 spells of the game are known (their runes, cost and the `spellcast` event that scripts react to); the six above do something so far, the others say so when cast.
+
+```bash
+cargo run --release -p arx-viewer -- level 1 --no-menu --no-cutscenes --runes all     # every rune, to try it out
+cargo run --release -p arx-viewer -- level 1 --no-menu --no-cutscenes --runes all --cast aam,taar --focus goblin_base_0050   # cast without drawing
+```
+
 ## Mods
 
 Drop a mod into the `mods` folder next to where you run the game (it is made on the first run; `--mods-dir` or `ARX_MODS` points somewhere else) and it is used: no installing, no editing of the game's files.
