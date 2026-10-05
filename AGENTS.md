@@ -215,6 +215,23 @@ sets the screenshot frame (large levels need ~60 frames before everything appear
   controls to a cutscene puts the weapon away (`PutPlayerInNormalStance`), or the outside body T-poses its arms.
 - The captured mouse is re-centred every frame and released when the window loses focus; while it is captured the
   interface gets no cursor position (a hidden cursor used to click whatever it was parked on).
+- **Level changes** (`main.rs::load_level`, `arx-level/src/travel.rs`): a `Trip` in the `Travel` resource is carried out at
+  the start of the next frame. Everything marked `LevelScoped` (level meshes, everything `spawn_entity` makes), sounds and
+  missiles are despawned; the level's whole simulation (`Scripting`, `NpcWorld`, obstacles, collision world, zones, stage,
+  which torches burn) goes into `Visited` and comes back out unchanged on return, so only the scene is rebuilt (from the
+  scripted state, as at start-up; `forget_applied` makes `apply_state` put it all on again, runtime items are re-noted as
+  dropped, every entity gets `reload`). `carry_player` moves the hero's state, globals and carried items between the two
+  script worlds, keeping item names (keys are matched by name) and reusing an item's old entity when it returns to the
+  level it came from. New level-scoped things must carry `LevelScoped` or they outlive the level; new per-level resources
+  must be reset in `load_level` and, if they are simulation state, kept in `LevelSim`. `--go 2:marker_0217,1:marker_0367`
+  tests a round trip. A stashed level's clock stands still while the hero is away.
+- **Dynamic lights** (`dynlight.rs`, experimental, an option): world materials (white base colour, not additive) are
+  flipped from unlit to lit, `GlobalAmbientLight` 6800 makes a lit material look like the unlit one (measured from
+  screenshots; the renderer's exposure and tone mapping make this far from the obvious 1000), `vertex_torches` takes the
+  per-vertex torch light off the level, and a pool of 8 point lights follows the nearest lit torches (2 with shadow maps;
+  biases set for a world in centimetres). All meshes carry normals for it. Unlit remains the faithful default.
+- `PlayerState::recompute` no longer refills life and mana at level 0 (equipping something healed a new hero); only
+  moving points about during character creation does.
 - **Magic** (`arx-level/src/magic.rs`, `arx-viewer/src/magic.rs`): runes are the engine's direction strings
   (`Rune::strokes`), but recognition is our own by the owner's wish: the stroke and every rune's ideal path (at several
   proportions) are resampled to 48 points, centred, scaled by the longer side, and compared by point distance + heading +
@@ -283,7 +300,7 @@ Done since: footsteps from the engine's material tables (`SoundMap`), dragging i
 
 Missing: the map and spell pages of the book, combat cursors, active-spell and hunger icons, the HUD sliding away in free look,
 cinematic cameras for `speak -c`, most spell effects (see Magic), precasting, NPC spell casting (`spellcast`), bows and arrows, NPC weapons drawn in hand, NPC footsteps, `usepath`, inventory weight limits,
-level changes (`teleport -l`, needs state transfer), the 2D `.cin` cinematics (skipped: `cine_end` is sent at once), ladders, leaning, music/ambiance zones, fog, light flares, save games, credits and key bindings. About 60 script
+the level-change confirmation icon, saving levels to disk, the 2D `.cin` cinematics (skipped: `cine_end` is sent at once), ladders, leaning, music/ambiance zones, fog, light flares, save games, credits and key bindings. About 60 script
 commands are skipped (the interpreter ignores a command it does not know, line by line, and counts it in
 `Stats::unknown_commands`; `arx script` prints the most frequent ones). With jumping off, `arx walk N --no-jump` has no
 rescues in 21 of 23 levels; levels 10 and 20 have genuine drops where the player falls out of the world and is put back on

@@ -116,6 +116,10 @@ pub struct LevelLighting {
     dirty: Vec<bool>,
     /// Whose turn it is among the torches that share the budget.
     turn: usize,
+    /// The torches light the level's vertices (the original's way). Off while the experimental dynamic lights do
+    /// it per pixel instead.
+    pub vertex_torches: bool,
+    vertex_torches_applied: bool,
 }
 
 impl LevelLighting {
@@ -168,7 +172,7 @@ impl LevelLighting {
             })
             .collect();
         let dirty = vec![false; chunks.len()];
-        LevelLighting { chunks, torches, lut, rng: 0x1357_9BDF, since_flicker: 1.0, dirty, turn: 0 }
+        LevelLighting { chunks, torches, lut, rng: 0x1357_9BDF, since_flicker: 1.0, dirty, turn: 0, vertex_torches: true, vertex_torches_applied: true }
     }
 
     fn random(&mut self) -> f32 {
@@ -192,6 +196,15 @@ pub fn update(time: Res<Time>, cam: Single<&Transform, (With<Camera3d>, Without<
     }
     l.since_flicker = 0.0;
     let eye = cam.translation;
+    // Switching between the two ways of lighting changes every mesh a torch reaches.
+    if l.vertex_torches != l.vertex_torches_applied {
+        l.vertex_torches_applied = l.vertex_torches;
+        for t in &l.torches {
+            for &c in &t.chunks {
+                l.dirty[c] = true;
+            }
+        }
+    }
     // A torch lit or put out (and every torch the first time) changes its meshes whatever the budget.
     for t in &mut l.torches {
         if t.lit != t.was_lit {
@@ -216,6 +229,10 @@ pub fn update(time: Res<Time>, cam: Single<&Transform, (With<Camera3d>, Without<
         let r = Vec3::new(l.random(), l.random(), l.random());
         let t = &mut l.torches[i];
         t.now = ((t.rgb - t.rgb * t.flicker * r * 0.5).max(Vec3::ZERO)) * 255.0;
+        if !l.vertex_torches {
+            // (Only the colour is wanted, by the dynamic lights: no mesh changes.)
+            continue;
+        }
         budget -= t.chunks.len() as isize;
         for &c in &t.chunks {
             l.dirty[c] = true;
@@ -227,6 +244,7 @@ pub fn update(time: Res<Time>, cam: Single<&Transform, (With<Camera3d>, Without<
     if others > 0 {
         l.turn = (l.turn + taken) % others;
     }
+    let vertex_torches = l.vertex_torches;
     let LevelLighting { chunks, torches, lut, dirty, .. } = l;
     for (chunk, dirty) in chunks.iter().zip(dirty.iter_mut()) {
         if !std::mem::take(dirty) {
@@ -236,7 +254,7 @@ pub fn update(time: Res<Time>, cam: Single<&Transform, (With<Camera3d>, Without<
         let mut colors: Vec<Vec3> = chunk.baked.iter().map(|&c| Vec3::from(c)).collect();
         for (torch, reached) in &chunk.lit_by {
             let t = &torches[*torch];
-            if !t.lit {
+            if !t.lit || !vertex_torches {
                 continue;
             }
             for &(v, k) in reached {

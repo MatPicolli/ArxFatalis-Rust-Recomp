@@ -14,6 +14,7 @@ mod convert;
 mod cutscene;
 mod entities;
 mod drag;
+mod dynlight;
 mod hud;
 mod npcs;
 mod particles;
@@ -188,6 +189,13 @@ struct Args {
     /// Level mode: cast the spell these runes make shortly after start-up (`aam,yok`), for headless testing
     #[arg(long, value_delimiter = ',')]
     cast: Vec<String>,
+    /// Level mode: send the hero to other levels by themselves, one journey every 240 frames (`2:marker_0217,1:marker_0367`),
+    /// for headless testing of level changes
+    #[arg(long, value_delimiter = ',')]
+    go: Vec<String>,
+    /// Level mode: the experimental dynamic lights and shadows (also an option in the menu)
+    #[arg(long)]
+    dynamic_light: bool,
     /// Save a screenshot to this file after a few frames, then exit
     #[arg(long)]
     shot: Option<PathBuf>,
@@ -479,7 +487,6 @@ fn take_shot(mut commands: Commands, mut shot: ResMut<Shot>, mut exit: MessageWr
 
 #[derive(Resource)]
 struct LevelArgs {
-    level: u32,
     cam: Option<Vec3>,
     look: Option<(f32, f32)>,
     entities: bool,
@@ -505,6 +512,7 @@ struct LevelArgs {
     attrs: Vec<i32>,
     runes: Vec<String>,
     cast: Vec<String>,
+    go: Vec<String>,
 }
 
 #[derive(Resource)]
@@ -566,6 +574,9 @@ fn run_level(args: Args, pak: PakSet, mods: Vec<arx_formats::mods::Mod>) {
     if args.no_subtitles {
         options.set(menu::Opt::Subtitles, 0);
     }
+    if args.dynamic_light {
+        options.set(menu::Opt::DynamicLight, 1);
+    }
     let mut app = App::new();
     app.add_plugins(
         DefaultPlugins
@@ -587,7 +598,6 @@ fn run_level(args: Args, pak: PakSet, mods: Vec<arx_formats::mods::Mod>) {
     .insert_resource(Arx(std::sync::Arc::new(pak)))
     .insert_resource(TextureCache::default())
     .insert_resource(LevelArgs {
-        level,
         // Arx coordinates -> Bevy
         cam: args.cam.filter(|c| c.len() == 3).map(|c| Vec3::new(c[0], -c[1], -c[2])),
         look: args.look.filter(|l| l.len() == 2).map(|l| (l[0], l[1])),
@@ -614,6 +624,7 @@ fn run_level(args: Args, pak: PakSet, mods: Vec<arx_formats::mods::Mod>) {
         attrs: args.attrs.clone(),
         runes: args.runes.clone(),
         cast: args.cast.clone(),
+        go: args.go.clone(),
     })
     .insert_resource(entities::EntityCache::default())
     .insert_resource(entities::SpawnedEntities::default())
@@ -631,7 +642,9 @@ fn run_level(args: Args, pak: PakSet, mods: Vec<arx_formats::mods::Mod>) {
         invert_mouse: false,
         posed: false,
     })
-    .add_systems(Startup, setup_level)
+    .add_systems(Startup, setup_view)
+    .insert_resource(Travel { pending: Some(Trip { level, target: None, yaw: None }), current: level, started: false })
+    .insert_resource(Visited::default())
     .insert_resource(scripting::Scripting::default())
     .insert_resource(scripting::Pickables::default())
     .insert_resource(scripting::Obstacles::default())
@@ -643,6 +656,7 @@ fn run_level(args: Args, pak: PakSet, mods: Vec<arx_formats::mods::Mod>) {
     .insert_resource(perf::Perf::default())
     .insert_resource(book_hero::BookHero::default())
     .insert_resource(magic::Magic::default())
+    .insert_resource(dynlight::DynamicLight::default())
     .insert_resource(particles::Particles::default())
     .insert_resource(shadows::Shadows::default())
     .insert_resource(player_body::PlayerBody::default())
@@ -658,7 +672,7 @@ fn run_level(args: Args, pak: PakSet, mods: Vec<arx_formats::mods::Mod>) {
     .insert_resource(hud_ui::UiAssets::default())
     .add_systems(
         Update,
-        (perf::begin, timed!(menu::update, "menu::update"), (hud_ui::mouse, book_hero::update, hud_ui::draw, animated::animate).chain().run_if(menu::creating), ((
+        (perf::begin, debug_travel, timed!(load_level, "load_level"), timed!(menu::update, "menu::update"), (hud_ui::mouse, book_hero::update, hud_ui::draw, animated::animate).chain().run_if(menu::creating), ((
             timed!(scripting::tick, "scripting::tick"),
             timed!(npcs::zones, "npcs::zones"),
             timed!(npcs::update, "npcs::update"),
@@ -695,6 +709,7 @@ fn run_level(args: Args, pak: PakSet, mods: Vec<arx_formats::mods::Mod>) {
         )
             .chain(),
         (
+            timed!(dynlight::update, "dynlight::update"),
             timed!(lighting::update, "lighting::update"),
             timed!(particles::update, "particles::update"),
             timed!(magic::update, "magic::update"),
@@ -733,23 +748,70 @@ struct LevelState<'w> {
     stage: ResMut<'w, cutscene::Stage>,
 }
 
-fn setup_level(
-    mut commands: Commands,
-    arx: Res<Arx>,
-    args: Res<LevelArgs>,
-    mut fly: ResMut<Fly>,
-    mut cache: ResMut<TextureCache>,
-    mut ecache: ResMut<entities::EntityCache>,
-    mut scripting: ResMut<scripting::Scripting>,
-    mut pickables: ResMut<scripting::Pickables>,
-    mut spawned: ResMut<entities::SpawnedEntities>,
-    mut obstacles: ResMut<scripting::Obstacles>,
-    level: LevelState,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut images: ResMut<Assets<Image>>,
-) {
-    let LevelState { mut npcs, mut body, mut zones, mut stage } = level;
+/// A journey to another level, as scripts ask for it (`teleport -l <level> <marker>`).
+pub struct Trip {
+    pub level: u32,
+    /// The entity (a marker) to arrive at; the level's own start if there is none or it cannot be found.
+    pub target: Option<String>,
+    /// Which way the hero faces on arrival (the engine's yaw, degrees).
+    pub yaw: Option<f32>,
+}
+
+/// Which level the hero is in, and where they are about to go.
+#[derive(Resource)]
+pub struct Travel {
+    pub pending: Option<Trip>,
+    pub current: u32,
+    started: bool,
+}
+
+/// A level that was left: its scripts with everything they changed, its characters, doors and zones. Coming back,
+/// the level is as it was.
+struct LevelSim {
+    scripting: scripting::Scripting,
+    npcs: Option<arx_level::npc::NpcWorld>,
+    obstacles: arx_level::EntityObstacles,
+    collision: std::sync::Arc<arx_physics::CollisionWorld>,
+    zones: arx_level::zones::Zones,
+    stage: arx_level::stage::StageWorld,
+    torches_lit: Vec<bool>,
+}
+
+#[derive(Resource, Default)]
+struct Visited(std::collections::HashMap<u32, LevelSim>);
+
+/// What has to be cleared away when a level is left.
+#[derive(bevy::ecs::system::SystemParam)]
+struct Leaving<'w, 's> {
+    scoped: Query<'w, 's, Entity, With<entities::LevelScoped>>,
+    sounds_playing: Query<'w, 's, Entity, With<bevy::audio::AudioPlayer>>,
+    missiles: Query<'w, 's, Entity, With<magic::Missile>>,
+    visited: ResMut<'w, Visited>,
+    lighting: ResMut<'w, lighting::LevelLighting>,
+    combat: ResMut<'w, player_body::Combat>,
+    bodies: ResMut<'w, drag::ItemBodies>,
+    particles: ResMut<'w, particles::Particles>,
+    sounds: ResMut<'w, audio::Sounds>,
+    speech: ResMut<'w, speech::Speech>,
+    ui: ResMut<'w, hud::Ui>,
+    hero: ResMut<'w, book_hero::BookHero>,
+}
+
+/// Headless testing aid (`--go level:marker,...`): a journey every 240 frames.
+fn debug_travel(mut frames: Local<u32>, args: Res<LevelArgs>, mut travel: ResMut<Travel>) {
+    *frames += 1;
+    if *frames % 240 != 0 {
+        return;
+    }
+    let Some(spec) = args.go.get((*frames / 240 - 1) as usize) else { return };
+    let (level, marker) = spec.split_once(':').unwrap_or((spec, ""));
+    if let Ok(level) = level.parse() {
+        travel.pending = Some(Trip { level, target: (!marker.is_empty()).then(|| marker.to_owned()), yaw: None });
+    }
+}
+
+/// The camera the world is seen through, and the developer overlay's text.
+fn setup_view(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
         Projection::Perspective(PerspectiveProjection {
@@ -768,25 +830,97 @@ fn setup_level(
         TextColor(Color::WHITE),
         Node { position_type: PositionType::Absolute, left: Val::Px(10.0), top: Val::Px(8.0), ..default() },
     ));
+}
+
+/// Load the level a journey leads to: at start-up the one asked for on the command line, later wherever scripts
+/// send the hero. The level being left is put away as it is and the hero carried across.
+#[allow(clippy::too_many_arguments)]
+fn load_level(
+    mut commands: Commands,
+    arx: Res<Arx>,
+    args: Res<LevelArgs>,
+    mut travel: ResMut<Travel>,
+    mut fly: ResMut<Fly>,
+    mut cache: ResMut<TextureCache>,
+    mut ecache: ResMut<entities::EntityCache>,
+    mut scripting: ResMut<scripting::Scripting>,
+    mut pickables: ResMut<scripting::Pickables>,
+    mut spawned: ResMut<entities::SpawnedEntities>,
+    mut obstacles: ResMut<scripting::Obstacles>,
+    level: LevelState,
+    mut leaving: Leaving,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let Some(trip) = travel.pending.take() else { return };
+    let LevelState { mut npcs, mut body, mut zones, mut stage } = level;
+    let first = !travel.started;
+    let level_no = trip.level;
+    if !first && !arx.0.contains(&format!("game/graph/levels/level{level_no}/fast.fts")) {
+        scripting.host.push_message(format!("(there is no level {level_no})"));
+        return;
+    }
+    let previous = travel.current;
+    if !first {
+        // Everything of the level being left goes: its meshes, its things and people, its sounds, what was flying.
+        for e in leaving.scoped.iter().chain(leaving.sounds_playing.iter()).chain(leaving.missiles.iter()) {
+            commands.entity(e).try_despawn();
+        }
+        if let Some(collision) = fly.world.take() {
+            let sim = LevelSim {
+                scripting: std::mem::take(&mut *scripting),
+                npcs: npcs.0.take(),
+                obstacles: std::mem::take(&mut obstacles.entities),
+                collision,
+                zones: std::mem::take(&mut zones.0),
+                stage: std::mem::take(&mut stage.0),
+                torches_lit: leaving.lighting.torches.iter().map(|t| t.lit).collect(),
+            };
+            leaving.visited.0.insert(previous, sim);
+        }
+        obstacles.world = None;
+        pickables.0.clear();
+        spawned.0.clear();
+        *body = Default::default();
+        *leaving.combat = Default::default();
+        leaving.bodies.0.clear();
+        leaving.particles.clear();
+        leaving.sounds.forget();
+        leaving.speech.clear();
+        leaving.hero.reset();
+        let ui = &mut *leaving.ui;
+        (ui.held, ui.drag, ui.reading, ui.hover_item, ui.drag_spot) = (None, None, None, None, None);
+        eprintln!("leaving level {previous} for level {level_no} ({:?})", trip.target);
+    }
+    travel.started = true;
+    travel.current = level_no;
 
     let t = std::time::Instant::now();
-    match level::spawn_level(&mut commands, &arx.0, args.level, &mut cache, &mut meshes, &mut materials, &mut images) {
+    match level::spawn_level(&mut commands, &arx.0, level_no, &mut cache, &mut meshes, &mut materials, &mut images) {
         Ok(mut info) => {
+            // A level that was visited before comes back as it was left.
+            let mut back = if level_no == previous { None } else { leaving.visited.0.remove(&level_no) };
             // Torches are not in the baked light: they are added every frame (and flicker).
-            let level_lights = arx.0.load_llf(args.level).map(|l| l.lights).unwrap_or_default();
-            let lighting = lighting::LevelLighting::new(std::mem::take(&mut info.chunks), &level_lights, info.scene_pos);
+            let level_lights = arx.0.load_llf(level_no).map(|l| l.lights).unwrap_or_default();
+            let mut lighting = lighting::LevelLighting::new(std::mem::take(&mut info.chunks), &level_lights, info.scene_pos);
+            if let Some(sim) = &back {
+                for (torch, lit) in lighting.torches.iter_mut().zip(&sim.torches_lit) {
+                    torch.lit = *lit;
+                }
+            }
             eprintln!("torches: {} of {} lights", lighting.torches.len(), level_lights.len());
             if std::env::var_os("ARX_LOG_LIGHTS").is_some() {
                 for t in &lighting.torches {
                     eprintln!("  torch at {:.0},{:.0},{:.0} (Arx) extras {:#x} lit {} reach {:.0}..{:.0} x{:.1} fire r{:.0} f{:.2} size {:.1} speed {:.1}", t.pos.x, -t.pos.y, -t.pos.z, t.extras, t.lit, t.fall_start, t.fall_end, t.intensity, t.ex_radius, t.ex_frequency, t.ex_size, t.ex_speed);
                 }
             }
-            commands.insert_resource(lighting);
+            *leaving.lighting = lighting;
             eprintln!(
                 "level {}: {} polygons in {} meshes, built in {:.1?}",
-                args.level, info.poly_count, info.mesh_count, t.elapsed()
+                level_no, info.poly_count, info.mesh_count, t.elapsed()
             );
-            let dlf = arx.0.load_dlf(args.level);
+            let dlf = arx.0.load_dlf(level_no);
             // Where the player's feet start. The FTS position is a foot position; the DLF one is the
             // editor camera (eye height). Both are editor positions, and can lie on a ledge far from
             // the real floor: if the nearest entity (which stands on a real floor) is much higher or
@@ -813,47 +947,83 @@ fn setup_level(
                 }
             }
             let start = feet0 + Vec3::Y * arx_physics::EYE_HEIGHT;
-            fly.pos = args.cam.unwrap_or(start);
+            let cam = args.cam.filter(|_| first);
+            fly.pos = cam.unwrap_or(start);
             // Scripts decide which entities exist and what they look like; solid ones (doors,
             // portcullises, ...) join the collision world before it is shared.
-            let mut collision = info.collision;
-            if let (Ok(d), true) = (&dlf, args.entities) {
-                let t = std::time::Instant::now();
-                *scripting = scripting::Scripting::build(&arx.0, d, info.scene_pos);
-                let ws = &scripting.world.stats;
-                eprintln!(
-                    "scripts: {} events, {} commands, {} warnings, {} unimplemented command kinds, run in {:.1?}",
-                    ws.events_run, ws.commands_run, ws.warnings.len(), ws.unknown_commands.len(), t.elapsed()
-                );
-                obstacles.entities = arx_level::EntityObstacles::build(
-                    &mut collision, &arx.0, d, info.scene_pos, &scripting.world, &scripting.host, &scripting.ids,
-                );
-                eprintln!("entity obstacles: {}", obstacles.entities.by_entity.len());
-                npcs.0 = Some(arx_level::npc::build_npcs(
-                    &arx.0, &info.anchors, info.scene_pos, d, &scripting.ids, &scripting.world, &obstacles.entities, &collision,
-                ));
-                if let Some(n) = npcs.0.as_mut() {
-                    n.log = std::env::var("ARX_LOG_NPC").ok();
+            let returning = back.is_some();
+            let collision = match (back.take(), &dlf) {
+                (Some(sim), _) => {
+                    *scripting = sim.scripting;
+                    scripting.forget_applied();
+                    obstacles.entities = sim.obstacles;
+                    npcs.0 = sim.npcs;
+                    zones.0 = sim.zones;
+                    stage.0 = sim.stage;
+                    sim.collision
                 }
-                zones.0 = arx_level::zones::Zones::from_dlf(d, info.scene_pos);
-                stage.0 = arx_level::stage::StageWorld::from_dlf(d, info.scene_pos, &scripting.ids);
-                stage.1 = args.no_cutscenes;
-                eprintln!("zones: {}", zones.0.zones.len());
+                (None, Ok(d)) if args.entities => {
+                    let mut collision = info.collision;
+                    let t = std::time::Instant::now();
+                    *scripting = scripting::Scripting::build(&arx.0, d, info.scene_pos);
+                    let ws = &scripting.world.stats;
+                    eprintln!(
+                        "scripts: {} events, {} commands, {} warnings, {} unimplemented command kinds, run in {:.1?}",
+                        ws.events_run, ws.commands_run, ws.warnings.len(), ws.unknown_commands.len(), t.elapsed()
+                    );
+                    obstacles.entities = arx_level::EntityObstacles::build(
+                        &mut collision, &arx.0, d, info.scene_pos, &scripting.world, &scripting.host, &scripting.ids,
+                    );
+                    eprintln!("entity obstacles: {}", obstacles.entities.by_entity.len());
+                    npcs.0 = Some(arx_level::npc::build_npcs(
+                        &arx.0, &info.anchors, info.scene_pos, d, &scripting.ids, &scripting.world, &obstacles.entities, &collision,
+                    ));
+                    if let Some(n) = npcs.0.as_mut() {
+                        n.log = std::env::var("ARX_LOG_NPC").ok();
+                    }
+                    zones.0 = arx_level::zones::Zones::from_dlf(d, info.scene_pos);
+                    stage.0 = arx_level::stage::StageWorld::from_dlf(d, info.scene_pos, &scripting.ids);
+                    eprintln!("zones: {}", zones.0.zones.len());
+                    std::sync::Arc::new(collision)
+                }
+                (None, _) => std::sync::Arc::new(info.collision),
+            };
+            stage.1 = args.no_cutscenes;
+            // The hero comes along, with all they carry.
+            if !first
+                && level_no != previous
+                && let Some(old) = leaving.visited.0.get_mut(&previous)
+            {
+                let s = &mut *scripting;
+                arx_level::travel::carry_player(&mut old.scripting.world, &mut old.scripting.host, &mut s.world, &mut s.host);
             }
-            let collision = std::sync::Arc::new(collision);
             obstacles.world = Some(collision.clone());
             fly.world = Some(collision.clone());
             // Walking starts with the feet on the ground: an explicit camera is an eye position; the
             // default start is already a foot position (moved somewhere safe if it floats over nothing).
-            let feet = match args.cam {
+            let mut feet = match cam {
                 Some(eye) => eye - Vec3::Y * arx_physics::EYE_HEIGHT,
                 None => collision.spawn_point(feet0),
             };
+            // A journey ends at its marker.
+            let arrival = trip.target.as_deref().and_then(|name| scripting.world.find(&name.to_ascii_lowercase(), scripting.player));
+            match (arrival, &trip.target) {
+                (Some(marker), _) => {
+                    feet = Vec3::from(arx_level::to_yup(scripting.world.entity(marker).pos));
+                    fly.walk = true;
+                }
+                (None, Some(name)) => eprintln!("level {level_no} has no {name}: arriving at the level's own start"),
+                _ => {}
+            }
+            if let Some(yaw) = trip.yaw {
+                fly.yaw = yaw.to_radians();
+                fly.pitch = 0.0;
+            }
             fly.player = arx_physics::Player::new(feet + Vec3::Y * 20.0);
-            if args.cam.is_none() {
+            if cam.is_none() {
                 fly.pos = fly.player.eye();
             }
-            if let (Some(spec), Ok(d)) = (&args.focus, &dlf) {
+            if let (Some(spec), Ok(d), true) = (&args.focus, &dlf, first) {
                 let (name, side) = spec.split_once(':').unwrap_or((spec, "front"));
                 // Entity ids are `<class name>_<nnnn>`.
                 let found = d.entities.iter().find(|e| {
@@ -891,17 +1061,32 @@ fn setup_level(
                         &mut meshes, &mut materials, &mut images, fly.player.feet, &mut body,
                     );
                     commands.insert_resource(entities::LevelLights(lights));
+                    if returning {
+                        // Things that came to lie here later (dropped, taken out of chests) are not in the level's
+                        // file: they are shown again from where the scripts have them. And every script hears that
+                        // the level is entered again (`reload`), as the original tells them.
+                        let s = &mut *scripting;
+                        for id in 0..s.world.entities.len() as u32 {
+                            let lying = s.world.entity(id).kind == arx_script::EntityKind::Item
+                                && !spawned.0.contains(&id)
+                                && s.host.state(id).is_some_and(|st| !st.destroyed && !st.in_inventory && !st.equipped && st.moved_to.is_some());
+                            if lying {
+                                s.host.note_dropped(id);
+                            }
+                            s.world.queue_event(None, id, "reload", Vec::new());
+                        }
+                    }
                 }
                 Ok(_) => {}
                 Err(e) => eprintln!("no entities: {e}"),
             }
         }
         Err(e) => {
-            eprintln!("cannot load level {}: {e}", args.level);
+            eprintln!("cannot load level {level_no}: {e}");
             std::process::exit(1);
         }
     }
-    if let Some((yaw, pitch)) = args.look {
+    if let (Some((yaw, pitch)), true) = (args.look, first) {
         fly.yaw = yaw.to_radians();
         fly.pitch = pitch.to_radians();
     }
@@ -1043,7 +1228,7 @@ fn fly_camera(
 
 fn level_hud(
     fly: Res<Fly>,
-    args: Res<LevelArgs>,
+    travel: Res<Travel>,
     script: Res<scripting::Scripting>,
     speech: Res<speech::Speech>,
     ui: Res<hud::Ui>,
@@ -1069,7 +1254,7 @@ fn level_hud(
     hud.0 = format!(
         "level {} ({mode})   eye {:.0},{:.0},{:.0}   yaw {:.0} pitch {:.0}   rescues {}
 {help}{target}",
-        args.level,
+        travel.current,
         fly.pos.x,
         -fly.pos.y,
         -fly.pos.z,

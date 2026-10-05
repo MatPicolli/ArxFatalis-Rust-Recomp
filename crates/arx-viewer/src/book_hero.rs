@@ -52,6 +52,14 @@ pub struct BookHero {
     lights: Option<LevelLights>,
 }
 
+impl BookHero {
+    /// The models were cleared away with the level: they are built again when the book is next opened.
+    pub fn reset(&mut self) {
+        (self.body, self.weapon, self.shield) = (None, None, None);
+        self.pose.clear();
+    }
+}
+
 pub fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, mut hero: ResMut<BookHero>) {
     let size = (BOOK_AREA.1 * DETAIL).as_uvec2();
     let image = images.add(Image::new_target_texture(size.x, size.y, TextureFormat::Rgba8UnormSrgb, None));

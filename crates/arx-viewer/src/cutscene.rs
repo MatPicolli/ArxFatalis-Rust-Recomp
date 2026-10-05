@@ -52,7 +52,7 @@ pub fn spawn_ui(mut commands: Commands) {
 }
 
 /// Move what follows a path, and carry out the jumps and turns scripts asked for.
-pub fn update(time: Res<Time>, mut stage: ResMut<Stage>, mut npcs: ResMut<Npcs>, mut s: ResMut<Scripting>, mut fly: ResMut<Fly>, mut last: Local<Option<arx_script::Stage>>) {
+pub fn update(time: Res<Time>, mut stage: ResMut<Stage>, mut npcs: ResMut<Npcs>, mut s: ResMut<Scripting>, mut fly: ResMut<Fly>, mut travel: ResMut<crate::Travel>, mut last: Local<Option<arx_script::Stage>>) {
     let s = &mut *s;
     if s.world.entities.is_empty() {
         return;
@@ -91,8 +91,9 @@ pub fn update(time: Res<Time>, mut stage: ResMut<Stage>, mut npcs: ResMut<Npcs>,
                     fly.pitch = (dir.y / dir.length()).asin().clamp(-1.3, 1.0);
                 }
             }
-            StageEffect::ChangeLevel { level, target, .. } => {
-                s.host.push_message(format!("(the way to level {level} at {target} is not open yet)"));
+            StageEffect::ChangeLevel { level, target, yaw } => {
+                // Carried out at the start of the next frame (`load_level`).
+                travel.pending = Some(crate::Trip { level, target: Some(target), yaw });
             }
         }
     }

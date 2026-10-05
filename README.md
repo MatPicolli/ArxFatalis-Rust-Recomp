@@ -62,6 +62,18 @@ Model/texture controls: Left/Right = prev/next, PgUp/PgDn = +-25, Home = first, 
 
 The game starts on the original's main menu (`gui/MainMenu.cpp`: its background, font and positions), and `Esc` brings it back as the pause menu; while it is open nothing in the level moves and its sounds are paused. *New quest* opens character creation: the book's character sheet with 16 attribute and 18 skill points to hand out (left click spends, right click takes back), *Quick generation* (first the average hero, then random ones, as in the original), the hero's face, and *Done* once every point is spent, which starts the level's intro. *Options* has full screen, VSync, field of view, HUD size, subtitles, master/effects/speech volume, mouse sensitivity and inverted mouse; they take effect at once and are kept in `%APPDATA%\arx-fatalis-rust\options.cfg`. Loading, saving and the credits are shown but do nothing yet. With a game running, *New quest* asks first and then starts the program again on character creation.
 
+## Going between levels
+
+When a script sends the hero to another level (`teleport -l <level> <marker>`: the stairs and passages of the game), that level is loaded and the hero arrives at its marker with everything they carry: the pack, what is worn, gold, runes, quest log, the game's global variables. The level left behind is kept exactly as it was (doors opened, things moved or taken, who is dead, torches put out) and is found like that on the way back; its scripts are told with the `reload` event, as in the original. There is no confirmation icon yet (the journey starts at once) and no saving to disk.
+
+```bash
+cargo run --release -p arx-viewer -- level 1 --no-menu --no-cutscenes --go 2:marker_0217,1:marker_0367   # there and back by itself, 4 s apart
+```
+
+## Dynamic lights and shadows (experimental)
+
+*Options > Dynamic lights and shadows* (or `--dynamic-light`) turns the torches and fires near you into real lights: they light every pixel instead of every vertex, and the two nearest cast shadows (of walls, bars, furniture, people). The level's baked light stays underneath as ambient light. This is not how the game looked, it costs frame rate (about a quarter on level 1), lights pop as the nearest ones change, and things placed in the level get the torch light twice. Off by default.
+
 ## Magic
 
 Hold **Ctrl**, draw a rune with the left mouse button held, and let the button go: the rune is named aloud and its stone appears on screen. Draw the next rune the same way, then let go of Ctrl to cast what the runes make (Aam Yok lights the torches around you, Nhi Yok puts them out, Aam Taar is a magic missile, Mega Vitae heals, Mega Kaom is armour, Mega Movis speed). You need the runes (use a rune stone from the backpack to learn it) and the mana; spells are as strong as a tenth of casting skill plus mind, and mana comes back slowly by itself.

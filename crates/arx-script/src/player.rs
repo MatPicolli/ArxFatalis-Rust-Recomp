@@ -368,16 +368,12 @@ impl PlayerState {
         t.max(1500.0)
     }
 
-    /// Bring the life and mana maximums in line with the attributes and level. While the hero is still being
-    /// created (level 0) the pools are kept full.
+    /// Bring the life and mana maximums in line with the attributes and level (what is there now only shrinks to
+    /// fit: putting a ring on does not heal).
     pub fn recompute(&mut self) {
         let full = self.attributes_full();
         self.life.max = (full.constitution * (self.level + 2) as f32).floor();
         self.mana.max = (full.mind * (self.level + 1) as f32).floor();
-        if self.level == 0 {
-            self.life.current = self.life.max;
-            self.mana.current = self.mana.max;
-        }
         self.life.current = self.life.current.min(self.life.max);
         self.mana.current = self.mana.current.min(self.mana.max);
     }
@@ -438,6 +434,13 @@ impl PlayerState {
         (self.life.current, self.mana.current) = (self.life.max, self.mana.max);
     }
 
+    /// A hero still being made (level 0) has full life and mana whatever points are moved about.
+    fn fill_while_new(&mut self) {
+        if self.level == 0 {
+            (self.life.current, self.mana.current) = (self.life.max, self.mana.max);
+        }
+    }
+
     /// Spend a point on an attribute; false if there is none to spend.
     pub fn spend_attribute(&mut self, a: Attribute) -> bool {
         if self.attribute_points == 0 {
@@ -446,6 +449,7 @@ impl PlayerState {
         self.attribute_points -= 1;
         *self.attribute_mut(a) += 1;
         self.recompute();
+        self.fill_while_new();
         true
     }
 
@@ -457,6 +461,7 @@ impl PlayerState {
         *self.attribute_mut(a) -= 1;
         self.attribute_points += 1;
         self.recompute();
+        self.fill_while_new();
         true
     }
 

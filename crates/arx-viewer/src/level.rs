@@ -170,8 +170,11 @@ pub fn spawn_level(
         mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, b.positions);
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, b.uvs);
         mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, b.colors);
+        // Normals are only looked at by the experimental dynamic lights (`dynlight`); glowing polygons have none.
+        let normals: Vec<[f32; 3]> = b.normals.iter().map(|n| if *n == Vec3::ZERO { [0.0, 1.0, 0.0] } else { n.to_array() }).collect();
+        mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
         let handle = meshes.add(mesh);
-        commands.spawn((Mesh3d(handle.clone()), MeshMaterial3d(mat)));
+        commands.spawn((Mesh3d(handle.clone()), MeshMaterial3d(mat), crate::entities::LevelScoped));
         if !fullbright {
             lit_chunks.push(crate::lighting::LitChunk::new(handle, chunk_positions, b.normals, b.baked, alphas));
         }

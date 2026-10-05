@@ -117,6 +117,11 @@ pub struct EntityCache {
     skeletons: HashMap<String, Arc<Skeleton>>,
 }
 
+/// Marks what belongs to the level being played (its meshes, everything placed in it): cleared away when the hero
+/// goes to another level.
+#[derive(Component)]
+pub struct LevelScoped;
+
 /// The model serial (see `EntityState::model_serial`) an entity's model was built at.
 #[derive(Component)]
 pub struct ModelSerial(pub u32);
@@ -434,6 +439,8 @@ pub fn spawn_entity(
         mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, b.positions);
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, b.uvs);
         mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, b.colors);
+        // (For the experimental dynamic lights; the meshes are not indexed, so each face gets its own.)
+        mesh.compute_flat_normals();
         stats.meshes += 1;
         let handle = meshes.add(mesh);
         if animated {
@@ -446,6 +453,7 @@ pub fn spawn_entity(
         Transform { translation, rotation, scale: Vec3::splat(scale) },
         visibility,
         ScriptRef(script_id),
+        LevelScoped,
         ModelSerial(st.model_serial),
         BaseAngle { angle: angle, npc: class.contains("/npc/") },
     ));

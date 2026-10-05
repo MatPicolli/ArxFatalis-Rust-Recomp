@@ -39,15 +39,17 @@ pub enum Opt {
     SpeechVolume,
     Sensitivity,
     Invert,
+    /// Experimental: torches as real lights that cast shadows (see `dynlight`).
+    DynamicLight,
 }
 
 impl Opt {
-    pub const ALL: [Opt; 10] =
-        [Opt::Fullscreen, Opt::Vsync, Opt::Fov, Opt::HudScale, Opt::Subtitles, Opt::Master, Opt::Effects, Opt::SpeechVolume, Opt::Sensitivity, Opt::Invert];
+    pub const ALL: [Opt; 11] =
+        [Opt::Fullscreen, Opt::Vsync, Opt::DynamicLight, Opt::Fov, Opt::HudScale, Opt::Subtitles, Opt::Master, Opt::Effects, Opt::SpeechVolume, Opt::Sensitivity, Opt::Invert];
 
     /// On or off (a checkbox) rather than a slider of 0 to 10.
     pub fn is_toggle(self) -> bool {
-        matches!(self, Opt::Fullscreen | Opt::Vsync | Opt::Subtitles | Opt::Invert)
+        matches!(self, Opt::Fullscreen | Opt::Vsync | Opt::Subtitles | Opt::Invert | Opt::DynamicLight)
     }
 
     /// Name in the options file.
@@ -63,6 +65,7 @@ impl Opt {
             Opt::SpeechVolume => "speech_volume",
             Opt::Sensitivity => "mouse_sensitivity",
             Opt::Invert => "invert_mouse",
+            Opt::DynamicLight => "dynamic_light",
         }
     }
 
@@ -79,17 +82,18 @@ impl Opt {
             Opt::SpeechVolume => ("system_menus_options_audio_speech_volume", "Speech volume"),
             Opt::Sensitivity => ("system_menus_options_input_mouse_sensitivity", "Mouse sensitivity"),
             Opt::Invert => ("system_menus_options_input_invert_mouse", "Invert mouse"),
+            Opt::DynamicLight => ("system_menus_options_video_dynamic_light", "Dynamic lights and shadows (experimental)"),
         }
     }
 }
 
 /// The settings, each 0 to 10 (a toggle is 0 or 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Options([u8; 10]);
+pub struct Options([u8; 11]);
 
 impl Default for Options {
     fn default() -> Self {
-        let mut o = Options([0; 10]);
+        let mut o = Options([0; 11]);
         for (opt, v) in [(Opt::Vsync, 1), (Opt::Fov, 5), (Opt::HudScale, 10), (Opt::Subtitles, 1), (Opt::Master, 10), (Opt::Effects, 10), (Opt::SpeechVolume, 10), (Opt::Sensitivity, 5)] {
             o.set(opt, v);
         }
@@ -371,7 +375,7 @@ pub fn layout(screen: Screen, started: bool, o: &Options, can_finish: bool, w: f
             let size = 13.0 * ry;
             let unit = 15.0 * ry;
             for (i, opt) in Opt::ALL.into_iter().enumerate() {
-                let y = win.min.y + (40.0 + 31.0 * i as f32) * ry;
+                let y = win.min.y + (36.0 + 29.0 * i as f32) * ry;
                 let (key, fallback) = opt.label();
                 let label = l.get(key, fallback);
                 if opt.is_toggle() {
@@ -512,6 +516,7 @@ pub struct Game<'w> {
     fly: ResMut<'w, Fly>,
     stage: ResMut<'w, Stage>,
     volume: ResMut<'w, GlobalVolume>,
+    dynamic: ResMut<'w, crate::dynlight::DynamicLight>,
 }
 
 #[derive(SystemParam)]
@@ -533,6 +538,7 @@ fn apply(o: &Options, game: &mut Game, window: &mut Window) {
     game.fly.mouse_speed = o.mouse_speed();
     game.fly.invert_mouse = o.on(Opt::Invert);
     game.stage.2 = o.fov_degrees();
+    game.dynamic.enabled = o.on(Opt::DynamicLight);
     let mode = if o.on(Opt::Fullscreen) { WindowMode::BorderlessFullscreen(MonitorSelection::Current) } else { WindowMode::Windowed };
     if window.mode != mode {
         window.mode = mode;

@@ -55,6 +55,11 @@ impl Sounds {
         Sounds { muted, volume: 1.0, rng: 0x9E37_79B9, ..default() }
     }
 
+    /// The level was left: its looping sounds are gone.
+    pub fn forget(&mut self) {
+        self.unique.clear();
+    }
+
     fn random(&mut self) -> f32 {
         self.rng = self.rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
         (self.rng >> 8) as f32 / (1u32 << 24) as f32

@@ -65,6 +65,13 @@ impl Scripting {
         Scripting { world, host, ids, player, ..default() }
     }
 
+    /// The scene was built anew (the level was left and entered again): everything the scripts say has to be put
+    /// onto it again.
+    pub fn forget_applied(&mut self) {
+        self.applied.clear();
+        self.target = None;
+    }
+
     fn load_anim(&mut self, pak: &arx_formats::PakSet, path: &str) -> Option<Arc<Tea>> {
         self.anim_cache.entry(path.to_owned()).or_insert_with(|| anims::load_anim(pak, path)).clone()
     }

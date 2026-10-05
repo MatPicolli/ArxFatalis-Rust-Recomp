@@ -8,6 +8,7 @@ pub mod model;
 pub mod npc;
 pub mod player_combat;
 pub mod stage;
+pub mod travel;
 pub mod zones;
 
 use arx_formats::{PakSet, dlf::Dlf, ftl::Ftl};

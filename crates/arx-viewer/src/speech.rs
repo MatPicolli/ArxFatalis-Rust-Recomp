@@ -96,6 +96,11 @@ impl Speech {
     }
 
     /// Text shown for a message: the localised string, or the literal text a script gave.
+    /// Nobody is speaking any more (the level was left).
+    pub fn clear(&mut self) {
+        self.lines.clear();
+    }
+
     pub fn text(&self, key: &str) -> String {
         self.locale.text_or_key(key).to_owned()
     }

@@ -54,6 +54,12 @@ impl Particles {
         (self.rng >> 8) as f32 / (1u32 << 24) as f32
     }
 
+    /// Put every flame and wisp of smoke out (the level was left).
+    pub fn clear(&mut self) {
+        self.list.clear();
+        self.owed.clear();
+    }
+
     fn random_vec(&mut self) -> Vec3 {
         Vec3::new(self.random(), self.random(), self.random())
     }
